@@ -170,159 +170,36 @@ class ErrorEnvelopeMiddleware:
     """
     Compatibility shim only.
 
-    Some earlier main.py versions import ErrorEnvelopeMiddleware.
-    We keep it as a no-op pass-through middleware because platform errors are handled
-    via exception handlers above (single source of truth).
+    The platform's primary error handling is implemented via FastAPI exception handlers
+    registered by add_exception_handlers(). This middleware remains for backward-compat
+    with older entrypoints that import it.
+
+    Behavior:
+    - Pass-through in the normal case.
+    - LAST-RESORT fallback: if an exception escapes upstream handlers, return INTERNAL_ERROR
+      ErrorEnvelope and ensure X-Request-Id matches body.request_id.
     """
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
         try:
-            try:
-                try:
-                    await self.app(scope, receive, send)
-                except Exception:
-                    # --- M00-HOTFIX-ERRORS-STATE: INTERNAL_ERROR fallback, rid from scope.state ---
-                    from uuid import uuid4
-                    from starlette.responses import JSONResponse
-                    rid = None
-                    st = scope.get('state')
-                    try:
-                        if isinstance(st, dict):
-                            rid = st.get('request_id')
-                        else:
-                            rid = getattr(st, 'request_id', None)
-                    except Exception:
-                        rid = None
-                    if not rid:
-                        # try inbound header
-                        try:
-                            for k, v in (scope.get('headers') or []):
-                                if k.lower() == b'x-request-id':
-                                    rid = v.decode('utf-8', 'ignore')
-                                    break
-                        except Exception:
-                            rid = None
-                    if not rid:
-                        rid = str(uuid4())
-                    # persist back to scope.state so RequestIdMiddleware uses the same one
-                    try:
-                        if st is None:
-                            scope['state'] = {}
-                            st = scope['state']
-                        if isinstance(st, dict):
-                            st['request_id'] = rid
-                        else:
-                            setattr(st, 'request_id', rid)
-                    except Exception:
-                        pass
-                    payload = {
-                        'error': {'code': 'INTERNAL_ERROR', 'message': 'Internal server error', 'details': None},
-                        'request_id': rid,
-                    }
-                    resp = JSONResponse(status_code=500, content=payload)
-                    resp.headers['X-Request-Id'] = rid
-                    await resp(scope, receive, send)
-                    return
-            except Exception:
-                # Generic INTERNAL_ERROR fallback (platform contract).
-                # Single source of truth: scope['state']['request_id']
-                from uuid import uuid4
-                from starlette.responses import JSONResponse
-            
-                rid = None
-                state = scope.get('state')
-                try:
-                    if isinstance(state, dict):
-                        rid = state.get('request_id')
-                    else:
-                        rid = getattr(state, 'request_id', None)
-                except Exception:
-                    rid = None
-            
-                if not rid:
-                    # fallback to inbound request header if present
-                    try:
-                        for k, v in (scope.get('headers') or []):
-                            if k.lower() == b'x-request-id':
-                                rid = v.decode('utf-8', 'ignore')
-                                break
-                    except Exception:
-                        rid = None
-            
-                if not rid:
-                    rid = str(uuid4())
-            
-                # persist so outer RequestIdMiddleware can reuse it for response header
-                try:
-                    if state is None:
-                        scope['state'] = {}
-                        state = scope['state']
-                    if isinstance(state, dict):
-                        state['request_id'] = rid
-                    else:
-                        setattr(state, 'request_id', rid)
-                except Exception:
-                    pass
-            
-                payload = {
-                    'error': {'code': 'INTERNAL_ERROR', 'message': 'Internal server error', 'details': None},
-                    'request_id': rid,
-                }
-                resp = JSONResponse(status_code=500, content=payload)
-                # set it here too (safe); RequestIdMiddleware will set/override with the same rid
-                resp.headers['X-Request-Id'] = rid
-                await resp(scope, receive, send)
-                return
-        except Exception as exc:
-            # Generic INTERNAL_ERROR fallback (platform contract)
-            # Keep this minimal: do not leak internal exception details.
-            from uuid import uuid4
-            from starlette.responses import JSONResponse
-        
-            # best-effort request_id retrieval (should already exist from request_id middleware)
-            request_id = None
-            state = scope.get("state")
-            try:
-                request_id = getattr(state, "request_id", None)
-            except Exception:
-                request_id = None
-            if request_id is None and isinstance(state, dict):
-                request_id = state.get("request_id")
-        
-            if not request_id:
-                # try read from request headers
-                try:
-                    for k, v in scope.get("headers") or []:
-                        if k.lower() == b"x-request-id":
-                            request_id = v.decode("utf-8", "ignore")
-                            break
-                except Exception:
-                    request_id = None
-        
-            if not request_id:
-                request_id = str(uuid4())
-        
-            # write back to state (best effort)
-            try:
-                if state is not None:
-                    setattr(state, "request_id", request_id)
-            except Exception:
-                pass
-            if isinstance(state, dict):
-                state["request_id"] = request_id
-        
-            payload = {
-                "error": {
-                    "code": "INTERNAL_ERROR",
-                    "message": "Internal server error",
-                    "details": None,
-                },
-                "request_id": request_id,
-            }
-            resp = JSONResponse(status_code=500, content=payload)
-            resp.headers["X-Request-Id"] = request_id
+            await self.app(scope, receive, send)
+        except Exception:
+            # Do not leak internal details; follow platform envelope.
+            # Use Request so _error_response can apply CORS headers consistently.
+            req = Request(scope, receive)
+            resp = _error_response(
+                req,
+                status_code=500,
+                code="INTERNAL_ERROR",
+                message="Internal Server Error",
+                details=None,
+            )
             await resp(scope, receive, send)
             return

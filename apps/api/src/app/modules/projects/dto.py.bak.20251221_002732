@@ -1,0 +1,69 @@
+from __future__ import annotations
+
+from datetime import datetime
+from enum import Enum
+from typing import List, Optional
+
+from pydantic import BaseModel, Field
+
+
+class StrictModel(BaseModel):
+    # Pydantic v1 compat
+    class Config:
+        extra = "forbid"
+
+    # Pydantic v2 compat
+    model_config = {"extra": "forbid"}
+
+
+class ProjectType(str, Enum):
+    series_collection = "series_collection"
+    story_project = "story_project"
+
+
+class EncryptionPolicy(str, Enum):
+    none = "none"
+    bundle_only = "bundle_only"
+    at_rest_placeholder = "at_rest_placeholder"
+
+
+class FaceMode(str, Enum):
+    strict = "strict"
+    assisted = "assisted"
+    off = "off"
+
+
+class Project(StrictModel):
+    id: str
+    name: str
+    description: Optional[str] = None
+    project_type: ProjectType
+    encryption_policy: EncryptionPolicy
+    default_face_mode: FaceMode
+    tags: Optional[List[str]] = None
+    created_at: datetime
+    updated_at: datetime
+    archived_at: Optional[datetime] = None
+
+
+class ProjectCreate(StrictModel):
+    name: str = Field(min_length=1)
+    description: Optional[str] = None
+    project_type: ProjectType
+    default_face_mode: Optional[FaceMode] = None
+    tags: Optional[List[str]] = None
+
+
+class ProjectPatch(StrictModel):
+    name: Optional[str] = Field(default=None, min_length=1)
+    description: Optional[str] = None
+    default_face_mode: Optional[FaceMode] = None
+    tags: Optional[List[str]] = None
+    archived_at: Optional[datetime] = None
+
+
+class ProjectListResponse(StrictModel):
+    items: List[Project]
+    total: int
+    limit: int
+    offset: int

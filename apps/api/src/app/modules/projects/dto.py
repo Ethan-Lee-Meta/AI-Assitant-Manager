@@ -1,14 +1,3 @@
-"""
-M01 Projects - DTO & Enums (Frozen Contract Surface)
-
-This module intentionally contains only:
-- Enums required by the frozen Projects contract
-- Request/Response DTOs for Create/Patch/Get/List
-
-Business rules (defaults, sorting parse, q matching, tag normalization, archive semantics)
-MUST live in service.py in later steps.
-"""
-
 from __future__ import annotations
 
 from datetime import datetime
@@ -17,10 +6,23 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
+# Pydantic v2 forbids defining both `Config` and `model_config`.
+# This class uses ONE of them depending on availability.
+try:
+    from pydantic import ConfigDict  # type: ignore
 
-# -----------------------------
-# Enums (frozen)
-# -----------------------------
+    _STRICT_CONFIG = ConfigDict(extra="forbid")
+except Exception:
+    _STRICT_CONFIG = None
+
+
+class StrictModel(BaseModel):
+    if _STRICT_CONFIG is not None:
+        model_config = _STRICT_CONFIG  # pydantic v2
+    else:
+        class Config:  # pydantic v1 fallback
+            extra = "forbid"
+
 
 class ProjectType(str, Enum):
     series_collection = "series_collection"
@@ -33,104 +35,43 @@ class EncryptionPolicy(str, Enum):
     at_rest_placeholder = "at_rest_placeholder"
 
 
-class DefaultFaceMode(str, Enum):
+class FaceMode(str, Enum):
     strict = "strict"
     assisted = "assisted"
     off = "off"
 
 
-# -----------------------------
-# Request DTOs (frozen)
-# -----------------------------
-
-class ProjectCreateRequest(BaseModel):
-    """
-    Create request (frozen):
-      - name (required)
-      - description? (optional)
-      - project_type (required)
-      - default_face_mode? (optional; service will default to assisted)
-      - tags? (optional)
-    Note: encryption_policy is NOT in create request; service must default to bundle_only.
-    """
-    name: str = Field(..., min_length=1, max_length=200)
-    description: Optional[str] = Field(default=None, max_length=2000)
-    project_type: ProjectType
-    default_face_mode: Optional[DefaultFaceMode] = Field(default=None)
-    tags: Optional[List[str]] = Field(default=None)
-
-    class Config:
-        extra = "forbid"
-
-
-class ProjectPatchRequest(BaseModel):
-    """
-    Patch request (frozen):
-      - name?
-      - description?
-      - default_face_mode?
-      - tags?
-      - archived_at?
-    IMPORTANT: service must use fields-set tracking to distinguish:
-      - field omitted  -> no change
-      - field present null -> explicit unarchive (if you decide to support)
-    """
-    name: Optional[str] = Field(default=None, min_length=1, max_length=200)
-    description: Optional[str] = Field(default=None, max_length=2000)
-    default_face_mode: Optional[DefaultFaceMode] = Field(default=None)
-    tags: Optional[List[str]] = Field(default=None)
-    archived_at: Optional[datetime] = Field(default=None)
-
-    class Config:
-        extra = "forbid"
-
-
-# -----------------------------
-# Response DTOs (frozen)
-# -----------------------------
-
-class ProjectOut(BaseModel):
-    """
-    Project response fields (frozen minimum set):
-      id, name, description?, project_type, encryption_policy, default_face_mode, tags?,
-      created_at, updated_at, archived_at?
-    """
+class Project(StrictModel):
     id: str
     name: str
     description: Optional[str] = None
-
     project_type: ProjectType
     encryption_policy: EncryptionPolicy
-    default_face_mode: DefaultFaceMode
-
-    # Implementation constant (recommended):
-    # keep tags always present as list (default []) to simplify UI & avoid null-branches.
-    tags: List[str] = Field(default_factory=list)
-
+    default_face_mode: FaceMode
+    tags: Optional[List[str]] = None
     created_at: datetime
     updated_at: datetime
     archived_at: Optional[datetime] = None
 
-    class Config:
-        extra = "forbid"
+
+class ProjectCreate(StrictModel):
+    name: str = Field(min_length=1)
+    description: Optional[str] = None
+    project_type: ProjectType
+    default_face_mode: Optional[FaceMode] = None
+    tags: Optional[List[str]] = None
 
 
-class ProjectListResponse(BaseModel):
-    """
-    ListResponse (platform-frozen):
-      { items, total, limit, offset }
-    """
-    items: List[ProjectOut]
+class ProjectPatch(StrictModel):
+    name: Optional[str] = Field(default=None, min_length=1)
+    description: Optional[str] = None
+    default_face_mode: Optional[FaceMode] = None
+    tags: Optional[List[str]] = None
+    archived_at: Optional[datetime] = None
+
+
+class ProjectListResponse(StrictModel):
+    items: List[Project]
     total: int
     limit: int
     offset: int
-
-    class Config:
-        extra = "forbid"
-
-
-# -----------------------------
-# Constants for later steps
-# -----------------------------
-ALLOWED_SORT_FIELDS = {"created_at", "updated_at", "name"}
-DEFAULT_SORT = "-created_at"

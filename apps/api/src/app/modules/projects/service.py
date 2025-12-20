@@ -1,0 +1,138 @@
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Dict, Optional, Tuple
+from uuid import uuid4
+
+from app.core.errors import AppError
+
+from .dto import (
+    EncryptionPolicy,
+    FaceMode,
+    Project,
+    ProjectCreate,
+    ProjectListResponse,
+    ProjectPatch,
+    ProjectType,
+)
+from . import store_sqlite as store
+
+
+def _fields_set(model: Any) -> set:
+    # pydantic v2: model_fields_set; pydantic v1: __fields_set__
+    v = getattr(model, "model_fields_set", None)
+    if v is not None:
+        return set(v)
+    v1 = getattr(model, "__fields_set__", None)
+    if v1 is not None:
+        return set(v1)
+    return set()
+
+
+def _parse_sort(sort: str) -> Tuple[str, str]:
+    s = (sort or "").strip()
+    if not s:
+        # default: created_at desc
+        return "created_at", "DESC"
+
+    # format1: -created_at / created_at
+    if s.startswith("-"):
+        field = s[1:].strip()
+        direction = "DESC"
+    elif ":" in s:
+        # format2: created_at:desc / created_at:asc
+        field, d = s.split(":", 1)
+        field = field.strip()
+        d = d.strip().lower()
+        if d not in ("asc", "desc"):
+            raise AppError(
+                code="VALIDATION_ERROR",
+                message="Invalid sort direction",
+                details={"sort": sort},
+                status_code=422,
+            )
+        direction = "ASC" if d == "asc" else "DESC"
+    else:
+        field = s
+        direction = "ASC"
+
+    if field not in store.ALLOWED_SORT_FIELDS:
+        raise AppError(
+            code="VALIDATION_ERROR",
+            message="Invalid sort field",
+            details={"sort": sort, "allowed": sorted(list(store.ALLOWED_SORT_FIELDS))},
+            status_code=422,
+        )
+    return field, direction
+
+
+def create_project(payload: ProjectCreate) -> Project:
+    default_face_mode = payload.default_face_mode or FaceMode.assisted
+    encryption_policy = EncryptionPolicy.bundle_only  # MVP default, frozen
+
+    return store.insert_project(
+        project_id=str(uuid4()),
+        name=payload.name,
+        description=payload.description,
+        project_type=payload.project_type,
+        encryption_policy=encryption_policy,
+        default_face_mode=default_face_mode,
+        tags=payload.tags,
+    )
+
+
+def get_project(project_id: str) -> Project:
+    p = store.get_project(project_id)
+    if not p:
+        raise AppError(code="NOT_FOUND", message="Not Found", details=None, status_code=404)
+    return p
+
+
+def patch_project(project_id: str, payload: ProjectPatch) -> Project:
+    # ensure exists
+    _ = get_project(project_id)
+
+    updates: Dict[str, Any] = {}
+    fs = _fields_set(payload)
+
+    if "name" in fs:
+        updates["name"] = payload.name
+    if "description" in fs:
+        updates["description"] = payload.description
+    if "default_face_mode" in fs:
+        updates["default_face_mode"] = payload.default_face_mode.value if payload.default_face_mode else None
+    if "tags" in fs:
+        updates["tags"] = payload.tags
+    if "archived_at" in fs:
+        updates["archived_at"] = payload.archived_at  # datetime | None
+
+    # normalize default_face_mode None -> keep as-is (do not erase)
+    if "default_face_mode" in updates and updates["default_face_mode"] is None:
+        updates.pop("default_face_mode", None)
+
+    updated = store.update_project(project_id, updates)
+    if not updated:
+        raise AppError(code="NOT_FOUND", message="Not Found", details=None, status_code=404)
+    return updated
+
+
+def list_projects(
+    *,
+    q: Optional[str],
+    project_type: Optional[ProjectType],
+    archived: bool,
+    limit: int,
+    offset: int,
+    sort: str,
+) -> ProjectListResponse:
+    field, direction = _parse_sort(sort)
+    items, total = store.list_projects(
+        q=q,
+        project_type=project_type,
+        archived=bool(archived),
+        limit=int(limit),
+        offset=int(offset),
+        sort_field=field,
+        sort_dir=direction,
+    )
+    return ProjectListResponse(items=items, total=total, limit=int(limit), offset=int(offset))
