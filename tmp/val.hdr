@@ -1,0 +1,8 @@
+HTTP/1.1 422 Unprocessable Entity
+date: Sat, 20 Dec 2025 13:37:33 GMT
+server: uvicorn
+x-error-code: VALIDATION_ERROR
+content-length: 283
+content-type: application/json
+x-request-id: 32432453-af77-4fcc-9165-244c254640ed
+

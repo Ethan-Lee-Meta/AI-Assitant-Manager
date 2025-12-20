@@ -1,28 +1,66 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-API_BASE_URL="${API_BASE_URL:-http://localhost:7000}"
-LOCK_DIR="packages/contracts"
-LOCK_JSON="${LOCK_DIR}/openapi.json"
-LOCK_SHA="${LOCK_DIR}/openapi.sha256"
+VERIFY_LIVE="${VERIFY_LIVE:-1}"
+API_URL="${API_URL:-http://localhost:7000/openapi.json}"
 
-TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "${TMP_DIR}"' EXIT
+LOCK_JSON="packages/contracts/openapi.json"
+LOCK_SHA="packages/contracts/openapi.sha256"
 
-curl -sS "${API_BASE_URL}/openapi.json" -o "${TMP_DIR}/openapi.json"
-( cd "${TMP_DIR}" && sha256sum "openapi.json" > "openapi.sha256" )
-
-# 1) ensure lock sha matches its own json
-( cd "${LOCK_DIR}" && sha256sum -c "openapi.sha256" )
-
-# 2) ensure backend output equals lock json (by sha compare)
-LOCK_SUM="$(cut -d' ' -f1 "${LOCK_SHA}")"
-CURR_SUM="$(cut -d' ' -f1 "${TMP_DIR}/openapi.sha256")"
-
-if [ "${LOCK_SUM}" != "${CURR_SUM}" ]; then
-  echo "FAIL: backend OpenAPI differs from locked contracts."
-  echo "HINT: run ./scripts/export_openapi.sh to update lock artifacts (if change is intended)."
+if [[ ! -f "$LOCK_JSON" ]]; then
+  echo "[verify] ERROR: missing $LOCK_JSON" >&2
+  exit 1
+fi
+if [[ ! -f "$LOCK_SHA" ]]; then
+  echo "[verify] ERROR: missing $LOCK_SHA" >&2
   exit 1
 fi
 
-echo "OK: backend OpenAPI matches locked contracts."
+locked_sha="$(cat "$LOCK_SHA" | tr -d '\r' | xargs)"
+calc_sha="$(sha256sum "$LOCK_JSON" | awk '{print $1}')"
+
+if [[ "$locked_sha" != "$calc_sha" ]]; then
+  echo "[verify] ERROR: sha mismatch for locked openapi.json" >&2
+  echo "[verify] locked: $locked_sha" >&2
+  echo "[verify] calc  : $calc_sha" >&2
+  exit 1
+fi
+echo "[verify] OK: locked sha matches file"
+
+# 额外最低回归检查：锁定件必须包含平台验收路径
+pycmd() { if command -v python >/dev/null 2>&1; then python "$@"; else py -3 "$@"; fi; }
+
+pycmd - <<'PY' "$LOCK_JSON"
+import json, sys
+p = sys.argv[1]
+with open(p, "r", encoding="utf-8") as f:
+    data = json.load(f)
+paths = data.get("paths") or {}
+required = ["/health", "/api/_meta/echo", "/api/_meta/crash"]
+missing = [x for x in required if x not in paths]
+if missing:
+    raise SystemExit(f"[verify] ERROR: openapi missing required paths: {missing}")
+print("[verify] OK: required paths present")
+PY
+
+if [[ "$VERIFY_LIVE" == "0" ]]; then
+  echo "[verify] SKIP: live verification disabled (VERIFY_LIVE=0)"
+  exit 0
+fi
+
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+
+echo "[verify] fetching live OpenAPI from: $API_URL"
+curl -fsS "$API_URL" -o "$tmp"
+live_sha="$(sha256sum "$tmp" | awk '{print $1}')"
+
+if [[ "$live_sha" != "$locked_sha" ]]; then
+  echo "[verify] ERROR: live OpenAPI differs from locked artifact" >&2
+  echo "[verify] locked: $locked_sha" >&2
+  echo "[verify] live  : $live_sha" >&2
+  echo "[verify] hint  : run scripts/export_openapi.sh to update lockfiles (after confirming changes)" >&2
+  exit 1
+fi
+
+echo "[verify] OK: live OpenAPI matches locked artifact"

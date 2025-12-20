@@ -1,0 +1,4 @@
+[verify] OK: locked sha matches file
+[verify] OK: required paths present
+[verify] fetching live OpenAPI from: http://localhost:7000/openapi.json
+[verify] OK: live OpenAPI matches locked artifact

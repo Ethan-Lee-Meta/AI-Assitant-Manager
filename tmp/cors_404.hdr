@@ -1,0 +1,12 @@
+HTTP/1.1 404 Not Found
+date: Sat, 20 Dec 2025 11:40:36 GMT
+server: uvicorn
+x-error-code: NOT_FOUND
+access-control-allow-origin: http://localhost:2000
+access-control-allow-credentials: true
+access-control-expose-headers: X-Request-Id, X-Error-Code
+content-length: 119
+content-type: application/json
+vary: Origin
+x-request-id: 79746ba9-46d7-4a9d-b73d-cc4e5f4e0c32
+

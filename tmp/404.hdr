@@ -1,0 +1,8 @@
+HTTP/1.1 404 Not Found
+date: Sat, 20 Dec 2025 13:37:32 GMT
+server: uvicorn
+x-error-code: NOT_FOUND
+content-length: 119
+content-type: application/json
+x-request-id: e4c1eb15-9556-4d83-9899-061aff9212fa
+

@@ -1,0 +1,33 @@
+=== web build gate ===
+[web] node= npm=11.6.2
+
+added 26 packages in 53s
+
+5 packages are looking for funding
+  run `npm fund` for details
+
+> apps-web@0.0.0 build
+> next build
+
+▲ Next.js 16.1.0 (Turbopack)
+
+  Creating an optimized production build ...
+✓ Compiled successfully in 2.9s
+  Running TypeScript ...
+  Collecting page data using 19 workers ...
+  Generating static pages using 19 workers (0/5) ...
+  Generating static pages using 19 workers (1/5) 
+  Generating static pages using 19 workers (2/5) 
+  Generating static pages using 19 workers (3/5) 
+✓ Generating static pages using 19 workers (5/5) in 542.4ms
+  Finalizing page optimization ...
+
+Route (app)
+┌ ○ /
+├ ○ /_not-found
+├ ○ /projects
+└ ○ /settings
+
+
+○  (Static)  prerendered as static content
+

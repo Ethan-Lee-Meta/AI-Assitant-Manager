@@ -1,0 +1,49 @@
+=== web gate start: 20251220_215712 ===
+[info] pwd=/e/01Small_Tools/AI-Assitant-Manager
+=== step1: toolchain ===
+which node: alias node='winpty node.exe'
+node -v   : stdout is not a tty
+which npm : /d/Program Files/nodejs/npm
+npm -v    : 11.6.2
+=== step2: install + build ===
++ cd apps/web
++ npm ci
+
+added 26 packages in 57s
+
+5 packages are looking for funding
+  run `npm fund` for details
++ npm run build
+
+> apps-web@0.0.0 build
+> next build
+
+▲ Next.js 16.1.0 (Turbopack)
+
+  Creating an optimized production build ...
+✓ Compiled successfully in 3.3s
+  Running TypeScript ...
+  Collecting page data using 19 workers ...
+  Generating static pages using 19 workers (0/5) ...
+  Generating static pages using 19 workers (1/5) 
+  Generating static pages using 19 workers (2/5) 
+  Generating static pages using 19 workers (3/5) 
+✓ Generating static pages using 19 workers (5/5) in 523.1ms
+  Finalizing page optimization ...
+
+Route (app)
+┌ ○ /
+├ ○ /_not-found
+├ ○ /projects
+└ ○ /settings
+
+
+○  (Static)  prerendered as static content
+
+[rc] build_rc=0
+=== step3: reachability (optional) ===
+curl: (7) Failed to connect to localhost port 2000 after 2242 ms: Could not connect to server
+[rc] curl_2000_rc=7
+=== RESULT ===
+build_rc=0 curl_2000_rc=7
+[FAIL] gate failed; show tail of log:

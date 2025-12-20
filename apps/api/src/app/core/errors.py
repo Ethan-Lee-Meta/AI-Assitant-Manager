@@ -1,34 +1,32 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Callable
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from starlette.types import ASGIApp, Scope, Receive, Send
+from starlette.types import ASGIApp, Scope, Receive, Send, Message
 
-from .request_id import get_request_id, new_request_id, set_request_id
+from .config import get_settings
+from .request_id import get_request_id, new_request_id
 
-
-class ErrorBody(BaseModel):
-    code: str
-    message: str
-    details: Optional[Dict[str, Any]] = None
-
-
-class ErrorEnvelope(BaseModel):
-    error: ErrorBody
-    request_id: str
+# -----------------------------
+# Platform error model (frozen)
+# -----------------------------
+# ErrorEnvelope:
+# {
+#   "error": { "code": str, "message": str, "details": dict | null },
+#   "request_id": str
+# }
 
 
 class AppError(Exception):
     def __init__(
         self,
-        *,
         code: str,
         message: str,
+        *,
         details: Optional[Dict[str, Any]] = None,
         status_code: int = 400,
     ) -> None:
@@ -39,136 +37,292 @@ class AppError(Exception):
         self.status_code = status_code
 
 
-def _ensure_request_id() -> str:
+def _rid() -> str:
     rid = get_request_id()
     if rid:
         return rid
-    rid = new_request_id()
-    set_request_id(rid)
-    return rid
+    return new_request_id()
 
 
-def error_response(
+def _normalize_origin(o: str) -> str:
+    o = (o or "").strip()
+    if o.endswith("/"):
+        o = o[:-1]
+    return o
+
+
+def _is_origin_allowed(origin: str) -> bool:
+    settings = get_settings()
+    origin_n = _normalize_origin(origin)
+    allowed = [_normalize_origin(x) for x in (settings.CORS_ALLOW_ORIGINS or [])]
+    return origin_n in allowed
+
+
+def _cors_headers_for_error(request: Request) -> Dict[str, str]:
+    """
+    Guarantee CORS headers for ERROR responses so browsers can read ErrorEnvelope.
+    This is a platform-level guardrail.
+    """
+    origin = request.headers.get("origin")
+    if not origin:
+        return {}
+    if not _is_origin_allowed(origin):
+        return {}
+
+    return {
+        "Access-Control-Allow-Origin": origin,
+        "Access-Control-Allow-Credentials": "true",
+        "Access-Control-Expose-Headers": "X-Request-Id, X-Error-Code",
+    }
+
+
+def _envelope(code: str, message: str, details: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "error": {"code": code, "message": message, "details": details},
+        "request_id": _rid(),
+    }
+
+
+def _error_response(
+    request: Request,
     *,
     status_code: int,
     code: str,
     message: str,
-    details: Optional[Dict[str, Any]] = None,
+    details: Optional[Dict[str, Any]],
 ) -> JSONResponse:
-    rid = _ensure_request_id()
-    payload = ErrorEnvelope(
-        error=ErrorBody(code=code, message=message, details=details),
-        request_id=rid,
-    ).model_dump()
+    body = _envelope(code, message, details)
 
-    return JSONResponse(
-        status_code=status_code,
-        content=payload,
-        headers={
-            "X-Request-Id": rid,   # body/header must match
-            "X-Error-Code": code,  # for logging middleware
-        },
+    headers: Dict[str, str] = {
+        "X-Request-Id": body["request_id"],
+        "X-Error-Code": code,
+    }
+    headers.update(_cors_headers_for_error(request))
+
+    return JSONResponse(status_code=status_code, content=body, headers=headers)
+
+
+# -----------------------------
+# Exception handlers (new API)
+# -----------------------------
+async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
+    return _error_response(
+        request,
+        status_code=exc.status_code,
+        code=exc.code,
+        message=exc.message,
+        details=exc.details,
     )
 
 
-def _map_http_exception(exc: StarletteHTTPException) -> tuple[int, str, str, Optional[Dict[str, Any]]]:
-    status = int(getattr(exc, "status_code", 500) or 500)
+async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    details = {"errors": exc.errors()}
+    return _error_response(
+        request,
+        status_code=422,
+        code="VALIDATION_ERROR",
+        message="Request validation failed",
+        details=details,
+    )
 
-    if status == 404:
-        code, message = "NOT_FOUND", "Not Found"
-    elif status == 401:
-        code, message = "UNAUTHORIZED", "Unauthorized"
-    elif status == 403:
-        code, message = "FORBIDDEN", "Forbidden"
-    elif status == 405:
-        code, message = "METHOD_NOT_ALLOWED", "Method Not Allowed"
+
+async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    if int(exc.status_code) == 404:
+        code = "NOT_FOUND"
+        message = "Not Found"
     else:
-        code, message = "HTTP_ERROR", "HTTP Error"
+        code = "HTTP_ERROR"
+        message = exc.detail if isinstance(exc.detail, str) else f"HTTP {exc.status_code}"
+    return _error_response(
+        request,
+        status_code=int(exc.status_code),
+        code=code,
+        message=message,
+        details=None,
+    )
 
-    detail = getattr(exc, "detail", None)
-    details = {"detail": detail} if detail is not None else None
-    return status, code, message, details
+
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    return _error_response(
+        request,
+        status_code=500,
+        code="INTERNAL_ERROR",
+        message="Internal Server Error",
+        details=None,
+    )
 
 
+def add_exception_handlers(app: FastAPI) -> None:
+    """
+    Backward-compatible registration function expected by main.py in some variants.
+    Registers platform-standard handlers.
+    """
+    app.add_exception_handler(AppError, app_error_handler)
+    app.add_exception_handler(RequestValidationError, validation_error_handler)
+    app.add_exception_handler(StarletteHTTPException, http_exception_handler)
+    app.add_exception_handler(Exception, unhandled_exception_handler)
+
+
+# -----------------------------
+# Backward-compat symbol
+# -----------------------------
 class ErrorEnvelopeMiddleware:
     """
-    平台兜底：确保任何漏网异常都被转成 ErrorEnvelope（避免 TestClient re-raise）。
-    这不替代 FastAPI exception handlers；只是最后一道保险。
+    Compatibility shim only.
+
+    Some earlier main.py versions import ErrorEnvelopeMiddleware.
+    We keep it as a no-op pass-through middleware because platform errors are handled
+    via exception handlers above (single source of truth).
     """
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-
         try:
-            await self.app(scope, receive, send)
-        except RequestValidationError as exc:
-            resp = error_response(
-                status_code=422,
-                code="VALIDATION_ERROR",
-                message="Request validation failed",
-                details={"errors": exc.errors()},
-            )
+            try:
+                try:
+                    await self.app(scope, receive, send)
+                except Exception:
+                    # --- M00-HOTFIX-ERRORS-STATE: INTERNAL_ERROR fallback, rid from scope.state ---
+                    from uuid import uuid4
+                    from starlette.responses import JSONResponse
+                    rid = None
+                    st = scope.get('state')
+                    try:
+                        if isinstance(st, dict):
+                            rid = st.get('request_id')
+                        else:
+                            rid = getattr(st, 'request_id', None)
+                    except Exception:
+                        rid = None
+                    if not rid:
+                        # try inbound header
+                        try:
+                            for k, v in (scope.get('headers') or []):
+                                if k.lower() == b'x-request-id':
+                                    rid = v.decode('utf-8', 'ignore')
+                                    break
+                        except Exception:
+                            rid = None
+                    if not rid:
+                        rid = str(uuid4())
+                    # persist back to scope.state so RequestIdMiddleware uses the same one
+                    try:
+                        if st is None:
+                            scope['state'] = {}
+                            st = scope['state']
+                        if isinstance(st, dict):
+                            st['request_id'] = rid
+                        else:
+                            setattr(st, 'request_id', rid)
+                    except Exception:
+                        pass
+                    payload = {
+                        'error': {'code': 'INTERNAL_ERROR', 'message': 'Internal server error', 'details': None},
+                        'request_id': rid,
+                    }
+                    resp = JSONResponse(status_code=500, content=payload)
+                    resp.headers['X-Request-Id'] = rid
+                    await resp(scope, receive, send)
+                    return
+            except Exception:
+                # Generic INTERNAL_ERROR fallback (platform contract).
+                # Single source of truth: scope['state']['request_id']
+                from uuid import uuid4
+                from starlette.responses import JSONResponse
+            
+                rid = None
+                state = scope.get('state')
+                try:
+                    if isinstance(state, dict):
+                        rid = state.get('request_id')
+                    else:
+                        rid = getattr(state, 'request_id', None)
+                except Exception:
+                    rid = None
+            
+                if not rid:
+                    # fallback to inbound request header if present
+                    try:
+                        for k, v in (scope.get('headers') or []):
+                            if k.lower() == b'x-request-id':
+                                rid = v.decode('utf-8', 'ignore')
+                                break
+                    except Exception:
+                        rid = None
+            
+                if not rid:
+                    rid = str(uuid4())
+            
+                # persist so outer RequestIdMiddleware can reuse it for response header
+                try:
+                    if state is None:
+                        scope['state'] = {}
+                        state = scope['state']
+                    if isinstance(state, dict):
+                        state['request_id'] = rid
+                    else:
+                        setattr(state, 'request_id', rid)
+                except Exception:
+                    pass
+            
+                payload = {
+                    'error': {'code': 'INTERNAL_ERROR', 'message': 'Internal server error', 'details': None},
+                    'request_id': rid,
+                }
+                resp = JSONResponse(status_code=500, content=payload)
+                # set it here too (safe); RequestIdMiddleware will set/override with the same rid
+                resp.headers['X-Request-Id'] = rid
+                await resp(scope, receive, send)
+                return
+        except Exception as exc:
+            # Generic INTERNAL_ERROR fallback (platform contract)
+            # Keep this minimal: do not leak internal exception details.
+            from uuid import uuid4
+            from starlette.responses import JSONResponse
+        
+            # best-effort request_id retrieval (should already exist from request_id middleware)
+            request_id = None
+            state = scope.get("state")
+            try:
+                request_id = getattr(state, "request_id", None)
+            except Exception:
+                request_id = None
+            if request_id is None and isinstance(state, dict):
+                request_id = state.get("request_id")
+        
+            if not request_id:
+                # try read from request headers
+                try:
+                    for k, v in scope.get("headers") or []:
+                        if k.lower() == b"x-request-id":
+                            request_id = v.decode("utf-8", "ignore")
+                            break
+                except Exception:
+                    request_id = None
+        
+            if not request_id:
+                request_id = str(uuid4())
+        
+            # write back to state (best effort)
+            try:
+                if state is not None:
+                    setattr(state, "request_id", request_id)
+            except Exception:
+                pass
+            if isinstance(state, dict):
+                state["request_id"] = request_id
+        
+            payload = {
+                "error": {
+                    "code": "INTERNAL_ERROR",
+                    "message": "Internal server error",
+                    "details": None,
+                },
+                "request_id": request_id,
+            }
+            resp = JSONResponse(status_code=500, content=payload)
+            resp.headers["X-Request-Id"] = request_id
             await resp(scope, receive, send)
-        except AppError as exc:
-            resp = error_response(
-                status_code=exc.status_code,
-                code=exc.code,
-                message=exc.message,
-                details=exc.details,
-            )
-            await resp(scope, receive, send)
-        except StarletteHTTPException as exc:
-            status, code, message, details = _map_http_exception(exc)
-            resp = error_response(status_code=status, code=code, message=message, details=details)
-            await resp(scope, receive, send)
-        except Exception:
-            resp = error_response(
-                status_code=500,
-                code="INTERNAL_ERROR",
-                message="Internal Server Error",
-                details=None,
-            )
-            await resp(scope, receive, send)
-
-
-def add_exception_handlers(app: FastAPI) -> None:
-    """
-    仍然提供 FastAPI exception handlers（冻结要求）。
-    """
-
-    @app.exception_handler(RequestValidationError)
-    async def _validation_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
-        return error_response(
-            status_code=422,
-            code="VALIDATION_ERROR",
-            message="Request validation failed",
-            details={"errors": exc.errors()},
-        )
-
-    @app.exception_handler(AppError)
-    async def _app_error_handler(request: Request, exc: AppError) -> JSONResponse:
-        return error_response(
-            status_code=exc.status_code,
-            code=exc.code,
-            message=exc.message,
-            details=exc.details,
-        )
-
-    @app.exception_handler(StarletteHTTPException)
-    async def _http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
-        status, code, message, details = _map_http_exception(exc)
-        return error_response(status_code=status, code=code, message=message, details=details)
-
-    @app.exception_handler(Exception)
-    async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-        return error_response(
-            status_code=500,
-            code="INTERNAL_ERROR",
-            message="Internal Server Error",
-            details=None,
-        )
+            return

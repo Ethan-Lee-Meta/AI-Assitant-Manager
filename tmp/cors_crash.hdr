@@ -1,0 +1,12 @@
+HTTP/1.1 500 Internal Server Error
+date: Sat, 20 Dec 2025 11:21:37 GMT
+server: uvicorn
+x-request-id: 9c20eee0-22f6-4aaa-8c40-a0a45fb716c5
+x-error-code: INTERNAL_ERROR
+access-control-allow-origin: http://localhost:2000
+vary: Origin
+access-control-allow-credentials: true
+access-control-expose-headers: X-Request-Id, X-Error-Code
+content-length: 136
+content-type: application/json
+
