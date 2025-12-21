@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$repo_root"
+ts="$(date +%Y%m%d_%H%M%S)"
+
+echo "[info] repo_root=$repo_root ts=$ts"
+
+# 1) Fix the accidental "echoëcho" in the tmp script (so it can be re-run cleanly)
+if [ -f "tmp/M02_R6_COMPLETE_SERIES_WORKSPACE_ASSOC" ]; then
+  cp -a "tmp/M02_R6_COMPLETE_SERIES_WORKSPACE_ASSOC" "tmp/M02_R6_COMPLETE_SERIES_WORKSPACE_ASSOC.bak.$ts"
+  python - <<'PY'
+from pathlib import Path
+p = Path("tmp/M02_R6_COMPLETE_SERIES_WORKSPACE_ASSOC")
+s = p.read_text(encoding="utf-8", errors="ignore")
+s2 = s.replace("echoëcho", "echo")
+p.write_text(s2, encoding="utf-8")
+print("[ok] patched tmp/M02_R6_COMPLETE_SERIES_WORKSPACE_ASSOC: echoëcho -> echo")
+PY
+else
+  echo "[warn] tmp/M02_R6_COMPLETE_SERIES_WORKSPACE_ASSOC not found; skip"
+fi
+
+# 2) Fix Next.js import aliases that don't exist in this repo (use relative imports like settings page)
+p1="apps/web/app/(app)/series/page.tsx"
+p2="apps/web/app/(app)/series/[series_id]/page.tsx"
+
+for f in "$p1" "$p2"; do
+  if [ -f "$f" ]; then
+    cp -a "$f" "$f.bak.$ts"
+    echo "[ok] backup: $f.bak.$ts"
+  else
+    echo "[fail] missing file: $f"
+    exit 1
+  fi
+done
+
+cat <<'TSX' > "$p1"
+import { SeriesIndex } from "../../../src/ui/series/SeriesIndex";
+
+export default function Page() {
+  return <SeriesIndex />;
+}
+TSX
+echo "[ok] wrote: $p1"
+
+cat <<'TSX' > "$p2"
+import { SeriesDetail } from "../../../../src/ui/series/SeriesDetail";
+
+export default async function Page({ params }: { params: Promise<{ series_id: string }> }) {
+  const { series_id } = await params;
+  return <SeriesDetail series_id={series_id} />;
+}
+TSX
+echo "[ok] wrote: $p2"
+
+# 3) Re-run frontend build gate
+echo "[info] running next build..."
+cd apps/web
+npm run build

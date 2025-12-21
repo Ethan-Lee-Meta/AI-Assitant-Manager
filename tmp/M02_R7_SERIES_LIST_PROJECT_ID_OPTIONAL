@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$repo_root"
+ts="$(date +%Y%m%d_%H%M%S)"
+echo "[info] repo_root=$repo_root ts=$ts"
+
+# --------
+# Backend: make GET /api/series project_id optional (None => list all)
+# --------
+router="apps/api/src/app/modules/series/router.py"
+service="apps/api/src/app/modules/series/service.py"
+store="apps/api/src/app/modules/series/store_sqlite.py"
+testf="apps/api/tests/test_series_crud.py"
+
+for f in "$router" "$service" "$store" "$testf"; do
+  test -f "$f" || { echo "[fatal] missing file: $f"; exit 2; }
+  cp -a "$f" "$f.bak.$ts"
+  echo "[ok] backup: $f.bak.$ts"
+done
+
+python - <<'PY'
+import re
+from pathlib import Path
+
+router = Path("apps/api/src/app/modules/series/router.py")
+service = Path("apps/api/src/app/modules/series/service.py")
+store = Path("apps/api/src/app/modules/series/store_sqlite.py")
+testf = Path("apps/api/tests/test_series_crud.py")
+
+# ---- router patch ----
+s = router.read_text(encoding="utf-8", errors="ignore")
+
+# 1) project_id Query required -> optional
+# handle a few likely shapes
+s2 = s
+
+# if it used Query(...) as required
+s2_new = re.sub(
+    r'project_id\s*:\s*str\s*=\s*Query\(\s*\.\.\.\s*[^)]*\)',
+    'project_id: str | None = Query(None)',
+    s2
+)
+# or Query(...) without "..."
+s2_new = re.sub(
+    r'project_id\s*:\s*str\s*=\s*Query\(\s*[^)]*\)',
+    'project_id: str | None = Query(None)',
+    s2_new
+)
+
+# 2) remove any manual 422 guard like "if not project_id: raise HTTPException(422, ...)"
+s2_new = re.sub(
+    r'\n\s*if\s+not\s+project_id\s*:\s*\n\s*raise\s+HTTPException\(\s*status_code\s*=\s*422[^)]*\)\s*\n',
+    "\n",
+    s2_new
+)
+
+if s2_new == s:
+    # if we didn't match anything, fail loudly (no guessing)
+    raise SystemExit("[fatal] router.py: did not find a patchable project_id Query/guard pattern. Please paste router.py content.")
+router.write_text(s2_new, encoding="utf-8")
+print("[ok] patched router.py: project_id optional + removed required guard (if existed)")
+
+# ---- service patch ----
+s = service.read_text(encoding="utf-8", errors="ignore")
+s2 = s
+
+# make list function accept Optional project_id and pass through
+# common pattern: def list_series(project_id: str, ...
+s2_new = re.sub(r'def\s+list_([a-zA-Z0-9_]*)\(\s*project_id\s*:\s*str\s*,', r'def list_\1(project_id: str | None,', s2)
+if s2_new == s:
+    # fallback: maybe it's list_series(... project_id: str = ...
+    s2_new = re.sub(r'def\s+list_([a-zA-Z0-9_]*)\(\s*project_id\s*:\s*str\s*=', r'def list_\1(project_id: str | None =', s2)
+
+if s2_new == s:
+    raise SystemExit("[fatal] service.py: did not find list_* signature with project_id: str. Please paste service.py content.")
+service.write_text(s2_new, encoding="utf-8")
+print("[ok] patched service.py: list_* project_id optional")
+
+# ---- store patch ----
+s = store.read_text(encoding="utf-8", errors="ignore")
+s2 = s
+
+# 1) signature project_id: str -> str | None
+s2_new = re.sub(r'(def\s+list_?[a-zA-Z0-9_]*\(\s*[^)]*?)project_id\s*:\s*str', r'\1project_id: str | None', s2)
+if s2_new == s2:
+    raise SystemExit("[fatal] store_sqlite.py: could not update list signature. Please paste store_sqlite.py content.")
+
+# 2) ensure SQL WHERE on project_id is conditional
+# We look for a very common pattern and rewrite the WHERE builder block safely.
+# If pattern not found, we fail loudly.
+if "WHERE project_id" in s2_new and "project_id" in s2_new:
+    # try to rewrite a simple fixed WHERE clause to conditional
+    # replace first occurrence of "WHERE project_id = ?" with "WHERE 1=1" and inject conditional append nearby.
+    # This is intentionally conservative; if it can't find a place, it fails.
+    if "WHERE project_id = ?" in s2_new:
+        s2_new = s2_new.replace("WHERE project_id = ?", "WHERE 1=1", 1)
+        # inject conditional right after params initialization if present
+        # common: params = [project_id, ...]
+        s2_new2 = re.sub(
+            r'params\s*=\s*\[\s*project_id\s*(,)?',
+            'params = [\n        ]\n        if project_id:\n            where_sql = where_sql + " AND project_id = ?"\n            params.append(project_id)\n        # keep other params below\n        params.extend([',
+            s2_new,
+            count=1
+        )
+        if s2_new2 == s2_new:
+            # alternative: maybe params is a list later; we do a smaller injection near cursor.execute(...) for list query
+            raise SystemExit("[fatal] store_sqlite.py: found fixed WHERE but could not inject conditional params logic safely. Please paste store_sqlite.py content.")
+        s2_new = s2_new2
+    else:
+        # already conditional or different style; leave it
+        pass
+else:
+    raise SystemExit("[fatal] store_sqlite.py: unexpected list query shape; cannot safely patch without source. Please paste store_sqlite.py content.")
+
+store.write_text(s2_new, encoding="utf-8")
+print("[ok] patched store_sqlite.py: list allows project_id=None (no filter)")
+
+# ---- tests patch ----
+t = testf.read_text(encoding="utf-8", errors="ignore")
+
+# change: list without project_id should be 200 (not 422)
+t2 = re.sub(
+    r'def\s+test_series_list_requires_project_id\(\)\s*:\s*\n\s*c\s*=\s*TestClient\(app\)\s*\n\s*r\s*=\s*c\.get\("/api/series"\)\s*\n\s*assert\s+r\.status_code\s*==\s*422\s*\n',
+    'def test_series_list_allows_missing_project_id_lists_all():\n    c = TestClient(app)\n    r = c.get("/api/series")\n    assert r.status_code == 200, r.text\n    js = r.json()\n    assert "items" in js and "total" in js\n',
+    t,
+    flags=re.M
+)
+
+if t2 == t:
+    raise SystemExit("[fatal] test_series_crud.py: could not patch the requires_project_id test. Please paste test_series_crud.py content.")
+testf.write_text(t2, encoding="utf-8")
+print("[ok] patched tests: list without project_id now allowed")
+
+PY
+
+# gate: backend tests
+echo "[info] running backend tests..."
+cd apps/api
+PYTHONPATH=./src pytest -q
+cd - >/dev/null
+
+# gate: web build
+echo "[info] running web build..."
+cd apps/web
+npm run build
+cd - >/dev/null
+
+echo "[done] M02_R7: series list project_id optional (empty => list all) + gates passed"

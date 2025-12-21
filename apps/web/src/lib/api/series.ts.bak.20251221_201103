@@ -1,0 +1,99 @@
+import { apiFetch } from "./client";
+
+export type Series = {
+  id: string;
+  project_id: string;
+  name: string;
+  style_text?: string | null;
+  continuity_text?: string | null;
+  archived_at?: string | null;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type SeriesCreate = {
+  project_id: string;
+  name: string;
+  style_text?: string | null;
+  continuity_text?: string | null;
+};
+
+export type SeriesPatch = {
+  name?: string;
+  style_text?: string | null;
+  continuity_text?: string | null;
+  archived_at?: string | null;
+};
+
+export type ListResponse<T> = {
+  items: T[];
+  total: number;
+  limit?: number;
+  offset?: number;
+};
+
+function qs(params: Record<string, any>): string {
+  const sp = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined) continue;
+    if (v === null) {
+      // keep null out of querystring by default
+      continue;
+    }
+    sp.set(k, String(v));
+  }
+  const s = sp.toString();
+  return s ? `?${s}` : "";
+}
+
+export async function listSeries(params: {
+  project_id: string;
+  q?: string;
+  archived?: boolean;
+  limit?: number;
+  offset?: number;
+}): Promise<ListResponse<Series>> {
+  const { project_id, q, archived, limit = 50, offset = 0 } = params;
+  return apiFetch<ListResponse<Series>>(
+    `/api/series${qs({ project_id, q, archived, limit, offset })}`
+  );
+}
+
+export async function createSeries(payload: SeriesCreate): Promise<Series> {
+  return apiFetch<Series>(`/api/series`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload ?? {}),
+  });
+}
+
+export async function getSeries(series_id: string): Promise<Series> {
+  return apiFetch<Series>(`/api/series/${series_id}`);
+}
+
+export async function patchSeries(series_id: string, patch: SeriesPatch): Promise<Series> {
+  return apiFetch<Series>(`/api/series/${series_id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch ?? {}),
+  });
+}
+
+export async function updateSeries(series_id: string, patch: SeriesPatch): Promise<Series> {
+  return patchSeries(series_id, patch);
+}
+
+/**
+ * Best-effort delete:
+ * - try DELETE /api/series/{id}
+ * - if backend doesn't support, fall back to archiving (archived_at=now)
+ */
+export async function deleteSeries(series_id: string): Promise<void> {
+  try {
+    await apiFetch<any>(`/api/series/${series_id}`, { method: "DELETE" });
+    return;
+  } catch (_e) {
+    // fallback to archive
+    await patchSeries(series_id, { archived_at: new Date().toISOString() });
+  }
+}

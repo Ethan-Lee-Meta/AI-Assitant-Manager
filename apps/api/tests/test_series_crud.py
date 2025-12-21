@@ -1,10 +1,12 @@
 from fastapi.testclient import TestClient
 from app.main import app
 
-def test_series_list_requires_project_id():
+def test_series_list_project_id_optional():
     c = TestClient(app)
     r = c.get("/api/series")
-    assert r.status_code == 422
+    assert r.status_code == 200, r.text
+    js = r.json()
+    assert "items" in js and "total" in js and "limit" in js and "offset" in js
 
 def test_series_crud_and_project_filtering():
     c = TestClient(app)

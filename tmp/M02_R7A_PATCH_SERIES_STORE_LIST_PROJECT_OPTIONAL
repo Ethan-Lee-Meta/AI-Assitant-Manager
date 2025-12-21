@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$repo_root"
+
+STORE="apps/api/src/app/modules/series/store_sqlite.py"
+TEST="apps/api/tests/test_series_crud.py"
+
+if [ ! -f "$STORE" ]; then
+  echo "[fail] missing $STORE"
+  exit 1
+fi
+
+ts="$(date +%Y%m%d_%H%M%S)"
+cp -a "$STORE" "$STORE.bak.$ts"
+echo "[ok] backup: $STORE.bak.$ts"
+
+python - <<'PY'
+from pathlib import Path
+import re
+
+path = Path("apps/api/src/app/modules/series/store_sqlite.py")
+s = path.read_text(encoding="utf-8")
+
+pat = re.compile(
+    r"def list_items\(\n"
+    r"(?:.|\n)*?"
+    r"\)\s*->\s*Dict\[str,\s*Any\]:\n"
+    r"(?:.|\n)*?"
+    r"return\s*\{\n"
+    r"(?:.|\n)*?"
+    r"\}\n",
+    re.MULTILINE,
+)
+
+m = pat.search(s)
+if not m:
+    raise SystemExit("[fail] cannot locate list_items() block in series/store_sqlite.py")
+
+replacement = """def list_items(
+    project_id: Optional[str] = None,
+    q: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    conn = _connect()
+    _ensure(conn)
+
+    # project_id is optional:
+    # - if provided: filter by project_id
+    # - if omitted/empty: return across projects (caller requested global refresh behavior)
+    where = ["1=1"]
+    args: List[Any] = []
+
+    if project_id:
+        where.append("project_id = ?")
+        args.append(project_id)
+
+    if q:
+        where.append("name LIKE ?")
+        args.append(f"%{q}%")
+
+    where_sql = " AND ".join(where)
+    total = conn.execute(
+        f"SELECT COUNT(1) AS c FROM series WHERE {where_sql}",
+        tuple(args),
+    ).fetchone()["c"]
+
+    rows = conn.execute(
+        f\"\"\"
+        SELECT *
+        FROM series
+        WHERE {where_sql}
+        ORDER BY created_at DESC
+        LIMIT ? OFFSET ?
+        \"\"\",
+        tuple(args + [limit, offset]),
+    ).fetchall()
+
+    return {
+        "total": int(total),
+        "items": [_row_to_dict(r) for r in rows],
+        "limit": int(limit),
+        "offset": int(offset),
+    }
+"""
+
+s2 = s[: m.start()] + replacement + s[m.end():]
+path.write_text(s2, encoding="utf-8")
+print("[ok] patched list_items(): project_id optional")
+PY
+
+if [ -f "$TEST" ]; then
+  cp -a "$TEST" "$TEST.bak.$ts"
+  echo "[ok] backup: $TEST.bak.$ts"
+
+  python - <<'PY'
+from pathlib import Path
+import re
+
+path = Path("apps/api/tests/test_series_crud.py")
+s = path.read_text(encoding="utf-8")
+
+# Replace the first test to reflect "project_id optional"
+pat = re.compile(r"def test_series_list_requires_project_id\(\):\n(?:[^\n]*\n)+?\n", re.MULTILINE)
+m = pat.search(s)
+if not m:
+    # If function name changed, do a best-effort edit: transform "assert r.status_code == 422" -> 200
+    s2 = s.replace('assert r.status_code == 422', 'assert r.status_code == 200')
+    path.write_text(s2, encoding="utf-8")
+    print("[warn] test function name not found; replaced status_code 422 -> 200 (best-effort)")
+else:
+    new_block = """def test_series_list_project_id_optional():
+    c = TestClient(app)
+    r = c.get("/api/series")
+    assert r.status_code == 200, r.text
+    js = r.json()
+    assert "items" in js and "total" in js and "limit" in js and "offset" in js
+
+"""
+    s2 = s[:m.start()] + new_block + s[m.end():]
+    path.write_text(s2, encoding="utf-8")
+    print("[ok] patched test: list allows missing project_id")
+PY
+else
+  echo "[warn] no test file at $TEST (skip)"
+fi
+
+echo "[done] patched series store + test"

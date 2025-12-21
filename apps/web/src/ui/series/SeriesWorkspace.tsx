@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Series, getSeries, patchSeries } from "../../lib/api/series";
+import { Series, getSeries, updateSeries } from "../../lib/api/series";
 
 export function SeriesWorkspace(props: { seriesId: string }) {
   const { seriesId } = props;
@@ -37,7 +37,7 @@ export function SeriesWorkspace(props: { seriesId: string }) {
     setLoading(true);
     setErr(null);
     try {
-      const s = await patchSeries(seriesId, {
+      const s = await updateSeries(seriesId, {
         style_text: styleText,
         continuity_text: continuityText,
       });
@@ -53,7 +53,7 @@ export function SeriesWorkspace(props: { seriesId: string }) {
     setLoading(true);
     setErr(null);
     try {
-      const s = await patchSeries(seriesId, { archived_at: new Date().toISOString() });
+      const s = await updateSeries(seriesId, { archived_at: new Date().toISOString() });
       setItem(s);
     } catch (e: any) {
       setErr(e?.message || "archive failed");
@@ -66,7 +66,7 @@ export function SeriesWorkspace(props: { seriesId: string }) {
     setLoading(true);
     setErr(null);
     try {
-      const s = await patchSeries(seriesId, { archived_at: null });
+      const s = await updateSeries(seriesId, { archived_at: null });
       setItem(s);
     } catch (e: any) {
       setErr(e?.message || "restore failed");

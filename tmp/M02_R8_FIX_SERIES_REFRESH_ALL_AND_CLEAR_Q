@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$repo_root"
+ts="$(date +%Y%m%d_%H%M%S)"
+
+echo "[info] M02_R8 starting... repo_root=$repo_root ts=$ts"
+
+api_router="apps/api/src/app/modules/series/router.py"
+api_service="apps/api/src/app/modules/series/service.py"
+api_store="apps/api/src/app/modules/series/store_sqlite.py"
+api_test="apps/api/tests/test_series_crud.py"
+
+web_api="apps/web/src/lib/api/series.ts"
+web_ui="apps/web/src/ui/series/SeriesIndex.tsx"
+
+for f in "$api_router" "$api_service" "$api_store" "$api_test" "$web_api" "$web_ui"; do
+  test -f "$f" || { echo "[fatal] missing file: $f"; exit 2; }
+  cp -a "$f" "$f.bak.$ts"
+  echo "[ok] backup: $f.bak.$ts"
+done
+
+python - <<'PY'
+from pathlib import Path
+import re
+
+# ---------- backend: make list project_id optional (no 422 when missing) ----------
+router = Path("apps/api/src/app/modules/series/router.py")
+s = router.read_text(encoding="utf-8")
+
+orig = s
+
+# ensure Optional imported
+if "Optional" not in s:
+    # try to extend existing typing import
+    m = re.search(r"^from typing import ([^\n]+)$", s, flags=re.M)
+    if m:
+        items = [x.strip() for x in m.group(1).split(",")]
+        if "Optional" not in items:
+            items.append("Optional")
+            s = s[:m.start(1)] + ", ".join(items) + s[m.end(1):]
+    else:
+        # insert after __future__ if present, else at top
+        m2 = re.search(r"^from __future__ import [^\n]+\n", s, flags=re.M)
+        ins = "from typing import Optional\n"
+        if m2:
+            s = s[:m2.end()] + ins + s[m2.end():]
+        else:
+            s = ins + s
+
+# change Query(...) from required "..." to optional None
+# pattern: project_id: str = Query(...)
+s = re.sub(r"(project_id\s*:\s*)str(\s*=\s*Query\()\s*\.\.\.", r"\1Optional[str]\2None", s)
+
+# also handle "project_id: str = Query(..., ...)" with "...," already captured above
+# remove any explicit "project_id required" guard that raises 422
+lines = s.splitlines(True)
+out = []
+i = 0
+while i < len(lines):
+    line = lines[i]
+    if re.search(r"\bif\b.*\bproject_id\b.*:\s*$", line) and (i+1) < len(lines):
+        # look ahead a few lines for 422 HTTPException
+        look = "".join(lines[i:i+5])
+        if ("HTTPException" in look and "422" in look):
+            # drop this if-block (best-effort: drop until first non-indented line at same/lower level)
+            indent = len(line) - len(line.lstrip(" "))
+            i += 1
+            while i < len(lines):
+                ln = lines[i]
+                if ln.strip() == "":
+                    i += 1
+                    continue
+                cur_indent = len(ln) - len(ln.lstrip(" "))
+                if cur_indent <= indent:
+                    break
+                i += 1
+            continue
+    out.append(line)
+    i += 1
+
+s = "".join(out)
+
+if s != orig:
+    router.write_text(s, encoding="utf-8")
+    print("[ok] patched series/router.py: project_id optional + removed required-422 guard (if existed)")
+else:
+    print("[warn] series/router.py: no change applied (pattern not found). If list still 422, paste router.py list handler.")
+
+# service: accept Optional[str] in list entrypoint (best effort)
+service = Path("apps/api/src/app/modules/series/service.py")
+ss = service.read_text(encoding="utf-8")
+ss0 = ss
+# common: def list_series(project_id: str, ...)
+ss = re.sub(r"(def\s+list_\w+\s*\(\s*[^)]*project_id\s*:\s*)str(\s*(?:=\s*[^,\n)]+)?)",
+            r"\1Optional[str]\2", ss)
+# ensure Optional imported if we used it
+if "Optional[str]" in ss and "Optional" not in ss:
+    m = re.search(r"^from typing import ([^\n]+)$", ss, flags=re.M)
+    if m:
+        items = [x.strip() for x in m.group(1).split(",")]
+        if "Optional" not in items:
+            items.append("Optional")
+            ss = ss[:m.start(1)] + ", ".join(items) + ss[m.end(1):]
+    else:
+        m2 = re.search(r"^from __future__ import [^\n]+\n", ss, flags=re.M)
+        ins = "from typing import Optional\n"
+        if m2:
+            ss = ss[:m2.end()] + ins + ss[m2.end():]
+        else:
+            ss = ins + ss
+if ss != ss0:
+    service.write_text(ss, encoding="utf-8")
+    print("[ok] patched series/service.py: list_* project_id Optional[str] (best-effort)")
+else:
+    print("[warn] series/service.py: no change applied (may already be Optional)")
+
+# tests: allow GET /api/series without project_id (should be 200)
+t = Path("apps/api/tests/test_series_crud.py")
+ts = t.read_text(encoding="utf-8")
+ts0 = ts
+
+# replace the first test if it still asserts 422
+ts = re.sub(
+    r"def test_series_list_requires_project_id\(\):\s*\n\s*c = TestClient\(app\)\s*\n\s*r = c\.get\(\"/api/series\"\)\s*\n\s*assert r\.status_code == 422\s*\n",
+    "def test_series_list_allows_missing_project_id():\n"
+    "    c = TestClient(app)\n"
+    "    r = c.get(\"/api/series\", params={\"limit\": 50, \"offset\": 0})\n"
+    "    assert r.status_code == 200, r.text\n"
+    "    js = r.json()\n"
+    "    assert \"items\" in js and \"total\" in js\n\n",
+    ts,
+    flags=re.M
+)
+
+if ts != ts0:
+    t.write_text(ts, encoding="utf-8")
+    print("[ok] patched test_series_crud.py: list allows missing project_id")
+else:
+    print("[warn] test_series_crud.py: no change applied (maybe already updated)")
+
+# ---------- frontend: ensure listSeries omits project_id when empty ----------
+api_dir = Path("apps/web/src/lib/api")
+# locate apiFetch provider file (do not guess)
+cands = []
+for p in api_dir.glob("*.ts"):
+    txt = p.read_text(encoding="utf-8")
+    if re.search(r"export\s+(async\s+)?function\s+apiFetch\b", txt):
+        cands.append(p)
+if not cands:
+    raise SystemExit("[fatal] cannot locate apiFetch exporter in apps/web/src/lib/api/*.ts")
+
+api_fetch_file = cands[0]
+import_spec = f"./{api_fetch_file.stem}"
+
+series_api = Path("apps/web/src/lib/api/series.ts")
+# rewrite series.ts to a stable, minimal wrapper that supports optional project_id
+series_api.write_text(f'''import {{ apiFetch }} from "{import_spec}";
+
+export type Series = {{
+  id: string;
+  project_id: string;
+  name: string;
+  style_text?: string | null;
+  continuity_text?: string | null;
+  prompt_ids: string[];
+  role_ids: string[];
+  created_at: string;
+  updated_at?: string | null;
+  archived_at?: string | null;
+}};
+
+export type SeriesCreate = {{
+  project_id: string;
+  name: string;
+  style_text?: string | null;
+  continuity_text?: string | null;
+  prompt_ids?: string[];
+  role_ids?: string[];
+}};
+
+export type SeriesPatch = {{
+  name?: string | null;
+  style_text?: string | null;
+  continuity_text?: string | null;
+  prompt_ids?: string[] | null;
+  role_ids?: string[] | null;
+  archived_at?: string | null;
+}};
+
+export type SeriesListResp = {{
+  total: number;
+  items: Series[];
+  limit: number;
+  offset: number;
+}};
+
+export async function listSeries(args: {{
+  project_id?: string;
+  q?: string;
+  limit?: number;
+  offset?: number;
+}} = {{}}): Promise<SeriesListResp> {{
+  const params = new URLSearchParams();
+  const pid = (args.project_id ?? "").trim();
+  const q = (args.q ?? "").trim();
+  params.set("limit", String(args.limit ?? 50));
+  params.set("offset", String(args.offset ?? 0));
+  if (pid) params.set("project_id", pid);
+  if (q) params.set("q", q);
+  const qs = params.toString();
+  return apiFetch<SeriesListResp>(`/api/series?${{qs}}`);
+}}
+
+export async function createSeries(payload: SeriesCreate): Promise<Series> {{
+  return apiFetch<Series>(`/api/series`, {{
+    method: "POST",
+    headers: {{ "Content-Type": "application/json" }},
+    body: JSON.stringify(payload ?? {{}}),
+  }});
+}}
+
+export async function getSeries(series_id: string): Promise<Series> {{
+  return apiFetch<Series>(`/api/series/${{series_id}}`);
+}}
+
+export async function updateSeries(series_id: string, patch: SeriesPatch): Promise<Series> {{
+  return apiFetch<Series>(`/api/series/${{series_id}}`, {{
+    method: "PATCH",
+    headers: {{ "Content-Type": "application/json" }},
+    body: JSON.stringify(patch ?? {{}}),
+  }});
+}}
+
+export async function deleteSeries(series_id: string): Promise<{{ ok: boolean }}> {{
+  await apiFetch<unknown>(`/api/series/${{series_id}}`, {{ method: "DELETE" }});
+  return {{ ok: true }};
+}}
+''', encoding="utf-8")
+print(f"[ok] rewrote web series api wrapper: {series_api} (apiFetch import={import_spec})")
+
+# SeriesIndex Clear: only clear q (do not clear project_id)
+ui = Path("apps/web/src/ui/series/SeriesIndex.tsx")
+u = ui.read_text(encoding="utf-8")
+u0 = u
+
+# best-effort: remove setProjectId("") in Clear handler if present
+u = u.replace('setProjectId("");', "")
+u = u.replace("setProjectId('');", "")
+
+# if clear handler clears both via one-liner, remove only project reset
+u = re.sub(r"setProjectId\(\s*\"\"\s*\)\s*;\s*", "", u)
+u = re.sub(r"setProjectId\(\s*''\s*\)\s*;\s*", "", u)
+
+if u != u0:
+    ui.write_text(u, encoding="utf-8")
+    print("[ok] patched SeriesIndex Clear: no longer clears project_id (q only)")
+else:
+    print("[warn] SeriesIndex.tsx: no clear-handler pattern matched (may already be correct)")
+PY
+
+echo "[info] run backend tests..."
+cd apps/api
+PYTHONPATH=./src pytest -q
+echo "[ok] backend tests passed"
+cd - >/dev/null
+
+echo "[info] run next build..."
+cd apps/web
+npm run build
+echo "[ok] next build passed"
+cd - >/dev/null
+
+echo "[done] M02_R8 completed."

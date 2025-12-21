@@ -1,0 +1,355 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" && pwd)"
+echo "[info] repo_root=$repo_root"
+
+# ---- locate apiFetch exporter under apps/web/src/lib/api ----
+api_dir="$repo_root/apps/web/src/lib/api"
+if [ ! -d "$api_dir" ]; then
+  echo "[fail] missing dir: $api_dir"
+  exit 2
+fi
+
+api_export_line="$(rg -n "export (async )?function apiFetch|export const apiFetch" "$api_dir" -S | head -n1 || true)"
+if [ -z "$api_export_line" ]; then
+  echo "[fail] cannot locate apiFetch export under $api_dir"
+  echo "       run: rg -n \"apiFetch\" $api_dir -S"
+  exit 2
+fi
+
+api_export_file="${api_export_line%%:*}"
+api_export_base="$(basename "$api_export_file")"
+api_export_base="${api_export_base%.ts}"
+api_import_spec="./$api_export_base"
+echo "[info] apiFetch exporter: $api_export_file -> import spec: $api_import_spec"
+
+# ---- series api wrapper (overwrite; contract-aligned) ----
+series_api="$repo_root/apps/web/src/lib/api/series.ts"
+mkdir -p "$(dirname "$series_api")"
+cp -f "$series_api" "$series_api.bak.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+
+cat > "$series_api" <<EOT
+import { apiFetch } from "${api_import_spec}";
+
+export type Series = {
+  id: string;
+  project_id: string;
+  name: string;
+  style_text?: string | null;
+  continuity_text?: string | null;
+  archived_at?: string | null;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type ListResp<T> = { items: T[]; total: number; limit: number; offset: number };
+
+export async function listSeries(args: {
+  project_id: string;
+  q?: string;
+  limit?: number;
+  offset?: number;
+  include_archived?: boolean;
+}) {
+  const sp = new URLSearchParams();
+  sp.set("project_id", (args.project_id || "").trim());
+  if (args.q) sp.set("q", args.q);
+  sp.set("limit", String(args.limit ?? 50));
+  sp.set("offset", String(args.offset ?? 0));
+  if (args.include_archived) sp.set("include_archived", "true");
+  return apiFetch<ListResp<Series>>(\`/api/series?\${sp.toString()}\`);
+}
+
+export async function createSeries(input: {
+  project_id: string;
+  name: string;
+  style_text?: string;
+  continuity_text?: string;
+}) {
+  const payload: any = {
+    project_id: (input.project_id || "").trim(),
+    name: (input.name || "").trim(),
+  };
+  const st = (input.style_text || "").trim();
+  const ct = (input.continuity_text || "").trim();
+  if (st) payload.style_text = st;
+  if (ct) payload.continuity_text = ct;
+
+  return apiFetch<Series>("/api/series", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getSeries(series_id: string) {
+  return apiFetch<Series>(\`/api/series/\${series_id}\`);
+}
+
+export async function updateSeries(series_id: string, patch: Partial<Pick<Series, "name" | "style_text" | "continuity_text" | "archived_at">>) {
+  // IMPORTANT: allow explicit null for archived_at (restore)
+  return apiFetch<Series>(\`/api/series/\${series_id}\`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch ?? {}),
+  });
+}
+EOT
+echo "[ok] wrote: $series_api"
+
+# ---- UI: SeriesIndex (overwrite) ----
+ui_dir="$repo_root/apps/web/src/ui/series"
+mkdir -p "$ui_dir"
+
+series_index="$ui_dir/SeriesIndex.tsx"
+cp -f "$series_index" "$series_index.bak.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+
+cat > "$series_index" <<'EOT'
+"use client";
+
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Series, createSeries, listSeries } from "../../lib/api/series";
+
+const LS_KEY = "m02.series.query.project_id";
+
+function prettyDetails(e: any): string | null {
+  const d = e?.details;
+  if (!d) return null;
+  try {
+    return JSON.stringify(d, null, 2);
+  } catch {
+    return String(d);
+  }
+}
+
+export function SeriesIndex() {
+  // Query
+  const [qProjectId, setQProjectId] = useState<string>("");
+  const [q, setQ] = useState<string>("");
+
+  // Create
+  const [cProjectId, setCProjectId] = useState<string>("");
+  const [cName, setCName] = useState<string>("");
+  const [cStyle, setCStyle] = useState<string>("");
+  const [cCont, setCCont] = useState<string>("");
+
+  // Data
+  const [items, setItems] = useState<Series[]>([]);
+  const [total, setTotal] = useState<number>(0);
+
+  // Status
+  const [loading, setLoading] = useState<boolean>(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [errDetails, setErrDetails] = useState<string | null>(null);
+
+  // restore persisted query project_id on mount
+  useEffect(() => {
+    const saved = (typeof window !== "undefined" ? window.localStorage.getItem(LS_KEY) : "") || "";
+    if (saved && !qProjectId) setQProjectId(saved);
+    if (saved && !cProjectId) setCProjectId(saved);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // persist query project_id
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const v = (qProjectId || "").trim();
+    if (v) window.localStorage.setItem(LS_KEY, v);
+  }, [qProjectId]);
+
+  const refresh = useCallback(async () => {
+    const pid = (qProjectId || "").trim();
+    if (!pid) {
+      // M02 frozen contract: list requires project_id filter. Do not call API.
+      setErr("project_id is required for listing (M02).");
+      setErrDetails(null);
+      return;
+    }
+    setLoading(true);
+    setErr(null);
+    setErrDetails(null);
+    try {
+      const r = await listSeries({ project_id: pid, q: (q || "").trim() || undefined, limit: 50, offset: 0 });
+      setItems(r.items || []);
+      setTotal(r.total ?? 0);
+    } catch (e: any) {
+      setErr(e?.message || "failed to list series");
+      setErrDetails(prettyDetails(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [qProjectId, q]);
+
+  // auto-refresh once when we have pid restored
+  useEffect(() => {
+    const pid = (qProjectId || "").trim();
+    if (pid) refresh();
+  }, [qProjectId, refresh]);
+
+  const onClearQ = useCallback(() => {
+    // Clear should ONLY clear q, not delete anything.
+    setQ("");
+  }, []);
+
+  const canCreate = useMemo(() => {
+    return (cProjectId || "").trim().length > 0 && (cName || "").trim().length > 0;
+  }, [cProjectId, cName]);
+
+  const onCreate = useCallback(async () => {
+    const pid = (cProjectId || "").trim();
+    const name = (cName || "").trim();
+    if (!pid || !name) {
+      setErr("project_id and name are required for create.");
+      setErrDetails(null);
+      return;
+    }
+    setLoading(true);
+    setErr(null);
+    setErrDetails(null);
+    try {
+      await createSeries({
+        project_id: pid,
+        name,
+        style_text: cStyle,
+        continuity_text: cCont,
+      });
+
+      // after create, keep project_id, clear name/style/cont
+      setCName("");
+      setCStyle("");
+      setCCont("");
+
+      // keep query project_id aligned so list shows it
+      if (!(qProjectId || "").trim()) setQProjectId(pid);
+      await refresh();
+    } catch (e: any) {
+      setErr(e?.message || "failed to create series");
+      setErrDetails(prettyDetails(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [cProjectId, cName, cStyle, cCont, qProjectId, refresh]);
+
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "420px 1fr", gap: 16 }}>
+      <div style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 16 }}>
+        <h2 style={{ fontSize: 18, fontWeight: 700, marginBottom: 10 }}>Create</h2>
+
+        <div style={{ display: "grid", gridTemplateColumns: "160px 1fr", gap: 10, alignItems: "center", marginBottom: 10 }}>
+          <div>project_id (required)</div>
+          <input value={cProjectId} onChange={(e) => setCProjectId(e.target.value)} style={{ width: "100%", padding: 8 }} />
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "160px 1fr", gap: 10, alignItems: "center", marginBottom: 10 }}>
+          <div>name (required)</div>
+          <input value={cName} onChange={(e) => setCName(e.target.value)} style={{ width: "100%", padding: 8 }} />
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "160px 1fr", gap: 10, alignItems: "start", marginBottom: 10 }}>
+          <div>style_text</div>
+          <textarea value={cStyle} onChange={(e) => setCStyle(e.target.value)} rows={5} style={{ width: "100%", padding: 8 }} />
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "160px 1fr", gap: 10, alignItems: "start", marginBottom: 10 }}>
+          <div>continuity_text</div>
+          <textarea value={cCont} onChange={(e) => setCCont(e.target.value)} rows={5} style={{ width: "100%", padding: 8 }} />
+        </div>
+
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <button disabled={!canCreate || loading} onClick={onCreate} style={{ padding: "8px 16px", borderRadius: 10 }}>
+            {loading ? "Working..." : "Create"}
+          </button>
+        </div>
+
+        {err ? (
+          <div style={{ marginTop: 12, color: "#b00020", whiteSpace: "pre-wrap" }}>
+            <div>{err}</div>
+            {errDetails ? (
+              <pre style={{ marginTop: 8, background: "#fafafa", border: "1px solid #eee", padding: 10, borderRadius: 10, overflowX: "auto" }}>
+                {errDetails}
+              </pre>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+
+      <div style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 16 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+          <h2 style={{ fontSize: 18, fontWeight: 700 }}>Series</h2>
+          <div style={{ color: "#666" }}>total: {total}</div>
+        </div>
+
+        {/* Query block should be ABOVE the list */}
+        <div style={{ border: "1px solid #eee", borderRadius: 12, padding: 12, marginBottom: 12 }}>
+          <div style={{ fontWeight: 700, marginBottom: 8 }}>Query</div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "160px 1fr", gap: 10, alignItems: "center", marginBottom: 10 }}>
+            <div>project_id (required)</div>
+            <input value={qProjectId} onChange={(e) => setQProjectId(e.target.value)} style={{ width: "100%", padding: 8 }} />
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "160px 1fr", gap: 10, alignItems: "center", marginBottom: 10 }}>
+            <div>q (optional)</div>
+            <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="name contains..." style={{ width: "100%", padding: 8 }} />
+          </div>
+
+          <div style={{ display: "flex", gap: 10 }}>
+            <button disabled={loading} onClick={refresh} style={{ padding: "8px 16px", borderRadius: 10 }}>
+              Refresh
+            </button>
+            <button disabled={loading} onClick={onClearQ} style={{ padding: "8px 16px", borderRadius: 10 }}>
+              Clear
+            </button>
+          </div>
+        </div>
+
+        {items.length === 0 ? <div style={{ color: "#666" }}>No items.</div> : null}
+
+        <div style={{ display: "grid", gap: 10 }}>
+          {items.map((x) => (
+            <div key={x.id} style={{ border: "1px solid #eee", borderRadius: 12, padding: 12, display: "flex", justifyContent: "space-between", gap: 12 }}>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {x.name}
+                </div>
+                <div style={{ color: "#666", fontSize: 13 }}>project_id: {x.project_id}</div>
+                <div style={{ color: "#666", fontSize: 13 }}>archived_at: {String(x.archived_at ?? null)}</div>
+              </div>
+              <a href={`/series/${x.id}`} style={{ alignSelf: "center", padding: "8px 14px", borderRadius: 10, border: "1px solid #ddd", textDecoration: "none" }}>
+                Open
+              </a>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+EOT
+echo "[ok] wrote: $series_index"
+
+# ---- Ensure page.tsx uses SeriesIndex (overwrite minimal; stable import paths) ----
+page_index="$repo_root/apps/web/app/(app)/series/page.tsx"
+mkdir -p "$(dirname "$page_index")"
+cp -f "$page_index" "$page_index.bak.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+
+cat > "$page_index" <<'EOT'
+import { SeriesIndex } from "../../../src/ui/series/SeriesIndex";
+
+export default function SeriesPage() {
+  return (
+    <div style={{ padding: 24 }}>
+      <h1 style={{ fontSize: 32, fontWeight: 800, marginBottom: 8 }}>Series</h1>
+      <p style={{ marginBottom: 16, color: "#555" }}>Series list requires <code>project_id</code> filter (M02).</p>
+      <SeriesIndex />
+    </div>
+  );
+}
+EOT
+echo "[ok] wrote: $page_index"
+
+# ---- build ----
+echo "[info] running next build (won't exit terminal on failure)"
+cd "$repo_root/apps/web"
+npm run build || true

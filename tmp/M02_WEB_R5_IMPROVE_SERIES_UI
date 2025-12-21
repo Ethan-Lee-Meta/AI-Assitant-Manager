@@ -1,0 +1,529 @@
+#!/usr/bin/env bash
+set -u
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+echo "[info] M02_WEB_R5_IMPROVE_SERIES_UI starting..."
+echo "[info] repo_root=$repo_root"
+cd "$repo_root"
+
+# ---- locate apiFetch import path by inspecting existing prompts wrapper (avoid guessing) ----
+api_fetch_import="$(python - <<'PY'
+from pathlib import Path
+import re
+
+cand = Path("apps/web/src/lib/api/prompts.ts")
+if not cand.exists():
+    # fallback (but still deterministic)
+    print("./base")
+    raise SystemExit(0)
+
+s = cand.read_text(encoding="utf-8", errors="ignore")
+m = re.search(r'import\s+\{\s*apiFetch[^}]*\}\s+from\s+[\'"]([^\'"]+)[\'"]\s*;', s)
+print(m.group(1) if m else "./base")
+PY
+)"
+echo "[info] apiFetch import path (from prompts.ts) = $api_fetch_import"
+
+mkdir -p "apps/web/src/ui/series"
+mkdir -p "apps/web/src/lib/api"
+mkdir -p "apps/web/app/(app)/series"
+mkdir -p "apps/web/app/(app)/series/[series_id]"
+
+# ---- write series api wrapper (self-contained; uses existing apiFetch import path) ----
+cat > "apps/web/src/lib/api/series.ts" <<EOF
+import { apiFetch } from "${api_fetch_import}";
+
+export type Series = {
+  id: string;
+  project_id: string;
+  name: string;
+  style_text?: string | null;
+  continuity_text?: string | null;
+  archived_at?: string | null;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type SeriesCreate = {
+  project_id: string;
+  name: string;
+  style_text?: string | null;
+  continuity_text?: string | null;
+};
+
+export type SeriesPatch = {
+  name?: string;
+  style_text?: string | null;
+  continuity_text?: string | null;
+  archived_at?: string | null;
+};
+
+export type ListResponse<T> = {
+  items: T[];
+  total: number;
+  limit?: number;
+  offset?: number;
+};
+
+function qs(params: Record<string, any>): string {
+  const sp = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined) continue;
+    if (v === null) {
+      // keep null out of querystring by default
+      continue;
+    }
+    sp.set(k, String(v));
+  }
+  const s = sp.toString();
+  return s ? \`?\${s}\` : "";
+}
+
+export async function listSeries(params: {
+  project_id: string;
+  q?: string;
+  archived?: boolean;
+  limit?: number;
+  offset?: number;
+}): Promise<ListResponse<Series>> {
+  const { project_id, q, archived, limit = 50, offset = 0 } = params;
+  return apiFetch<ListResponse<Series>>(
+    \`/api/series\${qs({ project_id, q, archived, limit, offset })}\`
+  );
+}
+
+export async function createSeries(payload: SeriesCreate): Promise<Series> {
+  return apiFetch<Series>(\`/api/series\`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload ?? {}),
+  });
+}
+
+export async function getSeries(series_id: string): Promise<Series> {
+  return apiFetch<Series>(\`/api/series/\${series_id}\`);
+}
+
+export async function patchSeries(series_id: string, patch: SeriesPatch): Promise<Series> {
+  return apiFetch<Series>(\`/api/series/\${series_id}\`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch ?? {}),
+  });
+}
+
+export async function updateSeries(series_id: string, patch: SeriesPatch): Promise<Series> {
+  return patchSeries(series_id, patch);
+}
+
+/**
+ * Best-effort delete:
+ * - try DELETE /api/series/{id}
+ * - if backend doesn't support, fall back to archiving (archived_at=now)
+ */
+export async function deleteSeries(series_id: string): Promise<void> {
+  try {
+    await apiFetch<any>(\`/api/series/\${series_id}\`, { method: "DELETE" });
+    return;
+  } catch (_e) {
+    // fallback to archive
+    await patchSeries(series_id, { archived_at: new Date().toISOString() });
+  }
+}
+EOF
+echo "[ok] wrote: apps/web/src/lib/api/series.ts"
+
+# ---- Series List UI (client) ----
+cat > "apps/web/src/ui/series/SeriesIndex.tsx" <<'EOF'
+"use client";
+
+import Link from "next/link";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { createSeries, deleteSeries, listSeries, Series } from "../../lib/api/series";
+
+const LS_PID = "m02.series.project_id";
+const LS_Q = "m02.series.q";
+
+function FieldRow(props: { label: string; children: any }) {
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "180px 1fr", gap: 10, alignItems: "center", marginBottom: 10 }}>
+      <div style={{ fontSize: 13, color: "#333" }}>{props.label}</div>
+      <div>{props.children}</div>
+    </div>
+  );
+}
+
+function Card(props: { title: string; right?: any; children: any }) {
+  return (
+    <div style={{ border: "1px solid #e6e6e6", borderRadius: 12, padding: 16, background: "#fff" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", marginBottom: 12 }}>
+        <div style={{ fontSize: 18, fontWeight: 700 }}>{props.title}</div>
+        <div>{props.right}</div>
+      </div>
+      {props.children}
+    </div>
+  );
+}
+
+export function SeriesIndex() {
+  const [projectId, setProjectId] = useState<string>("");
+  const [q, setQ] = useState<string>("");
+
+  const [name, setName] = useState<string>("");
+  const [styleText, setStyleText] = useState<string>("");
+  const [continuityText, setContinuityText] = useState<string>("");
+
+  const [items, setItems] = useState<Series[]>([]);
+  const [total, setTotal] = useState<number>(0);
+
+  const [loading, setLoading] = useState<boolean>(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  // hydrate from localStorage once
+  useEffect(() => {
+    try {
+      const pid = localStorage.getItem(LS_PID) || "";
+      const qq = localStorage.getItem(LS_Q) || "";
+      if (pid) setProjectId(pid);
+      if (qq) setQ(qq);
+    } catch {}
+  }, []);
+
+  // persist filters
+  useEffect(() => {
+    try { localStorage.setItem(LS_PID, projectId || ""); } catch {}
+  }, [projectId]);
+  useEffect(() => {
+    try { localStorage.setItem(LS_Q, q || ""); } catch {}
+  }, [q]);
+
+  const canQuery = useMemo(() => (projectId || "").trim().length > 0, [projectId]);
+  const canCreate = useMemo(() => canQuery && (name || "").trim().length > 0, [canQuery, name]);
+
+  const refresh = useCallback(async () => {
+    setErr(null);
+    if (!canQuery) {
+      setItems([]);
+      setTotal(0);
+      setErr("project_id is required for listing (M02).");
+      return;
+    }
+    setLoading(true);
+    try {
+      const r = await listSeries({
+        project_id: projectId.trim(),
+        q: (q || "").trim() || undefined,
+        limit: 50,
+        offset: 0,
+      });
+      setItems(r.items || []);
+      setTotal(r.total ?? (r.items?.length || 0));
+    } catch (e: any) {
+      setErr(e?.message || "failed to list series");
+    } finally {
+      setLoading(false);
+    }
+  }, [canQuery, projectId, q]);
+
+  // auto-refresh when coming back if projectId exists
+  useEffect(() => {
+    if ((projectId || "").trim()) {
+      refresh();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const clearQOnly = useCallback(() => {
+    setQ("");
+    // keep projectId, and refresh with empty q
+    setTimeout(() => refresh(), 0);
+  }, [refresh]);
+
+  const doCreate = useCallback(async () => {
+    setErr(null);
+    if (!canCreate) return;
+    setLoading(true);
+    try {
+      await createSeries({
+        project_id: projectId.trim(),
+        name: name.trim(),
+        style_text: styleText.trim() ? styleText : null,
+        continuity_text: continuityText.trim() ? continuityText : null,
+      });
+      setName("");
+      setStyleText("");
+      setContinuityText("");
+      await refresh();
+    } catch (e: any) {
+      setErr(e?.message || "create failed");
+    } finally {
+      setLoading(false);
+    }
+  }, [canCreate, projectId, name, styleText, continuityText, refresh]);
+
+  const doDelete = useCallback(async (id: string, displayName: string) => {
+    setErr(null);
+    const ok = confirm(`Delete series "${displayName}"?\nIf backend does not support DELETE, it will be archived (archived_at=now).`);
+    if (!ok) return;
+    setLoading(true);
+    try {
+      await deleteSeries(id);
+      await refresh();
+    } catch (e: any) {
+      setErr(e?.message || "delete/archive failed");
+    } finally {
+      setLoading(false);
+    }
+  }, [refresh]);
+
+  return (
+    <div style={{ padding: 24 }}>
+      <h1 style={{ fontSize: 32, fontWeight: 800, marginBottom: 6 }}>Series</h1>
+      <div style={{ color: "#555", marginBottom: 16 }}>
+        Series list requires <code>project_id</code> filter (M02).
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "420px 1fr", gap: 16, alignItems: "start" }}>
+        <Card title="Create">
+          <FieldRow label="project_id (required)">
+            <input value={projectId} onChange={(e) => setProjectId(e.target.value)} style={{ width: "100%", padding: 8 }} placeholder="project_id" />
+          </FieldRow>
+
+          <FieldRow label="name (required)">
+            <input value={name} onChange={(e) => setName(e.target.value)} style={{ width: "100%", padding: 8 }} placeholder="Series name" />
+          </FieldRow>
+
+          <FieldRow label="style_text">
+            <textarea value={styleText} onChange={(e) => setStyleText(e.target.value)} style={{ width: "100%", padding: 8, height: 90 }} />
+          </FieldRow>
+
+          <FieldRow label="continuity_text">
+            <textarea value={continuityText} onChange={(e) => setContinuityText(e.target.value)} style={{ width: "100%", padding: 8, height: 90 }} />
+          </FieldRow>
+
+          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+            <button disabled={!canCreate || loading} onClick={doCreate} style={{ padding: "8px 14px", borderRadius: 10, border: "1px solid #ddd" }}>
+              Create
+            </button>
+            <button disabled={loading} onClick={refresh} style={{ padding: "8px 14px", borderRadius: 10, border: "1px solid #ddd" }}>
+              Refresh
+            </button>
+          </div>
+
+          {err ? <div style={{ marginTop: 10, color: "#b00020", whiteSpace: "pre-wrap" }}>{err}</div> : null}
+        </Card>
+
+        <Card
+          title="Series"
+          right={<div style={{ fontSize: 12, color: "#666" }}>total: {total}</div>}
+        >
+          {/* Query controls ABOVE the list (per your request) */}
+          <div style={{ border: "1px solid #f0f0f0", borderRadius: 10, padding: 12, marginBottom: 12, background: "#fafafa" }}>
+            <div style={{ fontWeight: 700, marginBottom: 10 }}>Query</div>
+            <FieldRow label="project_id (required)">
+              <input value={projectId} onChange={(e) => setProjectId(e.target.value)} style={{ width: "100%", padding: 8 }} placeholder="project_id" />
+            </FieldRow>
+            <FieldRow label="q (optional)">
+              <input value={q} onChange={(e) => setQ(e.target.value)} style={{ width: "100%", padding: 8 }} placeholder="name contains..." />
+            </FieldRow>
+            <div style={{ display: "flex", gap: 10 }}>
+              <button disabled={loading} onClick={refresh} style={{ padding: "8px 14px", borderRadius: 10, border: "1px solid #ddd" }}>
+                Refresh
+              </button>
+              <button disabled={loading} onClick={clearQOnly} style={{ padding: "8px 14px", borderRadius: 10, border: "1px solid #ddd" }}>
+                Clear
+              </button>
+            </div>
+          </div>
+
+          {loading ? <div style={{ color: "#666" }}>Loading...</div> : null}
+          {items.length === 0 && !loading ? <div style={{ color: "#666" }}>No items.</div> : null}
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {items.map((it) => (
+              <div key={it.id} style={{ border: "1px solid #eee", borderRadius: 12, padding: 12, display: "flex", justifyContent: "space-between", gap: 12 }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontWeight: 800, fontSize: 16, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {it.name}
+                  </div>
+                  <div style={{ fontSize: 12, color: "#666" }}>project_id: {it.project_id}</div>
+                  <div style={{ fontSize: 12, color: "#666" }}>archived_at: {String(it.archived_at ?? "null")}</div>
+                </div>
+
+                <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                  <Link href={`/series/${it.id}`} style={{ padding: "8px 12px", borderRadius: 10, border: "1px solid #ddd", textDecoration: "none" }}>
+                    Open
+                  </Link>
+                  <button
+                    disabled={loading}
+                    onClick={() => doDelete(it.id, it.name)}
+                    style={{ padding: "8px 12px", borderRadius: 10, border: "1px solid #ddd" }}
+                  >
+                    Delete
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {err ? <div style={{ marginTop: 10, color: "#b00020", whiteSpace: "pre-wrap" }}>{err}</div> : null}
+        </Card>
+      </div>
+    </div>
+  );
+}
+EOF
+echo "[ok] wrote: apps/web/src/ui/series/SeriesIndex.tsx"
+
+# ---- Series Detail UI (client) ----
+cat > "apps/web/src/ui/series/SeriesDetail.tsx" <<'EOF'
+"use client";
+
+import Link from "next/link";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { getSeries, Series, updateSeries } from "../../lib/api/series";
+
+function FieldRow(props: { label: string; children: any }) {
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "180px 1fr", gap: 10, alignItems: "start", marginBottom: 12 }}>
+      <div style={{ fontSize: 13, color: "#333", paddingTop: 6 }}>{props.label}</div>
+      <div>{props.children}</div>
+    </div>
+  );
+}
+
+export function SeriesDetail({ series_id }: { series_id: string }) {
+  const [item, setItem] = useState<Series | null>(null);
+  const [loading, setLoading] = useState<boolean>(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const [styleText, setStyleText] = useState<string>("");
+  const [continuityText, setContinuityText] = useState<string>("");
+
+  const canSave = useMemo(() => !!item && !loading, [item, loading]);
+
+  const load = useCallback(async () => {
+    setErr(null);
+    setLoading(true);
+    try {
+      const r = await getSeries(series_id);
+      setItem(r);
+      setStyleText(r.style_text ?? "");
+      setContinuityText(r.continuity_text ?? "");
+    } catch (e: any) {
+      setErr(e?.message || "failed to load");
+    } finally {
+      setLoading(false);
+    }
+  }, [series_id]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const save = useCallback(async () => {
+    if (!item) return;
+    setErr(null);
+    setLoading(true);
+    try {
+      const r = await updateSeries(series_id, {
+        style_text: styleText.trim() ? styleText : null,
+        continuity_text: continuityText.trim() ? continuityText : null,
+      });
+      setItem(r);
+    } catch (e: any) {
+      setErr(e?.message || "save failed");
+    } finally {
+      setLoading(false);
+    }
+  }, [item, series_id, styleText, continuityText]);
+
+  const toggleArchive = useCallback(async () => {
+    if (!item) return;
+    setErr(null);
+    setLoading(true);
+    try {
+      const next = item.archived_at ? null : new Date().toISOString();
+      const r = await updateSeries(series_id, { archived_at: next });
+      setItem(r);
+    } catch (e: any) {
+      setErr(e?.message || "archive toggle failed");
+    } finally {
+      setLoading(false);
+    }
+  }, [item, series_id]);
+
+  return (
+    <div style={{ padding: 24 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", marginBottom: 12 }}>
+        <div>
+          <div style={{ fontSize: 28, fontWeight: 900, marginBottom: 4 }}>Series Detail</div>
+          <div style={{ color: "#666", fontSize: 12 }}>id: {series_id}</div>
+        </div>
+        <div style={{ display: "flex", gap: 10 }}>
+          <Link href="/series" style={{ padding: "8px 12px", borderRadius: 10, border: "1px solid #ddd", textDecoration: "none" }}>
+            Back
+          </Link>
+          <button disabled={!item || loading} onClick={load} style={{ padding: "8px 12px", borderRadius: 10, border: "1px solid #ddd" }}>
+            Reload
+          </button>
+        </div>
+      </div>
+
+      {loading ? <div style={{ color: "#666", marginBottom: 10 }}>Loading...</div> : null}
+      {err ? <div style={{ color: "#b00020", whiteSpace: "pre-wrap", marginBottom: 10 }}>{err}</div> : null}
+
+      {item ? (
+        <div style={{ border: "1px solid #e6e6e6", borderRadius: 12, padding: 16, background: "#fff" }}>
+          <FieldRow label="project_id">{item.project_id}</FieldRow>
+          <FieldRow label="name">{item.name}</FieldRow>
+          <FieldRow label="archived_at">{String(item.archived_at ?? "null")}</FieldRow>
+
+          <FieldRow label="style_text">
+            <textarea value={styleText} onChange={(e) => setStyleText(e.target.value)} style={{ width: "100%", padding: 8, height: 140 }} />
+          </FieldRow>
+
+          <FieldRow label="continuity_text">
+            <textarea value={continuityText} onChange={(e) => setContinuityText(e.target.value)} style={{ width: "100%", padding: 8, height: 140 }} />
+          </FieldRow>
+
+          <div style={{ display: "flex", gap: 10 }}>
+            <button disabled={!canSave} onClick={save} style={{ padding: "8px 14px", borderRadius: 10, border: "1px solid #ddd" }}>
+              Save
+            </button>
+            <button disabled={!item || loading} onClick={toggleArchive} style={{ padding: "8px 14px", borderRadius: 10, border: "1px solid #ddd" }}>
+              {item.archived_at ? "Unarchive" : "Archive"}
+            </button>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+EOF
+echo "[ok] wrote: apps/web/src/ui/series/SeriesDetail.tsx"
+
+# ---- wire pages to UI components ----
+cat > "apps/web/app/(app)/series/page.tsx" <<'EOF'
+import { SeriesIndex } from "../../../src/ui/series/SeriesIndex";
+
+export default function SeriesPage() {
+  return <SeriesIndex />;
+}
+EOF
+echo "[ok] wrote: apps/web/app/(app)/series/page.tsx"
+
+cat > "apps/web/app/(app)/series/[series_id]/page.tsx" <<'EOF'
+import { SeriesDetail } from "../../../../src/ui/series/SeriesDetail";
+
+export default function SeriesDetailPage({ params }: { params: { series_id: string } }) {
+  return <SeriesDetail series_id={params.series_id} />;
+}
+EOF
+echo "[ok] wrote: apps/web/app/(app)/series/[series_id]/page.tsx"
+
+# ---- build gate ----
+echo "[info] running next build (won't exit terminal on failure)"
+cd "apps/web"
+npm run build
+rc=$?
+echo "[info] next build rc=$rc"
+exit $rc

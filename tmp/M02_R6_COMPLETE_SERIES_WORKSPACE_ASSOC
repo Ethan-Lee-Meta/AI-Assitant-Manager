@@ -1,0 +1,910 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$repo_root"
+
+ts="$(date +%Y%m%d_%H%M%S)"
+echo "[info] M02_R6 starting... repo_root=$repo_root ts=$ts"
+
+api_dir="apps/api/src/app/modules/series"
+web_api_dir="apps/web/src/lib/api"
+web_ui_dir="apps/web/src/ui/series"
+web_app_series_dir="apps/web/app/(app)/series"
+
+for d in "$api_dir" "$web_api_dir" "$web_ui_dir" "$web_app_series_dir"; do
+  mkdir -p "$d"
+done
+
+# -------------------------
+# (A) BACKEND: series dto/store/service/router
+# -------------------------
+
+for f in "$api_dir/dto.py" "$api_dir/store_sqlite.py" "$api_dir/service.py" "$api_dir/router.py"; do
+  if [ -f "$f" ]; then
+    cp -a "$f" "$f.bak.$ts"
+    echo "[ok] backup: $f.bak.$ts"
+  fi
+done
+
+cat <<'PY' > "$api_dir/dto.py"
+from __future__ import annotations
+
+from typing import List, Optional
+
+from pydantic import BaseModel, Field
+
+
+class SeriesBase(BaseModel):
+    project_id: str
+    name: str
+    style_text: Optional[str] = None
+    continuity_text: Optional[str] = None
+    prompt_ids: List[str] = Field(default_factory=list)
+    role_ids: List[str] = Field(default_factory=list)
+
+
+class SeriesCreate(SeriesBase):
+    pass
+
+
+class SeriesPatch(BaseModel):
+    name: Optional[str] = None
+    style_text: Optional[str] = None
+    continuity_text: Optional[str] = None
+    prompt_ids: Optional[List[str]] = None
+    role_ids: Optional[List[str]] = None
+    # allow explicit null to clear archived_at
+    archived_at: Optional[str] = None
+
+
+class SeriesOut(SeriesBase):
+    id: str
+    created_at: str
+    updated_at: Optional[str] = None
+    archived_at: Optional[str] = None
+
+
+class SeriesListResp(BaseModel):
+    total: int
+    items: List[SeriesOut]
+    limit: int
+    offset: int
+PY
+echo "[ok] wrote: $api_dir/dto.py"
+
+cat <<'PY' > "$api_dir/store_sqlite.py"
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+
+def _default_db_path() -> str:
+    return os.getenv("AAM_SQLITE_PATH") or os.getenv("SQLITE_PATH") or str(Path("apps/api/.data/app.sqlite").resolve())
+
+
+def _connect() -> sqlite3.Connection:
+    path = _default_db_path()
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _utc_now_iso() -> str:
+    # keep consistent with existing modules: ISO-ish string with Z
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _ensure(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS series (
+          id TEXT PRIMARY KEY,
+          project_id TEXT NOT NULL,
+          name TEXT NOT NULL,
+          style_text TEXT,
+          continuity_text TEXT,
+          prompt_ids TEXT NOT NULL DEFAULT '[]',
+          role_ids TEXT NOT NULL DEFAULT '[]',
+          created_at TEXT NOT NULL,
+          updated_at TEXT,
+          archived_at TEXT
+        );
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_series_project_id ON series(project_id);")
+
+    # migrate older DBs
+    cur = conn.cursor()
+    for col, ddl in [
+        ("prompt_ids", "ALTER TABLE series ADD COLUMN prompt_ids TEXT NOT NULL DEFAULT '[]'"),
+        ("role_ids", "ALTER TABLE series ADD COLUMN role_ids TEXT NOT NULL DEFAULT '[]'"),
+    ]:
+        try:
+            cur.execute(ddl)
+        except sqlite3.OperationalError:
+            # already exists or table definition different; ignore
+            pass
+
+
+def _row_to_dict(r: sqlite3.Row) -> Dict[str, Any]:
+    d = dict(r)
+    for k in ("prompt_ids", "role_ids"):
+        v = d.get(k)
+        if v is None or v == "":
+            d[k] = []
+        elif isinstance(v, str):
+            try:
+                d[k] = json.loads(v)
+            except Exception:
+                d[k] = []
+        elif isinstance(v, list):
+            d[k] = v
+        else:
+            d[k] = []
+    return d
+
+
+def create(payload: Dict[str, Any]) -> Dict[str, Any]:
+    conn = _connect()
+    _ensure(conn)
+
+    sid = payload.get("id") or f"s_{uuid.uuid4().hex[:12]}"
+    now = _utc_now_iso()
+
+    prompt_ids = payload.get("prompt_ids") or []
+    role_ids = payload.get("role_ids") or []
+
+    conn.execute(
+        """
+        INSERT INTO series (id, project_id, name, style_text, continuity_text, prompt_ids, role_ids, created_at, updated_at, archived_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            sid,
+            payload["project_id"],
+            payload["name"],
+            payload.get("style_text"),
+            payload.get("continuity_text"),
+            json.dumps(prompt_ids, ensure_ascii=False),
+            json.dumps(role_ids, ensure_ascii=False),
+            now,
+            now,
+            payload.get("archived_at"),
+        ),
+    )
+    conn.commit()
+
+    return get(sid)
+
+
+def get(series_id: str) -> Dict[str, Any]:
+    conn = _connect()
+    _ensure(conn)
+
+    r = conn.execute("SELECT * FROM series WHERE id = ?", (series_id,)).fetchone()
+    if not r:
+        raise KeyError("NOT_FOUND")
+    return _row_to_dict(r)
+
+
+def update(series_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
+    conn = _connect()
+    _ensure(conn)
+
+    cur = conn.cursor()
+    old = cur.execute("SELECT * FROM series WHERE id = ?", (series_id,)).fetchone()
+    if not old:
+        raise KeyError("NOT_FOUND")
+    merged = _row_to_dict(old)
+
+    # apply patch (preserve ability to clear archived_at via explicit null)
+    for k, v in patch.items():
+        if k in ("prompt_ids", "role_ids"):
+            merged[k] = v or []
+        else:
+            merged[k] = v
+
+    merged["updated_at"] = _utc_now_iso()
+
+    cur.execute(
+        """
+        UPDATE series
+        SET
+          project_id = ?,
+          name = ?,
+          style_text = ?,
+          continuity_text = ?,
+          prompt_ids = ?,
+          role_ids = ?,
+          updated_at = ?,
+          archived_at = ?
+        WHERE id = ?
+        """,
+        (
+            merged["project_id"],
+            merged["name"],
+            merged.get("style_text"),
+            merged.get("continuity_text"),
+            json.dumps(merged.get("prompt_ids") or [], ensure_ascii=False),
+            json.dumps(merged.get("role_ids") or [], ensure_ascii=False),
+            merged.get("updated_at"),
+            merged.get("archived_at"),
+            series_id,
+        ),
+    )
+    conn.commit()
+    return get(series_id)
+
+
+def delete(series_id: str) -> None:
+    conn = _connect()
+    _ensure(conn)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM series WHERE id = ?", (series_id,))
+    conn.commit()
+
+
+def list_items(
+    project_id: str,
+    q: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    conn = _connect()
+    _ensure(conn)
+
+    where = ["project_id = ?"]
+    args: List[Any] = [project_id]
+
+    if q:
+        where.append("name LIKE ?")
+        args.append(f"%{q}%")
+
+    where_sql = " AND ".join(where)
+    total = conn.execute(f"SELECT COUNT(1) AS c FROM series WHERE {where_sql}", tuple(args)).fetchone()["c"]
+
+    rows = conn.execute(
+        f"""
+        SELECT *
+        FROM series
+        WHERE {where_sql}
+        ORDER BY created_at DESC
+        LIMIT ? OFFSET ?
+        """,
+        tuple(args + [limit, offset]),
+    ).fetchall()
+
+    return {
+        "total": int(total),
+        "items": [_row_to_dict(r) for r in rows],
+        "limit": int(limit),
+        "offset": int(offset),
+    }
+PY
+echo "[ok] wrote: $api_dir/store_sqlite.py"
+
+cat <<'PY' > "$api_dir/service.py"
+from __future__ import annotations
+
+from typing import Any, Dict, Optional
+
+from . import store_sqlite as store
+
+
+def create_series(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return store.create(payload)
+
+
+def get_series(series_id: str) -> Dict[str, Any]:
+    return store.get(series_id)
+
+
+def list_series(project_id: str, q: Optional[str], limit: int, offset: int) -> Dict[str, Any]:
+    return store.list_items(project_id=project_id, q=q, limit=limit, offset=offset)
+
+
+def update_series(series_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
+    return store.update(series_id, patch)
+
+
+def delete_series(series_id: str) -> None:
+    return store.delete(series_id)
+PY
+echo "[ok] wrote: $api_dir/service.py"
+
+cat <<'PY' > "$api_dir/router.py"
+from __future__ import annotations
+
+from fastapi import APIRouter, HTTPException, Query
+
+from .dto import SeriesCreate, SeriesListResp, SeriesOut, SeriesPatch
+from .service import create_series, delete_series, get_series, list_series, update_series
+
+router = APIRouter(prefix="/api/series", tags=["series"])
+
+
+@router.get("", response_model=SeriesListResp)
+def api_list_series(
+    project_id: str = Query(...),
+    q: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+):
+    return list_series(project_id=project_id, q=q, limit=limit, offset=offset)
+
+
+@router.post("", response_model=SeriesOut)
+def api_create_series(body: SeriesCreate):
+    return create_series(body.model_dump())
+
+
+@router.get("/{series_id}", response_model=SeriesOut)
+def api_get_series(series_id: str):
+    try:
+        return get_series(series_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="NOT_FOUND")
+
+
+@router.patch("/{series_id}", response_model=SeriesOut)
+def api_patch_series(series_id: str, body: SeriesPatch):
+    patch = body.model_dump(exclude_unset=True)  # keep explicit nulls
+    try:
+        return update_series(series_id, patch)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="NOT_FOUND")
+
+
+@router.delete("/{series_id}")
+def api_delete_series(series_id: str):
+    try:
+        delete_series(series_id)
+        return {"ok": True}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="NOT_FOUND")
+PY
+echo "[ok] wrote: $api_dir/router.py"
+
+# -------------------------
+# (B) FRONTEND: series api + workspace UI
+# -------------------------
+
+# series api wrapper aligned with prompts.ts imports (./client)
+cat <<'TS' > "apps/web/src/lib/api/series.ts"
+import { apiGet, apiPatch, apiPost } from "./client";
+
+export type Series = {
+  id: string;
+  project_id: string;
+  name: string;
+  style_text?: string | null;
+  continuity_text?: string | null;
+  prompt_ids?: string[];
+  role_ids?: string[];
+  created_at?: string;
+  updated_at?: string | null;
+  archived_at?: string | null;
+};
+
+export type SeriesListResp = {
+  total: number;
+  items: Series[];
+  limit: number;
+  offset: number;
+};
+
+export async function listSeries(args: {
+  project_id: string;
+  q?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<SeriesListResp> {
+  const qs = new URLSearchParams();
+  qs.set("project_id", args.project_id);
+  if (args.q) qs.set("q", args.q);
+  qs.set("limit", String(args.limit ?? 50));
+  qs.set("offset", String(args.offset ?? 0));
+  return apiGet(`/api/series?${qs.toString()}`);
+}
+
+export async function createSeries(body: {
+  project_id: string;
+  name: string;
+  style_text?: string | null;
+  continuity_text?: string | null;
+  prompt_ids?: string[];
+  role_ids?: string[];
+}): Promise<Series> {
+  return apiPost(`/api/series`, body);
+}
+
+export async function getSeries(series_id: string): Promise<Series> {
+  return apiGet(`/api/series/${series_id}`);
+}
+
+export async function updateSeries(
+  series_id: string,
+  patch: Partial<Pick<Series, "name" | "style_text" | "continuity_text" | "prompt_ids" | "role_ids" | "archived_at">>
+): Promise<Series> {
+  return apiPatch(`/api/series/${series_id}`, patch);
+}
+TS
+echo "[ok] wrote: apps/web/src/lib/api/series.ts"
+
+cat <<'TSX' > "apps/web/src/ui/series/SeriesIndex.tsx"
+"use client";
+
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { createSeries, listSeries, Series } from "../../lib/api/series";
+
+const LS_KEY = "aam.series.query.project_id";
+
+export function SeriesIndex() {
+  const [queryProjectId, setQueryProjectId] = useState("");
+  const [q, setQ] = useState("");
+
+  const [createProjectId, setCreateProjectId] = useState("");
+  const [name, setName] = useState("");
+  const [styleText, setStyleText] = useState("");
+  const [continuityText, setContinuityText] = useState("");
+
+  const [items, setItems] = useState<Series[]>([]);
+  const [total, setTotal] = useState<number>(0);
+  const [err, setErr] = useState<string>("");
+
+  useEffect(() => {
+    const v = localStorage.getItem(LS_KEY);
+    if (v) setQueryProjectId(v);
+  }, []);
+
+  useEffect(() => {
+    if (queryProjectId) localStorage.setItem(LS_KEY, queryProjectId);
+  }, [queryProjectId]);
+
+  const refresh = useCallback(async () => {
+    setErr("");
+    if (!queryProjectId.trim()) {
+      setItems([]);
+      setTotal(0);
+      setErr("project_id is required for listing (M02).");
+      return;
+    }
+    try {
+      const res = await listSeries({ project_id: queryProjectId.trim(), q: q.trim() || undefined, limit: 50, offset: 0 });
+      setItems(res.items || []);
+      setTotal(res.total || 0);
+    } catch (e: any) {
+      setItems([]);
+      setTotal(0);
+      setErr(e?.message || "Request failed");
+    }
+  }, [queryProjectId, q]);
+
+  const clearQOnly = useCallback(() => {
+    setQ("");
+  }, []);
+
+  const onCreate = useCallback(async () => {
+    setErr("");
+    const pid = createProjectId.trim();
+    const nm = name.trim();
+    if (!pid) {
+      setErr("Create: project_id is required.");
+      return;
+    }
+    if (!nm) {
+      setErr("Create: name is required.");
+      return;
+    }
+    try {
+      await createSeries({
+        project_id: pid,
+        name: nm,
+        style_text: styleText || null,
+        continuity_text: continuityText || null,
+      });
+      // after create, switch listing to that project_id (helps avoid “created but not visible” confusion)
+      setQueryProjectId(pid);
+      await refresh();
+      setName("");
+      setStyleText("");
+      setContinuityText("");
+    } catch (e: any) {
+      setErr(e?.message || "Create failed");
+    }
+  }, [createProjectId, name, styleText, continuityText, refresh]);
+
+  const header = useMemo(() => {
+    return `total: ${total}`;
+  }, [total]);
+
+  return (
+    <div style={{ padding: 24 }}>
+      <h1 style={{ fontSize: 36, fontWeight: 700 }}>Series</h1>
+      <p style={{ marginTop: 8, color: "#444" }}>Series list requires <code>project_id</code> filter (M02).</p>
+
+      <div style={{ display: "grid", gridTemplateColumns: "420px 1fr", gap: 18, marginTop: 18 }}>
+        {/* Create */}
+        <div style={{ border: "1px solid #ddd", borderRadius: 12, padding: 16 }}>
+          <h2 style={{ fontSize: 18, fontWeight: 700 }}>Create</h2>
+
+          <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "160px 1fr", gap: 10, alignItems: "center" }}>
+            <div>project_id (required)</div>
+            <input value={createProjectId} onChange={(e) => setCreateProjectId(e.target.value)} placeholder="project_id" />
+
+            <div>name (required)</div>
+            <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Series name" />
+
+            <div>style_text</div>
+            <textarea value={styleText} onChange={(e) => setStyleText(e.target.value)} rows={5} />
+
+            <div>continuity_text</div>
+            <textarea value={continuityText} onChange={(e) => setContinuityText(e.target.value)} rows={5} />
+          </div>
+
+          <div style={{ marginTop: 12, display: "flex", gap: 10 }}>
+            <button onClick={onCreate}>Create</button>
+          </div>
+
+          {err ? <div style={{ marginTop: 10, color: "crimson" }}>{err}</div> : null}
+        </div>
+
+        {/* List + Query */}
+        <div style={{ border: "1px solid #ddd", borderRadius: 12, padding: 16 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+            <h2 style={{ fontSize: 18, fontWeight: 700 }}>Series</h2>
+            <div style={{ color: "#444" }}>{header}</div>
+          </div>
+
+          {/* Query (moved above list) */}
+          <div style={{ marginTop: 10, border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
+            <div style={{ fontWeight: 700, marginBottom: 10 }}>Query</div>
+            <div style={{ display: "grid", gridTemplateColumns: "180px 1fr", gap: 10, alignItems: "center" }}>
+              <div>project_id (required)</div>
+              <input value={queryProjectId} onChange={(e) => setQueryProjectId(e.target.value)} placeholder="project_id" />
+
+              <div>q (optional)</div>
+              <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="name contains..." />
+            </div>
+
+            <div style={{ marginTop: 10, display: "flex", gap: 10 }}>
+              <button onClick={refresh}>Refresh</button>
+              <button onClick={clearQOnly}>Clear</button>
+            </div>
+          </div>
+
+          {/* List */}
+          <div style={{ marginTop: 12, display: "grid", gap: 10 }}>
+            {items.length === 0 ? (
+              <div style={{ color: "#666" }}>
+                No items.
+                {queryProjectId.trim() ? null : <div style={{ color: "crimson", marginTop: 6 }}>project_id is required for listing (M02).</div>}
+                {queryProjectId.trim() && err ? <div style={{ color: "crimson", marginTop: 6 }}>{err}</div> : null}
+              </div>
+            ) : (
+              items.map((x) => (
+                <div key={x.id} style={{ border: "1px solid #eee", borderRadius: 12, padding: 12, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <div>
+                    <div style={{ fontWeight: 700, fontSize: 16 }}>{x.name}</div>
+                    <div style={{ fontSize: 12, color: "#444" }}>project_id: {x.project_id}</div>
+                    <div style={{ fontSize: 12, color: "#444" }}>archived_at: {String(x.archived_at ?? "null")}</div>
+                  </div>
+                  <a href={`/series/${x.id}`} style={{ border: "1px solid #ddd", borderRadius: 10, padding: "6px 12px", textDecoration: "none" }}>
+                    Open
+                  </a>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+TSX
+echo "[ok] wrote: apps/web/src/ui/series/SeriesIndex.tsx"
+
+cat <<'TSX' > "apps/web/src/ui/series/SeriesDetail.tsx"
+"use client";
+
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { getSeries, Series, updateSeries } from "../../lib/api/series";
+
+export function SeriesDetail({ series_id }: { series_id: string }) {
+  const [item, setItem] = useState<Series | null>(null);
+  const [err, setErr] = useState("");
+
+  const [styleText, setStyleText] = useState("");
+  const [continuityText, setContinuityText] = useState("");
+
+  const [promptIdInput, setPromptIdInput] = useState("");
+  const [roleIdInput, setRoleIdInput] = useState("");
+
+  const refresh = useCallback(async () => {
+    setErr("");
+    try {
+      const x = await getSeries(series_id);
+      setItem(x);
+      setStyleText(x.style_text || "");
+      setContinuityText(x.continuity_text || "");
+    } catch (e: any) {
+      setErr(e?.message || "Failed to load series");
+    }
+  }, [series_id]);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  const promptIds = useMemo(() => item?.prompt_ids || [], [item]);
+  const roleIds = useMemo(() => item?.role_ids || [], [item]);
+
+  const saveTexts = useCallback(async () => {
+    if (!item) return;
+    setErr("");
+    try {
+      const x = await updateSeries(item.id, { style_text: styleText, continuity_text: continuityText });
+      setItem(x);
+    } catch (e: any) {
+      setErr(e?.message || "Save failed");
+    }
+  }, [item, styleText, continuityText]);
+
+  const addPromptId = useCallback(async () => {
+    if (!item) return;
+    const v = promptIdInput.trim();
+    if (!v) return;
+    if (promptIds.includes(v)) return;
+    setErr("");
+    try {
+      const x = await updateSeries(item.id, { prompt_ids: [...promptIds, v] });
+      setItem(x);
+      setPromptIdInput("");
+    } catch (e: any) {
+      setErr(e?.message || "Update failed");
+    }
+  }, [item, promptIdInput, promptIds]);
+
+  const removePromptId = useCallback(
+    async (pid: string) => {
+      if (!item) return;
+      setErr("");
+      try {
+        const x = await updateSeries(item.id, { prompt_ids: promptIds.filter((x) => x !== pid) });
+        setItem(x);
+      } catch (e: any) {
+        setErr(e?.message || "Update failed");
+      }
+    },
+    [item, promptIds]
+  );
+
+  const addRoleId = useCallback(async () => {
+    if (!item) return;
+    const v = roleIdInput.trim();
+    if (!v) return;
+    if (roleIds.includes(v)) return;
+    setErr("");
+    try {
+      const x = await updateSeries(item.id, { role_ids: [...roleIds, v] });
+      setItem(x);
+      setRoleIdInput("");
+    } catch (e: any) {
+      setErr(e?.message || "Update failed");
+    }
+  }, [item, roleIdInput, roleIds]);
+
+  const removeRoleId = useCallback(
+    async (rid: string) => {
+      if (!item) return;
+      setErr("");
+      try {
+        const x = await updateSeries(item.id, { role_ids: roleIds.filter((x) => x !== rid) });
+        setItem(x);
+      } catch (e: any) {
+        setErr(e?.message || "Update failed");
+      }
+    },
+    [item, roleIds]
+  );
+
+  if (!item) {
+    return (
+      <div style={{ padding: 24 }}>
+        <h1 style={{ fontSize: 32, fontWeight: 700 }}>Series</h1>
+        {err ? <div style={{ color: "crimson", marginTop: 10 }}>{err}</div> : <div style={{ marginTop: 10 }}>Loading...</div>}
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ padding: 24 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+        <div>
+          <h1 style={{ fontSize: 32, fontWeight: 700 }}>{item.name}</h1>
+          <div style={{ color: "#444", marginTop: 6, fontSize: 12 }}>
+            id: {item.id} · project_id: {item.project_id}
+          </div>
+        </div>
+        <a href="/series" style={{ textDecoration: "none", color: "#2563eb" }}>
+          Back to list
+        </a>
+      </div>
+
+      {err ? <div style={{ marginTop: 12, color: "crimson" }}>{err}</div> : null}
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginTop: 16 }}>
+        <div style={{ border: "1px solid #ddd", borderRadius: 12, padding: 16 }}>
+          <h2 style={{ fontSize: 18, fontWeight: 700 }}>Style / Continuity</h2>
+
+          <div style={{ marginTop: 10 }}>
+            <div style={{ fontSize: 12, color: "#444" }}>style_text</div>
+            <textarea value={styleText} onChange={(e) => setStyleText(e.target.value)} rows={7} style={{ width: "100%", marginTop: 6 }} />
+          </div>
+
+          <div style={{ marginTop: 10 }}>
+            <div style={{ fontSize: 12, color: "#444" }}>continuity_text</div>
+            <textarea value={continuityText} onChange={(e) => setContinuityText(e.target.value)} rows={7} style={{ width: "100%", marginTop: 6 }} />
+          </div>
+
+          <div style={{ marginTop: 10, display: "flex", gap: 10 }}>
+            <button onClick={saveTexts}>Save</button>
+            <button onClick={refresh}>Reload</button>
+          </div>
+        </div>
+
+        <div style={{ border: "1px solid #ddd", borderRadius: 12, padding: 16 }}>
+          <h2 style={{ fontSize: 18, fontWeight: 700 }}>Associations</h2>
+
+          <div style={{ marginTop: 12, border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
+            <div style={{ fontWeight: 700 }}>Prompts</div>
+
+            <div style={{ marginTop: 8, display: "flex", gap: 10 }}>
+              <input value={promptIdInput} onChange={(e) => setPromptIdInput(e.target.value)} placeholder="prompt_id to link" style={{ flex: 1 }} />
+              <button onClick={addPromptId}>Add</button>
+            </div>
+
+            <div style={{ marginTop: 10, display: "grid", gap: 8 }}>
+              {promptIds.length === 0 ? (
+                <div style={{ color: "#666" }}>No linked prompts.</div>
+              ) : (
+                promptIds.map((pid) => (
+                  <div key={pid} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", border: "1px solid #f0f0f0", borderRadius: 10, padding: "8px 10px" }}>
+                    <code>{pid}</code>
+                    <button onClick={() => removePromptId(pid)}>Remove</button>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+
+          <div style={{ marginTop: 12, border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
+            <div style={{ fontWeight: 700 }}>Roles</div>
+
+            <div style={{ marginTop: 8, display: "flex", gap: 10 }}>
+              <input value={roleIdInput} onChange={(e) => setRoleIdInput(e.target.value)} placeholder="role_id to link" style={{ flex: 1 }} />
+              <button onClick={addRoleId}>Add</button>
+            </div>
+
+            <div style={{ marginTop: 10, display: "grid", gap: 8 }}>
+              {roleIds.length === 0 ? (
+                <div style={{ color: "#666" }}>No linked roles.</div>
+              ) : (
+                roleIds.map((rid) => (
+                  <div key={rid} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", border: "1px solid #f0f0f0", borderRadius: 10, padding: "8px 10px" }}>
+                    <code>{rid}</code>
+                    <button onClick={() => removeRoleId(rid)}>Remove</button>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+
+          <div style={{ marginTop: 12, border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
+            <div style={{ fontWeight: 700 }}>Episode / Video Entry</div>
+            <div style={{ marginTop: 8, color: "#444", fontSize: 12 }}>
+              These are M02 entry points. M03 will implement actual Episode/Video creation.
+            </div>
+            <div style={{ marginTop: 10, display: "flex", gap: 10 }}>
+              <a href={`/series/${item.id}/episodes/new`} style={{ textDecoration: "none", border: "1px solid #ddd", borderRadius: 10, padding: "6px 10px" }}>
+                Create Episode
+              </a>
+              <a href={`/series/${item.id}/videos/new`} style={{ textDecoration: "none", border: "1px solid #ddd", borderRadius: 10, padding: "6px 10px" }}>
+                Create Video
+              </a>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+TSX
+echo "[ok] wrote: apps/web/src/ui/series/SeriesDetail.tsx"
+
+cat <<'TSX' > "apps/web/app/(app)/series/page.tsx"
+import { SeriesIndex } from "@/src/ui/series/SeriesIndex";
+
+export default function Page() {
+  return <SeriesIndex />;
+}
+TSX
+echo "[ok] wrote: apps/web/app/(app)/series/page.tsx"
+
+cat <<'TSX' > "apps/web/app/(app)/series/[series_id]/page.tsx"
+import { SeriesDetail } from "@/src/ui/series/SeriesDetail";
+
+export default async function Page({ params }: { params: Promise<{ series_id: string }> }) {
+  const { series_id } = await params;
+  return <SeriesDetail series_id={series_id} />;
+}
+TSX
+echo "[ok] wrote: apps/web/app/(app)/series/[series_id]/page.tsx"
+
+mkdir -p "apps/web/app/(app)/series/[series_id]/episodes/new"
+mkdir -p "apps/web/app/(app)/series/[series_id]/videos/new"
+
+cat <<'TSX' > "apps/web/app/(app)/series/[series_id]/episodes/new/page.tsx"
+export default async function Page({ params }: { params: Promise<{ series_id: string }> }) {
+  const { series_id } = await params;
+  return (
+    <div style={{ padding: 24 }}>
+      <h1 style={{ fontSize: 28, fontWeight: 700 }}>Create Episode (placeholder)</h1>
+      <p style={{ marginTop: 10, color: "#444" }}>
+        series_id: <code>{series_id}</code>
+      </p>
+      <p style={{ marginTop: 10, color: "#444" }}>
+        M02 provides the entry point; M03 will implement the actual Episode entity and create flow.
+      </p>
+      <p style={{ marginTop: 12 }}>
+        <a href={`/series/${series_id}`} style={{ color: "#2563eb", textDecoration: "none" }}>Back to Series</a>
+      </p>
+    </div>
+  );
+}
+TSX
+echo "[ok] wrote: apps/web/app/(app)/series/[series_id]/episodes/new/page.tsx"
+
+cat <<'TSX' > "apps/web/app/(app)/series/[series_id]/videos/new/page.tsx"
+export default async function Page({ params }: { params: Promise<{ series_id: string }> }) {
+  const { series_id } = await params;
+  return (
+    <div style={{ padding: 24 }}>
+      <h1 style={{ fontSize: 28, fontWeight: 700 }}>Create Video (placeholder)</h1>
+      <p style={{ marginTop: 10, color: "#444" }}>
+        series_id: <code>{series_id}</code>
+      </p>
+      <p style={{ marginTop: 10, color: "#444" }}>
+        M02 provides the entry point; M03 will implement the actual Video entity and create flow.
+      </p>
+      <p style={{ marginTop: 12 }}>
+        <a href={`/series/${series_id}`} style={{ color: "#2563eb", textDecoration: "none" }}>Back to Series</a>
+      </p>
+    </div>
+  );
+}
+TSX
+echo "[ok] wrote: apps/web/app/(app)/series/[series_id]/videos/new/page.tsx"
+
+# -------------------------
+# (C) GATES
+# -------------------------
+echo "[gate] backend tests"
+cd apps/api
+PYTHONPATH=./src pytest -q
+cd - >/dev/null
+
+echo "[gate] frontend build"
+cd apps/web
+npm run build
+cd - >/dev/null
+
+echo "[done] M02_R6 completed"

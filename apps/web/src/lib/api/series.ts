@@ -1,5 +1,4 @@
-// M02 Series API wrapper (client-side)
-// NOTE: uses explicit API base to avoid accidentally hitting Next.js /api/* routes on :2000
+import { apiFetch } from "./client";
 
 export type Series = {
   id: string;
@@ -7,16 +6,11 @@ export type Series = {
   name: string;
   style_text?: string | null;
   continuity_text?: string | null;
+  prompt_ids: string[];
+  role_ids: string[];
+  created_at: string;
+  updated_at?: string | null;
   archived_at?: string | null;
-  created_at?: string;
-  updated_at?: string;
-};
-
-export type Paged<T> = {
-  items: T[];
-  total: number;
-  limit?: number;
-  offset?: number;
 };
 
 export type SeriesCreate = {
@@ -24,92 +18,64 @@ export type SeriesCreate = {
   name: string;
   style_text?: string | null;
   continuity_text?: string | null;
+  prompt_ids?: string[];
+  role_ids?: string[];
 };
 
 export type SeriesPatch = {
-  name?: string;
+  name?: string | null;
   style_text?: string | null;
   continuity_text?: string | null;
+  prompt_ids?: string[] | null;
+  role_ids?: string[] | null;
   archived_at?: string | null;
 };
 
-function getApiBaseUrl(): string {
-  const v = (process.env.NEXT_PUBLIC_API_BASE_URL || "").trim();
-  return v || "http://127.0.0.1:7000";
-}
+export type SeriesListResp = {
+  total: number;
+  items: Series[];
+  limit: number;
+  offset: number;
+};
 
-async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
-  const base = getApiBaseUrl().replace(/\/$/, "");
-  const url = path.startsWith("http") ? path : `${base}${path.startsWith("/") ? "" : "/"}${path}`;
-
-  const res = await fetch(url, {
-    ...init,
-    headers: {
-      ...(init?.headers || {}),
-      "Accept": "application/json",
-    },
-    cache: "no-store",
-  });
-
-  const text = await res.text();
-  let data: any = null;
-  try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    // keep raw
-  }
-
-  if (!res.ok) {
-    const msg = (data && (data.error?.message || data.message)) || `HTTP ${res.status}`;
-    const err: any = new Error(msg);
-    err.status = res.status;
-    err.body = data || text;
-    throw err;
-  }
-
-  return data as T;
-}
-
-export async function listSeries(params: {
-  project_id: string;
+export async function listSeries(args: {
+  project_id?: string;
   q?: string;
   limit?: number;
   offset?: number;
-  archived?: boolean;
-}): Promise<Paged<Series>> {
-  const usp = new URLSearchParams();
-  usp.set("project_id", params.project_id);
-  if (params.q) usp.set("q", params.q);
-  if (typeof params.limit === "number") usp.set("limit", String(params.limit));
-  if (typeof params.offset === "number") usp.set("offset", String(params.offset));
-  if (typeof params.archived === "boolean") usp.set("archived", params.archived ? "true" : "false");
-  return apiFetch<Paged<Series>>(`/api/series?${usp.toString()}`);
+} = {}): Promise<SeriesListResp> {
+  const params = new URLSearchParams();
+  const pid = (args.project_id ?? "").trim();
+  const q = (args.q ?? "").trim();
+  params.set("limit", String(args.limit ?? 50));
+  params.set("offset", String(args.offset ?? 0));
+  if (pid) params.set("project_id", pid);
+  if (q) params.set("q", q);
+  const qs = params.toString();
+  return apiFetch<SeriesListResp>(`/api/series?${qs}`);
 }
 
-export async function createSeries(body: SeriesCreate): Promise<Series> {
+export async function createSeries(payload: SeriesCreate): Promise<Series> {
   return apiFetch<Series>(`/api/series`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify(payload ?? {}),
   });
 }
 
 export async function getSeries(series_id: string): Promise<Series> {
-  return apiFetch<Series>(`/api/series/${encodeURIComponent(series_id)}`);
+  return apiFetch<Series>(`/api/series/${series_id}`);
 }
 
-export async function patchSeries(series_id: string, patch: SeriesPatch): Promise<Series> {
-  // IMPORTANT: do not drop null; archived_at: null is used to restore.
-  return apiFetch<Series>(`/api/series/${encodeURIComponent(series_id)}`, {
+export async function updateSeries(series_id: string, patch: SeriesPatch): Promise<Series> {
+  return apiFetch<Series>(`/api/series/${series_id}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(patch),
+    body: JSON.stringify(patch ?? {}),
   });
 }
 
-// deleteSeries: not exposed by current OpenAPI; use archived_at soft-delete instead.
-
-export async function updateSeries(series_id: string, patch: SeriesPatch): Promise<Series> {
-  return patchSeries(series_id, patch);
+export async function deleteSeries(series_id: string): Promise<{ ok: boolean }> {
+  await apiFetch<unknown>(`/api/series/${series_id}`, { method: "DELETE" });
+  return { ok: true };
 }
-

@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" && pwd)"
+ts="$(date +%Y%m%d_%H%M%S)"
+echo "[info] repo_root=$repo_root ts=$ts"
+cd "$repo_root"
+
+SERIES_STORE="apps/api/src/app/modules/series/store_sqlite.py"
+SERIES_DTO="apps/api/src/app/modules/series/dto.py"
+
+if [[ ! -f "$SERIES_STORE" ]]; then
+  echo "[fatal] missing file: $SERIES_STORE"
+  exit 1
+fi
+
+cp -a "$SERIES_STORE" "${SERIES_STORE}.bak.${ts}"
+[[ -f "$SERIES_DTO" ]] && cp -a "$SERIES_DTO" "${SERIES_DTO}.bak.${ts}" || true
+
+python - <<'PY'
+from __future__ import annotations
+import re
+from pathlib import Path
+
+store_path = Path("apps/api/src/app/modules/series/store_sqlite.py")
+dto_path = Path("apps/api/src/app/modules/series/dto.py")
+
+store = store_path.read_text(encoding="utf-8")
+
+# ---- Patch store_sqlite.py: ensure style_text/continuity_text exist when create payload omitted them
+pat = re.compile(r'^(?P<indent>\s*)(?P<var>\w+)\s*=\s*.*model_dump\([^)]*\)\s*$', re.M)
+m = pat.search(store)
+
+inserted = False
+if m:
+    indent = m.group("indent")
+    var = m.group("var")
+    inject = (
+        f"{indent}{var}.setdefault(\"style_text\", \"\")\n"
+        f"{indent}{var}.setdefault(\"continuity_text\", \"\")\n"
+    )
+    start = m.end()
+    window = store[start:start+400]
+    if "setdefault(\"style_text\"" not in window and "setdefault('style_text'" not in window:
+        store = store[:start] + "\n" + inject + store[start:]
+        inserted = True
+
+if not inserted:
+    pat2 = re.compile(r'^(?P<indent>\s*)(?P<var>(data|payload|row|obj))\s*=\s*\{\s*$', re.M)
+    m2 = pat2.search(store)
+    if m2:
+        indent = m2.group("indent")
+        var = m2.group("var")
+        i = m2.end()
+        depth = 1
+        while i < len(store) and depth > 0:
+            if store[i] == "{":
+                depth += 1
+            elif store[i] == "}":
+                depth -= 1
+            i += 1
+        inject = (
+            f"\n{indent}{var}.setdefault(\"style_text\", \"\")\n"
+            f"{indent}{var}.setdefault(\"continuity_text\", \"\")\n"
+        )
+        block = store[m2.start():i]
+        if "setdefault(\"style_text\"" not in block and "setdefault('style_text'" not in block:
+            store = store[:i] + inject + store[i:]
+            inserted = True
+
+store_path.write_text(store, encoding="utf-8")
+print(f"[ok] patched store_sqlite.py inserted_setdefault={inserted}")
+
+# ---- Patch dto.py (best-effort): add defaults if plain `style_text: str` / `continuity_text: str`
+if dto_path.exists():
+    dto = dto_path.read_text(encoding="utf-8")
+    lines = dto.splitlines()
+    out = []
+    changed = False
+
+    for ln in lines:
+        if re.match(r'^\s*style_text\s*:\s*str\s*$', ln) and "=" not in ln:
+            out.append(ln + ' = ""')
+            changed = True
+            continue
+        if re.match(r'^\s*continuity_text\s*:\s*str\s*$', ln) and "=" not in ln:
+            out.append(ln + ' = ""')
+            changed = True
+            continue
+        out.append(ln)
+
+    dto2 = "\n".join(out) + ("\n" if dto.endswith("\n") else "")
+    if changed:
+        dto_path.write_text(dto2, encoding="utf-8")
+    print(f"[ok] patched dto.py changed={changed}")
+else:
+    print("[warn] dto.py not found; skipped")
+PY
+
+echo "[info] running backend tests..."
+cd apps/api
+PYTHONPATH=./src pytest -q
+rc=$?
+echo "[info] pytest rc=$rc"
+if [[ "$rc" -ne 0 ]]; then
+  echo "[warn] full test failed; rerun failing test with verbose output"
+  PYTHONPATH=./src pytest -q -vv -s tests/test_series_crud.py::test_series_archived_at_restore_null || true
+  exit 1
+fi
+
+echo "[done] M02 series create 500 fix applied + tests passed."

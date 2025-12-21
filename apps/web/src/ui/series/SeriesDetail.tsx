@@ -1,122 +1,214 @@
-'use client';
+"use client";
 
-import { useCallback, useEffect, useState } from "react";
-import { Series, getSeries, updateSeries } from "../../lib/api/series";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { getSeries, Series, updateSeries } from "../../lib/api/series";
 
 export function SeriesDetail({ series_id }: { series_id: string }) {
   const [item, setItem] = useState<Series | null>(null);
-  const [loading, setLoading] = useState<boolean>(false);
-  const [err, setErr] = useState<string | null>(null);
+  const [err, setErr] = useState("");
 
-  const [name, setName] = useState<string>("");
-  const [styleText, setStyleText] = useState<string>("");
-  const [continuityText, setContinuityText] = useState<string>("");
+  const [styleText, setStyleText] = useState("");
+  const [continuityText, setContinuityText] = useState("");
+
+  const [promptIdInput, setPromptIdInput] = useState("");
+  const [roleIdInput, setRoleIdInput] = useState("");
 
   const refresh = useCallback(async () => {
-    setErr(null);
-    setLoading(true);
+    setErr("");
     try {
-      const s = await getSeries(series_id);
-      setItem(s);
-      setName(s.name || "");
-      setStyleText((s.style_text ?? "") as string);
-      setContinuityText((s.continuity_text ?? "") as string);
+      const x = await getSeries(series_id);
+      setItem(x);
+      setStyleText(x.style_text || "");
+      setContinuityText(x.continuity_text || "");
     } catch (e: any) {
-      setErr(e?.message || "failed to load series");
-    } finally {
-      setLoading(false);
+      setErr(e?.message || "Failed to load series");
     }
   }, [series_id]);
 
-  useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
 
-  const save = useCallback(async () => {
-    setErr(null);
-    setLoading(true);
-    try {
-      const s = await updateSeries(series_id, {
-        name: name.trim() || (item?.name ?? ""),
-        style_text: styleText,
-        continuity_text: continuityText,
-      });
-      setItem(s);
-    } catch (e: any) {
-      setErr(e?.message || "failed to update");
-    } finally {
-      setLoading(false);
-    }
-  }, [series_id, name, styleText, continuityText, item]);
+  const promptIds = useMemo(() => item?.prompt_ids || [], [item]);
+  const roleIds = useMemo(() => item?.role_ids || [], [item]);
 
-  const archive = useCallback(async () => {
-    setErr(null);
-    setLoading(true);
+  const saveTexts = useCallback(async () => {
+    if (!item) return;
+    setErr("");
     try {
-      const s = await updateSeries(series_id, { archived_at: new Date().toISOString() });
-      setItem(s);
+      const x = await updateSeries(item.id, { style_text: styleText, continuity_text: continuityText });
+      setItem(x);
     } catch (e: any) {
-      setErr(e?.message || "failed to archive");
-    } finally {
-      setLoading(false);
+      setErr(e?.message || "Save failed");
     }
-  }, [series_id]);
+  }, [item, styleText, continuityText]);
 
-  const restore = useCallback(async () => {
-    setErr(null);
-    setLoading(true);
+  const addPromptId = useCallback(async () => {
+    if (!item) return;
+    const v = promptIdInput.trim();
+    if (!v) return;
+    if (promptIds.includes(v)) return;
+    setErr("");
     try {
-      const s = await updateSeries(series_id, { archived_at: null });
-      setItem(s);
+      const x = await updateSeries(item.id, { prompt_ids: [...promptIds, v] });
+      setItem(x);
+      setPromptIdInput("");
     } catch (e: any) {
-      setErr(e?.message || "failed to restore");
-    } finally {
-      setLoading(false);
+      setErr(e?.message || "Update failed");
     }
-  }, [series_id]);
+  }, [item, promptIdInput, promptIds]);
+
+  const removePromptId = useCallback(
+    async (pid: string) => {
+      if (!item) return;
+      setErr("");
+      try {
+        const x = await updateSeries(item.id, { prompt_ids: promptIds.filter((x) => x !== pid) });
+        setItem(x);
+      } catch (e: any) {
+        setErr(e?.message || "Update failed");
+      }
+    },
+    [item, promptIds]
+  );
+
+  const addRoleId = useCallback(async () => {
+    if (!item) return;
+    const v = roleIdInput.trim();
+    if (!v) return;
+    if (roleIds.includes(v)) return;
+    setErr("");
+    try {
+      const x = await updateSeries(item.id, { role_ids: [...roleIds, v] });
+      setItem(x);
+      setRoleIdInput("");
+    } catch (e: any) {
+      setErr(e?.message || "Update failed");
+    }
+  }, [item, roleIdInput, roleIds]);
+
+  const removeRoleId = useCallback(
+    async (rid: string) => {
+      if (!item) return;
+      setErr("");
+      try {
+        const x = await updateSeries(item.id, { role_ids: roleIds.filter((x) => x !== rid) });
+        setItem(x);
+      } catch (e: any) {
+        setErr(e?.message || "Update failed");
+      }
+    },
+    [item, roleIds]
+  );
+
+  if (!item) {
+    return (
+      <div style={{ padding: 24 }}>
+        <h1 style={{ fontSize: 32, fontWeight: 700 }}>Series</h1>
+        {err ? <div style={{ color: "crimson", marginTop: 10 }}>{err}</div> : <div style={{ marginTop: 10 }}>Loading...</div>}
+      </div>
+    );
+  }
 
   return (
-    <div style={{ border: "1px solid #eee", borderRadius: 14, padding: 16, background: "#fff" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 10 }}>
-        <div style={{ fontWeight: 800, fontSize: 20 }}>Series Detail</div>
-        <button onClick={() => void refresh()} disabled={loading} style={{ padding: "6px 10px", borderRadius: 10, border: "1px solid #ddd" }}>Refresh</button>
+    <div style={{ padding: 24 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+        <div>
+          <h1 style={{ fontSize: 32, fontWeight: 700 }}>{item.name}</h1>
+          <div style={{ color: "#444", marginTop: 6, fontSize: 12 }}>
+            id: {item.id} · project_id: {item.project_id}
+          </div>
+        </div>
+        <a href="/series" style={{ textDecoration: "none", color: "#2563eb" }}>
+          Back to list
+        </a>
       </div>
 
-      {err && (
-        <div style={{ marginBottom: 12, padding: 10, borderRadius: 10, border: "1px solid #f2c9c9", background: "#fff5f5", color: "#8a1f1f" }}>
-          {err}
+      {err ? <div style={{ marginTop: 12, color: "crimson" }}>{err}</div> : null}
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginTop: 16 }}>
+        <div style={{ border: "1px solid #ddd", borderRadius: 12, padding: 16 }}>
+          <h2 style={{ fontSize: 18, fontWeight: 700 }}>Style / Continuity</h2>
+
+          <div style={{ marginTop: 10 }}>
+            <div style={{ fontSize: 12, color: "#444" }}>style_text</div>
+            <textarea value={styleText} onChange={(e) => setStyleText(e.target.value)} rows={7} style={{ width: "100%", marginTop: 6 }} />
+          </div>
+
+          <div style={{ marginTop: 10 }}>
+            <div style={{ fontSize: 12, color: "#444" }}>continuity_text</div>
+            <textarea value={continuityText} onChange={(e) => setContinuityText(e.target.value)} rows={7} style={{ width: "100%", marginTop: 6 }} />
+          </div>
+
+          <div style={{ marginTop: 10, display: "flex", gap: 10 }}>
+            <button onClick={saveTexts}>Save</button>
+            <button onClick={refresh}>Reload</button>
+          </div>
         </div>
-      )}
 
-      {!item && !loading && <div style={{ color: "#666" }}>Not found.</div>}
-      {loading && <div style={{ color: "#666" }}>Loading...</div>}
+        <div style={{ border: "1px solid #ddd", borderRadius: 12, padding: 16 }}>
+          <h2 style={{ fontSize: 18, fontWeight: 700 }}>Associations</h2>
 
-      {item && (
-        <>
-          <div style={{ color: "#666", fontSize: 13, marginBottom: 12 }}>
-            id: {item.id} | project_id: {item.project_id} | archived_at: {item.archived_at ?? "null"}
+          <div style={{ marginTop: 12, border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
+            <div style={{ fontWeight: 700 }}>Prompts</div>
+
+            <div style={{ marginTop: 8, display: "flex", gap: 10 }}>
+              <input value={promptIdInput} onChange={(e) => setPromptIdInput(e.target.value)} placeholder="prompt_id to link" style={{ flex: 1 }} />
+              <button onClick={addPromptId}>Add</button>
+            </div>
+
+            <div style={{ marginTop: 10, display: "grid", gap: 8 }}>
+              {promptIds.length === 0 ? (
+                <div style={{ color: "#666" }}>No linked prompts.</div>
+              ) : (
+                promptIds.map((pid) => (
+                  <div key={pid} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", border: "1px solid #f0f0f0", borderRadius: 10, padding: "8px 10px" }}>
+                    <code>{pid}</code>
+                    <button onClick={() => removePromptId(pid)}>Remove</button>
+                  </div>
+                ))
+              )}
+            </div>
           </div>
 
-          <div style={{ display: "grid", gridTemplateColumns: "220px 1fr", gap: 10, alignItems: "center", marginBottom: 10 }}>
-            <div style={{ color: "#333", fontSize: 14 }}>name</div>
-            <input value={name} onChange={(e) => setName(e.target.value)} style={{ padding: 8, border: "1px solid #ddd", borderRadius: 8 }} />
+          <div style={{ marginTop: 12, border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
+            <div style={{ fontWeight: 700 }}>Roles</div>
+
+            <div style={{ marginTop: 8, display: "flex", gap: 10 }}>
+              <input value={roleIdInput} onChange={(e) => setRoleIdInput(e.target.value)} placeholder="role_id to link" style={{ flex: 1 }} />
+              <button onClick={addRoleId}>Add</button>
+            </div>
+
+            <div style={{ marginTop: 10, display: "grid", gap: 8 }}>
+              {roleIds.length === 0 ? (
+                <div style={{ color: "#666" }}>No linked roles.</div>
+              ) : (
+                roleIds.map((rid) => (
+                  <div key={rid} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", border: "1px solid #f0f0f0", borderRadius: 10, padding: "8px 10px" }}>
+                    <code>{rid}</code>
+                    <button onClick={() => removeRoleId(rid)}>Remove</button>
+                  </div>
+                ))
+              )}
+            </div>
           </div>
 
-          <div style={{ display: "grid", gridTemplateColumns: "220px 1fr", gap: 10, marginBottom: 10 }}>
-            <div style={{ color: "#333", fontSize: 14 }}>style_text</div>
-            <textarea value={styleText} onChange={(e) => setStyleText(e.target.value)} style={{ padding: 8, border: "1px solid #ddd", borderRadius: 8, minHeight: 120 }} />
+          <div style={{ marginTop: 12, border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
+            <div style={{ fontWeight: 700 }}>Episode / Video Entry</div>
+            <div style={{ marginTop: 8, color: "#444", fontSize: 12 }}>
+              These are M02 entry points. M03 will implement actual Episode/Video creation.
+            </div>
+            <div style={{ marginTop: 10, display: "flex", gap: 10 }}>
+              <a href={`/series/${item.id}/episodes/new`} style={{ textDecoration: "none", border: "1px solid #ddd", borderRadius: 10, padding: "6px 10px" }}>
+                Create Episode
+              </a>
+              <a href={`/series/${item.id}/videos/new`} style={{ textDecoration: "none", border: "1px solid #ddd", borderRadius: 10, padding: "6px 10px" }}>
+                Create Video
+              </a>
+            </div>
           </div>
-
-          <div style={{ display: "grid", gridTemplateColumns: "220px 1fr", gap: 10, marginBottom: 10 }}>
-            <div style={{ color: "#333", fontSize: 14 }}>continuity_text</div>
-            <textarea value={continuityText} onChange={(e) => setContinuityText(e.target.value)} style={{ padding: 8, border: "1px solid #ddd", borderRadius: 8, minHeight: 120 }} />
-          </div>
-
-          <div style={{ display: "flex", gap: 10, marginTop: 10 }}>
-            <button onClick={() => void save()} disabled={loading} style={{ padding: "8px 12px", borderRadius: 10, border: "1px solid #ddd" }}>Save</button>
-            <button onClick={() => void archive()} disabled={loading} style={{ padding: "8px 12px", borderRadius: 10, border: "1px solid #ddd" }}>Archive</button>
-            <button onClick={() => void restore()} disabled={loading} style={{ padding: "8px 12px", borderRadius: 10, border: "1px solid #ddd" }}>Restore (archived_at=null)</button>
-          </div>
-        </>
-      )}
+        </div>
+      </div>
     </div>
   );
 }

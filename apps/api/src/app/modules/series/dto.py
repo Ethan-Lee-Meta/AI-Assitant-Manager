@@ -1,33 +1,44 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Literal
+from typing import List, Optional
+
 from pydantic import BaseModel, Field
 
-class SeriesCreate(BaseModel):
-    project_id: str = Field(..., min_length=1)
-    name: str = Field(..., min_length=1)
-    style_text: str = Field(default="")
-    continuity_text: str = Field(default="")
 
-class SeriesPatch(BaseModel):
-    # partial update; explicit null for archived_at is allowed (restore)
-    name: Optional[str] = Field(default=None, min_length=1)
-    style_text: Optional[str] = None
-    continuity_text: Optional[str] = None
-    archived_at: Optional[str] = None  # ISO string or null
-
-class SeriesOut(BaseModel):
-    id: str
+class SeriesBase(BaseModel):
     project_id: str
     name: str
-    style_text: str
-    continuity_text: str
-    created_at: str
-    updated_at: str
+    style_text: Optional[str] = None
+    continuity_text: Optional[str] = None
+    prompt_ids: List[str] = Field(default_factory=list)
+    role_ids: List[str] = Field(default_factory=list)
+
+
+class SeriesCreate(SeriesBase):
+    pass
+
+
+    style_text: str = ""
+    continuity_text: str = ""
+class SeriesPatch(BaseModel):
+    name: Optional[str] = None
+    style_text: Optional[str] = None
+    continuity_text: Optional[str] = None
+    prompt_ids: Optional[List[str]] = None
+    role_ids: Optional[List[str]] = None
+    # allow explicit null to clear archived_at
     archived_at: Optional[str] = None
 
-class SeriesListResponse(BaseModel):
-    items: List[SeriesOut]
+
+class SeriesOut(SeriesBase):
+    id: str
+    created_at: str
+    updated_at: Optional[str] = None
+    archived_at: Optional[str] = None
+
+
+class SeriesListResp(BaseModel):
     total: int
+    items: List[SeriesOut]
     limit: int
     offset: int

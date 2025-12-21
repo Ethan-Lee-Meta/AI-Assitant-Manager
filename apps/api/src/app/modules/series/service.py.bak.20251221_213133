@@ -1,0 +1,25 @@
+from __future__ import annotations
+
+from typing import Any, Dict, Optional
+
+from . import store_sqlite as store
+
+
+def create_series(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return store.create(payload)
+
+
+def get_series(series_id: str) -> Dict[str, Any]:
+    return store.get(series_id)
+
+
+def list_series(project_id: str, q: Optional[str], limit: int, offset: int) -> Dict[str, Any]:
+    return store.list_items(project_id=project_id, q=q, limit=limit, offset=offset)
+
+
+def update_series(series_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
+    return store.update(series_id, patch)
+
+
+def delete_series(series_id: str) -> None:
+    return store.delete(series_id)

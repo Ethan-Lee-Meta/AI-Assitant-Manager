@@ -1,23 +1,25 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple, List
-from .store_sqlite import create_series, get_series, list_series, update_series
+from typing import Any, Dict, Optional
 
-def create(data: Dict[str, Any]) -> Dict[str, Any]:
-    return create_series(data)
+from . import store_sqlite as store
 
-def get(series_id: str) -> Optional[Dict[str, Any]]:
-    return get_series(series_id)
 
-def list_(
-    *,
-    project_id: str,
-    q: Optional[str],
-    archived: Optional[bool],
-    limit: int,
-    offset: int,
-) -> Tuple[List[Dict[str, Any]], int]:
-    return list_series(project_id=project_id, q=q, archived=archived, limit=limit, offset=offset)
+def create_series(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return store.create(payload)
 
-def patch(series_id: str, patch_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    return update_series(series_id, patch_data)
+
+def get_series(series_id: str) -> Dict[str, Any]:
+    return store.get(series_id)
+
+
+def list_series(project_id: Optional[str] | None, q: Optional[str], limit: int, offset: int) -> Dict[str, Any]:
+    return store.list_items(project_id=project_id, q=q, limit=limit, offset=offset)
+
+
+def update_series(series_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
+    return store.update(series_id, patch)
+
+
+def delete_series(series_id: str) -> None:
+    return store.delete(series_id)

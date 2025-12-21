@@ -1,0 +1,237 @@
+"use client";
+
+import Link from "next/link";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { createSeries, deleteSeries, listSeries, Series } from "../../lib/api/series";
+
+const LS_PID = "m02.series.project_id";
+const LS_Q = "m02.series.q";
+
+function FieldRow(props: { label: string; children: any }) {
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "180px 1fr", gap: 10, alignItems: "center", marginBottom: 10 }}>
+      <div style={{ fontSize: 13, color: "#333" }}>{props.label}</div>
+      <div>{props.children}</div>
+    </div>
+  );
+}
+
+function Card(props: { title: string; right?: any; children: any }) {
+  return (
+    <div style={{ border: "1px solid #e6e6e6", borderRadius: 12, padding: 16, background: "#fff" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", marginBottom: 12 }}>
+        <div style={{ fontSize: 18, fontWeight: 700 }}>{props.title}</div>
+        <div>{props.right}</div>
+      </div>
+      {props.children}
+    </div>
+  );
+}
+
+export function SeriesIndex() {
+  const [projectId, setProjectId] = useState<string>("");
+  const [q, setQ] = useState<string>("");
+
+  const [name, setName] = useState<string>("");
+  const [styleText, setStyleText] = useState<string>("");
+  const [continuityText, setContinuityText] = useState<string>("");
+
+  const [items, setItems] = useState<Series[]>([]);
+  const [total, setTotal] = useState<number>(0);
+
+  const [loading, setLoading] = useState<boolean>(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  // hydrate from localStorage once
+  useEffect(() => {
+    try {
+      const pid = localStorage.getItem(LS_PID) || "";
+      const qq = localStorage.getItem(LS_Q) || "";
+      if (pid) setProjectId(pid);
+      if (qq) setQ(qq);
+    } catch {}
+  }, []);
+
+  // persist filters
+  useEffect(() => {
+    try { localStorage.setItem(LS_PID, projectId || ""); } catch {}
+  }, [projectId]);
+  useEffect(() => {
+    try { localStorage.setItem(LS_Q, q || ""); } catch {}
+  }, [q]);
+
+  const canQuery = useMemo(() => (projectId || "").trim().length > 0, [projectId]);
+  const canCreate = useMemo(() => canQuery && (name || "").trim().length > 0, [canQuery, name]);
+
+  const refresh = useCallback(async () => {
+    setErr(null);
+    if (!canQuery) {
+      setItems([]);
+      setTotal(0);
+      setErr("project_id is required for listing (M02).");
+      return;
+    }
+    setLoading(true);
+    try {
+      const r = await listSeries({
+        project_id: projectId.trim(),
+        q: (q || "").trim() || undefined,
+        limit: 50,
+        offset: 0,
+      });
+      setItems(r.items || []);
+      setTotal(r.total ?? (r.items?.length || 0));
+    } catch (e: any) {
+      setErr(e?.message || "failed to list series");
+    } finally {
+      setLoading(false);
+    }
+  }, [canQuery, projectId, q]);
+
+  // auto-refresh when coming back if projectId exists
+  useEffect(() => {
+    if ((projectId || "").trim()) {
+      refresh();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const clearQOnly = useCallback(() => {
+    setQ("");
+    // keep projectId, and refresh with empty q
+    setTimeout(() => refresh(), 0);
+  }, [refresh]);
+
+  const doCreate = useCallback(async () => {
+    setErr(null);
+    if (!canCreate) return;
+    setLoading(true);
+    try {
+      await createSeries({
+        project_id: projectId.trim(),
+        name: name.trim(),
+        style_text: styleText.trim() ? styleText : null,
+        continuity_text: continuityText.trim() ? continuityText : null,
+      });
+      setName("");
+      setStyleText("");
+      setContinuityText("");
+      await refresh();
+    } catch (e: any) {
+      setErr(e?.message || "create failed");
+    } finally {
+      setLoading(false);
+    }
+  }, [canCreate, projectId, name, styleText, continuityText, refresh]);
+
+  const doDelete = useCallback(async (id: string, displayName: string) => {
+    setErr(null);
+    const ok = confirm(`Delete series "${displayName}"?\nIf backend does not support DELETE, it will be archived (archived_at=now).`);
+    if (!ok) return;
+    setLoading(true);
+    try {
+      await deleteSeries(id);
+      await refresh();
+    } catch (e: any) {
+      setErr(e?.message || "delete/archive failed");
+    } finally {
+      setLoading(false);
+    }
+  }, [refresh]);
+
+  return (
+    <div style={{ padding: 24 }}>
+      <h1 style={{ fontSize: 32, fontWeight: 800, marginBottom: 6 }}>Series</h1>
+      <div style={{ color: "#555", marginBottom: 16 }}>
+        Series list requires <code>project_id</code> filter (M02).
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "420px 1fr", gap: 16, alignItems: "start" }}>
+        <Card title="Create">
+          <FieldRow label="project_id (required)">
+            <input value={projectId} onChange={(e) => setProjectId(e.target.value)} style={{ width: "100%", padding: 8 }} placeholder="project_id" />
+          </FieldRow>
+
+          <FieldRow label="name (required)">
+            <input value={name} onChange={(e) => setName(e.target.value)} style={{ width: "100%", padding: 8 }} placeholder="Series name" />
+          </FieldRow>
+
+          <FieldRow label="style_text">
+            <textarea value={styleText} onChange={(e) => setStyleText(e.target.value)} style={{ width: "100%", padding: 8, height: 90 }} />
+          </FieldRow>
+
+          <FieldRow label="continuity_text">
+            <textarea value={continuityText} onChange={(e) => setContinuityText(e.target.value)} style={{ width: "100%", padding: 8, height: 90 }} />
+          </FieldRow>
+
+          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+            <button disabled={!canCreate || loading} onClick={doCreate} style={{ padding: "8px 14px", borderRadius: 10, border: "1px solid #ddd" }}>
+              Create
+            </button>
+            <button disabled={loading} onClick={refresh} style={{ padding: "8px 14px", borderRadius: 10, border: "1px solid #ddd" }}>
+              Refresh
+            </button>
+          </div>
+
+          {err ? <div style={{ marginTop: 10, color: "#b00020", whiteSpace: "pre-wrap" }}>{err}</div> : null}
+        </Card>
+
+        <Card
+          title="Series"
+          right={<div style={{ fontSize: 12, color: "#666" }}>total: {total}</div>}
+        >
+          {/* Query controls ABOVE the list (per your request) */}
+          <div style={{ border: "1px solid #f0f0f0", borderRadius: 10, padding: 12, marginBottom: 12, background: "#fafafa" }}>
+            <div style={{ fontWeight: 700, marginBottom: 10 }}>Query</div>
+            <FieldRow label="project_id (required)">
+              <input value={projectId} onChange={(e) => setProjectId(e.target.value)} style={{ width: "100%", padding: 8 }} placeholder="project_id" />
+            </FieldRow>
+            <FieldRow label="q (optional)">
+              <input value={q} onChange={(e) => setQ(e.target.value)} style={{ width: "100%", padding: 8 }} placeholder="name contains..." />
+            </FieldRow>
+            <div style={{ display: "flex", gap: 10 }}>
+              <button disabled={loading} onClick={refresh} style={{ padding: "8px 14px", borderRadius: 10, border: "1px solid #ddd" }}>
+                Refresh
+              </button>
+              <button disabled={loading} onClick={clearQOnly} style={{ padding: "8px 14px", borderRadius: 10, border: "1px solid #ddd" }}>
+                Clear
+              </button>
+            </div>
+          </div>
+
+          {loading ? <div style={{ color: "#666" }}>Loading...</div> : null}
+          {items.length === 0 && !loading ? <div style={{ color: "#666" }}>No items.</div> : null}
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {items.map((it) => (
+              <div key={it.id} style={{ border: "1px solid #eee", borderRadius: 12, padding: 12, display: "flex", justifyContent: "space-between", gap: 12 }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontWeight: 800, fontSize: 16, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {it.name}
+                  </div>
+                  <div style={{ fontSize: 12, color: "#666" }}>project_id: {it.project_id}</div>
+                  <div style={{ fontSize: 12, color: "#666" }}>archived_at: {String(it.archived_at ?? "null")}</div>
+                </div>
+
+                <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                  <Link href={`/series/${it.id}`} style={{ padding: "8px 12px", borderRadius: 10, border: "1px solid #ddd", textDecoration: "none" }}>
+                    Open
+                  </Link>
+                  <button
+                    disabled={loading}
+                    onClick={() => doDelete(it.id, it.name)}
+                    style={{ padding: "8px 12px", borderRadius: 10, border: "1px solid #ddd" }}
+                  >
+                    Delete
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {err ? <div style={{ marginTop: 10, color: "#b00020", whiteSpace: "pre-wrap" }}>{err}</div> : null}
+        </Card>
+      </div>
+    </div>
+  );
+}

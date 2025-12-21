@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$repo_root"
+
+ts="$(date +%Y%m%d_%H%M%S)"
+dto="apps/api/src/app/modules/series/dto.py"
+store="apps/api/src/app/modules/series/store_sqlite.py"
+
+test -f "$dto" || { echo "[fatal] missing: $dto"; exit 2; }
+test -f "$store" || { echo "[fatal] missing: $store"; exit 2; }
+
+cp -a "$dto"   "$dto.bak.$ts"
+cp -a "$store" "$store.bak.$ts"
+echo "[ok] backup: $dto.bak.$ts"
+echo "[ok] backup: $store.bak.$ts"
+
+python - <<'PY'
+from pathlib import Path
+import re
+
+dto = Path("apps/api/src/app/modules/series/dto.py")
+s = dto.read_text(encoding="utf-8")
+
+lines = s.splitlines(True)
+out = []
+in_create = False
+seen_style = False
+seen_cont = False
+inserted = False
+
+# 简单行级解析：只在 SeriesCreate 类块内修 style/continuity 默认值
+for i, line in enumerate(lines):
+    if re.match(r"^class\s+SeriesCreate\b", line):
+        in_create = True
+        seen_style = False
+        seen_cont = False
+        inserted = False
+        out.append(line)
+        continue
+
+    if in_create and re.match(r"^class\s+", line):  # 下一个 class，结束 SeriesCreate
+        # 如果 SeriesCreate 内没找到字段，补插（放在 class 末尾前）
+        if not inserted and (not seen_style or not seen_cont):
+            if not seen_style:
+                out.append("    style_text: str = \"\"\n")
+            if not seen_cont:
+                out.append("    continuity_text: str = \"\"\n")
+        in_create = False
+        out.append(line)
+        continue
+
+    if in_create:
+        m1 = re.match(r"^\s*style_text\s*:", line)
+        m2 = re.match(r"^\s*continuity_text\s*:", line)
+        if m1:
+            out.append("    style_text: str = \"\"\n")
+            seen_style = True
+            continue
+        if m2:
+            out.append("    continuity_text: str = \"\"\n")
+            seen_cont = True
+            continue
+
+        # 如果遇到 name 字段，且尚未插入默认字段，提前插入更稳定
+        if (not inserted) and re.match(r"^\s*name\s*:", line):
+            out.append(line)
+            if not seen_style:
+                out.append("    style_text: str = \"\"\n")
+                seen_style = True
+            if not seen_cont:
+                out.append("    continuity_text: str = \"\"\n")
+                seen_cont = True
+            inserted = True
+            continue
+
+        out.append(line)
+        continue
+
+    out.append(line)
+
+dto.write_text("".join(out), encoding="utf-8")
+
+store = Path("apps/api/src/app/modules/series/store_sqlite.py")
+t = store.read_text(encoding="utf-8")
+
+# 兜底：把 payload["style_text"]/["continuity_text"] 改为 get + 默认空串
+t2 = t
+t2 = re.sub(r'\[\s*[\'"]style_text[\'"]\s*\]', r'.get("style_text") or ""', t2)
+t2 = re.sub(r'\[\s*[\'"]continuity_text[\'"]\s*\]', r'.get("continuity_text") or ""', t2)
+
+store.write_text(t2, encoding="utf-8")
+print("[ok] patched dto.py + store_sqlite.py for SeriesCreate defaults")
+PY
+
+echo "[info] run failing test only..."
+cd apps/api
+PYTHONPATH=./src pytest -q tests/test_series_crud.py::test_series_archived_at_restore_null
+echo "[ok] single test passed"
+
+echo "[info] run full backend tests..."
+PYTHONPATH=./src pytest -q
+echo "[ok] all backend tests passed"

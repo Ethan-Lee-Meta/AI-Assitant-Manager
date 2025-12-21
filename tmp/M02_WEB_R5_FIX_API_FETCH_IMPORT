@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$repo_root"
+echo "[info] repo_root=$repo_root"
+
+series_file="apps/web/src/lib/api/series.ts"
+if [ ! -f "$series_file" ]; then
+  echo "[fatal] missing: $series_file"
+  exit 2
+fi
+
+# Extract apiFetch import spec from an existing wrapper (no guessing)
+spec="$(python - <<'PY'
+from pathlib import Path
+import re
+
+candidates = [
+  Path("apps/web/src/lib/api/prompts.ts"),
+  Path("apps/web/src/lib/api/prompt_versions.ts"),
+  Path("apps/web/src/lib/api/providers.ts"),
+  Path("apps/web/src/lib/api/workflows.ts"),
+  Path("apps/web/src/lib/api/tools.ts"),
+]
+
+pat = re.compile(r'import\s+\{\s*apiFetch[^}]*\}\s+from\s+[\'"]([^\'"]+)[\'"]\s*;')
+
+for p in candidates:
+  if not p.exists():
+    continue
+  s = p.read_text(encoding="utf-8", errors="ignore")
+  m = pat.search(s)
+  if m:
+    print(m.group(1))
+    raise SystemExit(0)
+
+print("")
+PY
+)"
+
+if [ -z "$spec" ]; then
+  echo "[fatal] cannot resolve apiFetch import spec from existing api wrappers"
+  echo "       checked: prompts/prompt_versions/providers/workflows/tools"
+  exit 3
+fi
+
+echo "[info] resolved apiFetch import spec = $spec"
+
+bak="$series_file.bak.$(date +%Y%m%d_%H%M%S)"
+cp -a "$series_file" "$bak"
+echo "[ok] backup: $bak"
+
+SPEC="$spec" python - <<'PY'
+from __future__ import annotations
+from pathlib import Path
+import os, re
+
+spec = os.environ["SPEC"]
+p = Path("apps/web/src/lib/api/series.ts")
+lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+
+out = []
+replaced = False
+for line in lines:
+  if re.match(r'^\s*import\s+\{\s*apiFetch\b', line) and not replaced:
+    out.append(f'import {{ apiFetch }} from "{spec}";')
+    replaced = True
+  else:
+    out.append(line)
+
+if not replaced:
+  out.insert(0, f'import {{ apiFetch }} from "{spec}";')
+
+p.write_text("\n".join(out) + "\n", encoding="utf-8")
+print("[ok] patched series.ts apiFetch import")
+PY
+
+echo "[info] run next build (apps/web)..."
+cd apps/web
+npm run build
+echo "[ok] next build passed"
