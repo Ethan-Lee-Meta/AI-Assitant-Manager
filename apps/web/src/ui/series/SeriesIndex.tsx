@@ -24,19 +24,23 @@ export function SeriesIndex() {
   }, []);
 
   useEffect(() => {
-    if (queryProjectId) localStorage.setItem(LS_KEY, queryProjectId);
+    if (queryProjectId) {
+      localStorage.setItem(LS_KEY, queryProjectId);
+    } else {
+      localStorage.removeItem(LS_KEY);
+    }
   }, [queryProjectId]);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (overrideProjectId?: string) => {
     setErr("");
-    if (!queryProjectId.trim()) {
-      setItems([]);
-      setTotal(0);
-      setErr("project_id is required for listing (M02).");
-      return;
-    }
     try {
-      const res = await listSeries({ project_id: queryProjectId.trim(), q: q.trim() || undefined, limit: 50, offset: 0 });
+      const effectiveProjectId = (overrideProjectId ?? queryProjectId).trim() || undefined;
+      const res = await listSeries({
+        project_id: effectiveProjectId,
+        q: q.trim() || undefined,
+        limit: 50,
+        offset: 0,
+      });
       setItems(res.items || []);
       setTotal(res.total || 0);
     } catch (e: any) {
@@ -71,7 +75,7 @@ export function SeriesIndex() {
       });
       // after create, switch listing to that project_id (helps avoid “created but not visible” confusion)
       setQueryProjectId(pid);
-      await refresh();
+      await refresh(pid);
       setName("");
       setStyleText("");
       setContinuityText("");
@@ -87,7 +91,9 @@ export function SeriesIndex() {
   return (
     <div style={{ padding: 24 }}>
       <h1 style={{ fontSize: 36, fontWeight: 700 }}>Series</h1>
-      <p style={{ marginTop: 8, color: "#444" }}>Series list requires <code>project_id</code> filter (M02).</p>
+      <p style={{ marginTop: 8, color: "#444" }}>
+        Series list supports optional <code>project_id</code> filtering (M02).
+      </p>
 
       <div style={{ display: "grid", gridTemplateColumns: "420px 1fr", gap: 18, marginTop: 18 }}>
         {/* Create */}
@@ -126,8 +132,8 @@ export function SeriesIndex() {
           <div style={{ marginTop: 10, border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
             <div style={{ fontWeight: 700, marginBottom: 10 }}>Query</div>
             <div style={{ display: "grid", gridTemplateColumns: "180px 1fr", gap: 10, alignItems: "center" }}>
-              <div>project_id (required)</div>
-              <input value={queryProjectId} onChange={(e) => setQueryProjectId(e.target.value)} placeholder="project_id" />
+              <div>project_id (optional)</div>
+              <input value={queryProjectId} onChange={(e) => setQueryProjectId(e.target.value)} placeholder="project_id (blank = all)" />
 
               <div>q (optional)</div>
               <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="name contains..." />
@@ -144,8 +150,7 @@ export function SeriesIndex() {
             {items.length === 0 ? (
               <div style={{ color: "#666" }}>
                 No items.
-                {queryProjectId.trim() ? null : <div style={{ color: "crimson", marginTop: 6 }}>project_id is required for listing (M02).</div>}
-                {queryProjectId.trim() && err ? <div style={{ color: "crimson", marginTop: 6 }}>{err}</div> : null}
+                {err ? <div style={{ color: "crimson", marginTop: 6 }}>{err}</div> : null}
               </div>
             ) : (
               items.map((x) => (

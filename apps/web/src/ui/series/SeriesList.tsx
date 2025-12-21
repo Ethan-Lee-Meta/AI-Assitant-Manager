@@ -1,7 +1,7 @@
 'use client';
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Series, createSeries, listSeries } from "../../lib/api/series";
 
 const LS_PROJECT_ID = "m02.series.project_id";
@@ -50,18 +50,12 @@ export function SeriesList() {
     }
   }, [projectId, q]);
 
-  const canQuery = useMemo(() => projectId.trim().length > 0, [projectId]);
-
   const refresh = useCallback(async () => {
     setErr(null);
-    if (!canQuery) {
-      setItems([]); setTotal(0);
-      return;
-    }
     setLoading(true);
     try {
       const r = await listSeries({
-        project_id: projectId.trim(),
+        project_id: projectId.trim() || undefined,
         q: (q || "").trim() || undefined,
         limit: 50,
         offset: 0,
@@ -73,7 +67,7 @@ export function SeriesList() {
     } finally {
       setLoading(false);
     }
-  }, [canQuery, projectId, q]);
+  }, [projectId, q]);
 
   useEffect(() => { void refresh(); }, [refresh]);
 
@@ -105,14 +99,14 @@ export function SeriesList() {
     <div style={{ display: "grid", gridTemplateColumns: "420px 1fr", gap: 18 }}>
       <div style={{ border: "1px solid #eee", borderRadius: 14, padding: 16, background: "#fff" }}>
         <div style={{ fontWeight: 700, fontSize: 18, marginBottom: 12 }}>Query</div>
-        <Field label="project_id (required)" value={projectId} onChange={setProjectId} placeholder="e.g. p_demo" />
+        <Field label="project_id (optional)" value={projectId} onChange={setProjectId} placeholder="e.g. p_demo (blank = all)" />
         <Field label="q (optional)" value={q} onChange={setQ} placeholder="name contains..." />
 
         <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
-          <button onClick={() => void refresh()} disabled={!canQuery || loading} style={{ padding: "8px 12px", borderRadius: 10, border: "1px solid #ddd" }}>
+          <button onClick={() => void refresh()} disabled={loading} style={{ padding: "8px 12px", borderRadius: 10, border: "1px solid #ddd" }}>
             Refresh
           </button>
-          <button onClick={() => { setProjectId(""); setQ(""); }} disabled={loading} style={{ padding: "8px 12px", borderRadius: 10, border: "1px solid #ddd" }}>
+          <button onClick={() => { setQ(""); }} disabled={loading} style={{ padding: "8px 12px", borderRadius: 10, border: "1px solid #ddd" }}>
             Clear
           </button>
         </div>
@@ -149,13 +143,7 @@ export function SeriesList() {
           <div style={{ color: "#666", fontSize: 13 }}>total: {total}</div>
         </div>
 
-        {!canQuery && (
-          <div style={{ color: "#666" }}>
-            Enter <code>project_id</code> to list series. (This field is persisted, so returning to this page will restore it.)
-          </div>
-        )}
-
-        {canQuery && items.length === 0 && !loading && (
+        {items.length === 0 && !loading && (
           <div style={{ color: "#666" }}>No series found.</div>
         )}
 
