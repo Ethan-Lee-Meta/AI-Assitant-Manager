@@ -34,4 +34,9 @@ def get_module_routers() -> List[APIRouter]:
 
 
 
+        # --- M02 Series begin ---
+    from .series.router import router as series_router
+    routers.append(series_router)
+    # --- M02 Series end ---
+
     return routers

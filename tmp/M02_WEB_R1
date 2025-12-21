@@ -1,0 +1,441 @@
+
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$repo_root"
+echo "[info] M02_WEB_R1 starting..."
+echo "[info] repo_root=$repo_root"
+
+# ----------------------------
+# A) Web: files
+# ----------------------------
+mkdir -p "apps/web/src/lib/api"
+mkdir -p "apps/web/src/ui/series"
+mkdir -p "apps/web/app/(app)/series"
+mkdir -p "apps/web/app/(app)/series/[series_id]"
+
+cat > "apps/web/src/lib/api/series.ts" <<'TS'
+export type Series = {
+  id: string;
+  project_id: string;
+  name: string;
+  style_text?: string | null;
+  continuity_text?: string | null;
+  archived_at?: string | null;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type SeriesCreate = {
+  project_id: string;
+  name: string;
+  style_text?: string | null;
+  continuity_text?: string | null;
+};
+
+export type SeriesPatch = {
+  name?: string;
+  style_text?: string | null;
+  continuity_text?: string | null;
+  archived_at?: string | null;
+};
+
+export type ListResp<T> = {
+  items: T[];
+  total: number;
+  limit?: number;
+  offset?: number;
+};
+
+async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  const r = await fetch(path, {
+    ...init,
+    headers: { ...(init?.headers || {}), "Accept": "application/json" },
+  });
+
+  if (r.ok) {
+    return (await r.json()) as T;
+  }
+
+  const text = await r.text();
+  try {
+    const js = JSON.parse(text);
+    const msg =
+      js?.error?.message ||
+      js?.detail ||
+      `HTTP ${r.status}`;
+    throw new Error(msg);
+  } catch {
+    throw new Error(text || `HTTP ${r.status}`);
+  }
+}
+
+export async function listSeries(params: {
+  project_id: string;
+  q?: string;
+  archived?: boolean;
+  limit?: number;
+  offset?: number;
+  sort?: string;
+}): Promise<ListResp<Series>> {
+  const usp = new URLSearchParams();
+  usp.set("project_id", params.project_id);
+  if (params.q) usp.set("q", params.q);
+  if (typeof params.archived === "boolean") usp.set("archived", String(params.archived));
+  if (typeof params.limit === "number") usp.set("limit", String(params.limit));
+  if (typeof params.offset === "number") usp.set("offset", String(params.offset));
+  if (params.sort) usp.set("sort", params.sort);
+  return apiFetch<ListResp<Series>>(`/api/series?${usp.toString()}`, { method: "GET" });
+}
+
+export async function createSeries(payload: SeriesCreate): Promise<Series> {
+  return apiFetch<Series>(`/api/series`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getSeries(series_id: string): Promise<Series> {
+  return apiFetch<Series>(`/api/series/${series_id}`, { method: "GET" });
+}
+
+export async function patchSeries(series_id: string, patch: SeriesPatch): Promise<Series> {
+  return apiFetch<Series>(`/api/series/${series_id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch ?? {}),
+  });
+}
+TS
+
+cat > "apps/web/src/ui/series/SeriesList.tsx" <<'TSX'
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import { Series, createSeries, listSeries } from "../../lib/api/series";
+
+export function SeriesList() {
+  const [projectId, setProjectId] = useState<string>("p_demo");
+  const [items, setItems] = useState<Series[]>([]);
+  const [total, setTotal] = useState<number>(0);
+  const [loading, setLoading] = useState<boolean>(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const [name, setName] = useState<string>("");
+  const [styleText, setStyleText] = useState<string>("");
+  const [continuityText, setContinuityText] = useState<string>("");
+
+  const canCreate = useMemo(() => {
+    return projectId.trim().length > 0 && name.trim().length > 0;
+  }, [projectId, name]);
+
+  async function refresh() {
+    setLoading(true);
+    setErr(null);
+    try {
+      const r = await listSeries({ project_id: projectId.trim(), limit: 50, offset: 0 });
+      setItems(r.items || []);
+      setTotal(r.total || 0);
+    } catch (e: any) {
+      setErr(e?.message || "failed to load series");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function onCreate() {
+    if (!canCreate) return;
+    setLoading(true);
+    setErr(null);
+    try {
+      await createSeries({
+        project_id: projectId.trim(),
+        name: name.trim(),
+        style_text: styleText.trim() || undefined,
+        continuity_text: continuityText.trim() || undefined,
+      });
+      setName("");
+      setStyleText("");
+      setContinuityText("");
+      await refresh();
+    } catch (e: any) {
+      setErr(e?.message || "create failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div style={{ display: "grid", gap: 16 }}>
+      <div style={{ display: "grid", gap: 8, padding: 12, border: "1px solid #ddd", borderRadius: 12 }}>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <label style={{ width: 120, color: "#555" }}>project_id *</label>
+          <input value={projectId} onChange={(e) => setProjectId(e.target.value)} style={{ flex: 1, padding: 8 }} />
+          <button onClick={refresh} disabled={loading || projectId.trim().length === 0} style={{ padding: "8px 12px" }}>
+            Refresh
+          </button>
+        </div>
+
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <label style={{ width: 120, color: "#555" }}>name *</label>
+          <input value={name} onChange={(e) => setName(e.target.value)} style={{ flex: 1, padding: 8 }} />
+          <button onClick={onCreate} disabled={loading || !canCreate} style={{ padding: "8px 12px" }}>
+            Create
+          </button>
+        </div>
+
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <label style={{ width: 120, color: "#555" }}>style_text</label>
+          <input value={styleText} onChange={(e) => setStyleText(e.target.value)} style={{ flex: 1, padding: 8 }} />
+        </div>
+
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <label style={{ width: 120, color: "#555" }}>continuity_text</label>
+          <input value={continuityText} onChange={(e) => setContinuityText(e.target.value)} style={{ flex: 1, padding: 8 }} />
+        </div>
+
+        {err ? <div style={{ color: "crimson" }}>Error: {err}</div> : null}
+      </div>
+
+      <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 12 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+          <h2 style={{ margin: 0 }}>Series ({total})</h2>
+          {loading ? <span style={{ color: "#666" }}>Loading...</span> : null}
+        </div>
+
+        <div style={{ marginTop: 12, display: "grid", gap: 10 }}>
+          {items.map((s) => (
+            <a
+              key={s.id}
+              href={`/series/${s.id}`}
+              style={{
+                display: "block",
+                padding: 12,
+                border: "1px solid #eee",
+                borderRadius: 12,
+                textDecoration: "none",
+                color: "#111",
+              }}
+            >
+              <div style={{ fontWeight: 700 }}>{s.name}</div>
+              <div style={{ color: "#666", fontSize: 12 }}>
+                id={s.id} • project_id={s.project_id} • archived_at={s.archived_at ?? "null"}
+              </div>
+            </a>
+          ))}
+          {items.length === 0 ? <div style={{ color: "#666" }}>No series found. Create one above.</div> : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+TSX
+
+cat > "apps/web/src/ui/series/SeriesWorkspace.tsx" <<'TSX'
+"use client";
+
+import { useEffect, useState } from "react";
+import { Series, getSeries, patchSeries } from "../../lib/api/series";
+
+export function SeriesWorkspace(props: { seriesId: string }) {
+  const { seriesId } = props;
+
+  const [item, setItem] = useState<Series | null>(null);
+  const [loading, setLoading] = useState<boolean>(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const [styleText, setStyleText] = useState<string>("");
+  const [continuityText, setContinuityText] = useState<string>("");
+
+  async function refresh() {
+    setLoading(true);
+    setErr(null);
+    try {
+      const s = await getSeries(seriesId);
+      setItem(s);
+      setStyleText((s.style_text ?? "") as any);
+      setContinuityText((s.continuity_text ?? "") as any);
+    } catch (e: any) {
+      setErr(e?.message || "failed to load series");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seriesId]);
+
+  async function saveTexts() {
+    setLoading(true);
+    setErr(null);
+    try {
+      const s = await patchSeries(seriesId, {
+        style_text: styleText,
+        continuity_text: continuityText,
+      });
+      setItem(s);
+    } catch (e: any) {
+      setErr(e?.message || "save failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function archiveNow() {
+    setLoading(true);
+    setErr(null);
+    try {
+      const s = await patchSeries(seriesId, { archived_at: new Date().toISOString() });
+      setItem(s);
+    } catch (e: any) {
+      setErr(e?.message || "archive failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function restore() {
+    setLoading(true);
+    setErr(null);
+    try {
+      const s = await patchSeries(seriesId, { archived_at: null });
+      setItem(s);
+    } catch (e: any) {
+      setErr(e?.message || "restore failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div style={{ display: "grid", gap: 16 }}>
+      <div>
+        <a href="/series" style={{ color: "#555", textDecoration: "none" }}>← Back to Series</a>
+      </div>
+
+      <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 12 }}>
+        <h1 style={{ margin: "0 0 6px 0" }}>Series Workspace</h1>
+        <div style={{ color: "#666", fontSize: 12 }}>
+          series_id={seriesId} • {loading ? "Loading..." : "Ready"} • archived_at={item?.archived_at ?? "null"}
+        </div>
+
+        {err ? <div style={{ marginTop: 10, color: "crimson" }}>Error: {err}</div> : null}
+
+        <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+          <button onClick={refresh} disabled={loading} style={{ padding: "8px 12px" }}>Refresh</button>
+          <button onClick={saveTexts} disabled={loading} style={{ padding: "8px 12px" }}>Save style/continuity</button>
+          <button onClick={archiveNow} disabled={loading} style={{ padding: "8px 12px" }}>Archive</button>
+          <button onClick={restore} disabled={loading} style={{ padding: "8px 12px" }}>Restore</button>
+        </div>
+      </div>
+
+      <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 12, display: "grid", gap: 12 }}>
+        <div>
+          <div style={{ fontWeight: 700, marginBottom: 6 }}>style_text</div>
+          <textarea value={styleText} onChange={(e) => setStyleText(e.target.value)} rows={6} style={{ width: "100%", padding: 10 }} />
+        </div>
+        <div>
+          <div style={{ fontWeight: 700, marginBottom: 6 }}>continuity_text</div>
+          <textarea value={continuityText} onChange={(e) => setContinuityText(e.target.value)} rows={6} style={{ width: "100%", padding: 10 }} />
+        </div>
+      </div>
+
+      <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 12 }}>
+        <h2 style={{ margin: 0 }}>Associations (placeholder)</h2>
+        <div style={{ color: "#666", marginTop: 8 }}>
+          M02 scope: keep as placeholder. Future steps will link Prompts / Roles and create EpisodeOrVideo entry here.
+        </div>
+      </div>
+    </div>
+  );
+}
+TSX
+
+cat > "apps/web/app/(app)/series/page.tsx" <<'TSX'
+import { SeriesList } from "../../../src/ui/series/SeriesList";
+
+export default function SeriesPage() {
+  return (
+    <div style={{ padding: 24 }}>
+      <h1 style={{ fontSize: 32, fontWeight: 700, marginBottom: 8 }}>Series</h1>
+      <p style={{ marginBottom: 16, color: "#555" }}>
+        M02 — Series (style/continuity mainline). List requires project_id filter.
+      </p>
+      <SeriesList />
+    </div>
+  );
+}
+TSX
+
+cat > "apps/web/app/(app)/series/[series_id]/page.tsx" <<'TSX'
+import { SeriesWorkspace } from "../../../../src/ui/series/SeriesWorkspace";
+
+export default function SeriesWorkspacePage({ params }: { params: { series_id: string } }) {
+  return (
+    <div style={{ padding: 24 }}>
+      <SeriesWorkspace seriesId={params.series_id} />
+    </div>
+  );
+}
+TSX
+
+# ----------------------------
+# B) Optional: patch nav to include /series
+# ----------------------------
+nav_file="apps/web/src/ui/nav/nav_items.ts"
+if [ -f "$nav_file" ]; then
+  python - <<'PY'
+from pathlib import Path
+import re, sys
+
+p = Path("apps/web/src/ui/nav/nav_items.ts")
+s = p.read_text(encoding="utf-8")
+
+if "/series" in s:
+    print("[ok] nav already has /series; skip")
+    raise SystemExit(0)
+
+# heuristic insert after /projects
+m = re.search(r'(["\'])/projects\1', s)
+if not m:
+    print("[warn] cannot find /projects in nav_items.ts; skip")
+    raise SystemExit(0)
+
+insert = '"/series"'
+# try object style: href: "/projects"
+m2 = re.search(r'(href:\s*["\']/projects["\']\s*,?\s*)', s)
+if m2:
+    i = m2.end()
+    block = 'href: "/series", label: "Series",\n    '
+    # Insert a full item is too format-specific; keep minimal by inserting a new item near the list if it matches common pattern.
+    # Safer: do nothing rather than corrupt.
+    print("[warn] nav format looks object-based; skip auto insert to avoid corrupting file")
+    raise SystemExit(0)
+
+print("[warn] nav file present but format not safely patchable; skip")
+PY
+else
+  echo "[info] nav_items.ts not found; skip nav patch"
+fi
+
+# ----------------------------
+# C) Build web
+# ----------------------------
+echo "[info] running next build..."
+cd apps/web
+npm run build
+rc=$?
+cd "$repo_root"
+echo "[info] next build rc=$rc"
+[ $rc -eq 0 ] || exit $rc
+
+echo "[done] M02_WEB_R1 completed."
+BASH

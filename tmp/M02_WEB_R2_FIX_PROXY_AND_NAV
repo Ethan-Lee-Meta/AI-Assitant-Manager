@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" && pwd)"
+cd "$repo_root"
+ts="$(date +%Y%m%d_%H%M%S)"
+
+echo "[info] M02_WEB_R2_FIX_PROXY_AND_NAV starting..."
+echo "[info] repo_root=$repo_root"
+
+########################################
+# 1) Ensure Next.js rewrites /api/* -> backend
+########################################
+cfg=""
+for f in apps/web/next.config.js apps/web/next.config.mjs apps/web/next.config.cjs; do
+  if [ -f "$f" ]; then cfg="$f"; break; fi
+done
+
+if [ -z "$cfg" ]; then
+  cfg="apps/web/next.config.js"
+  cat <<'JS' > "$cfg"
+/** @type {import('next').NextConfig} */
+const API_BASE =
+  process.env.NEXT_PUBLIC_API_BASE_URL ||
+  process.env.API_BASE_URL ||
+  "http://127.0.0.1:7000";
+
+const nextConfig = {
+  async rewrites() {
+    return [
+      { source: "/api/:path*", destination: `${API_BASE}/api/:path*` },
+    ];
+  },
+};
+
+module.exports = nextConfig;
+JS
+  echo "[ok] wrote: $cfg (new)"
+else
+  cp -a "$cfg" "$cfg.bak.$ts"
+  echo "[ok] backup: $cfg.bak.$ts"
+
+  python - <<'PY'
+from pathlib import Path
+import re, sys
+
+p = Path(sys.argv[1])
+txt = p.read_text(encoding="utf-8")
+
+if "/api/:path*" in txt and "rewrites" in txt:
+    print(f"[ok] {p}: rewrites already contains /api/:path*; skip")
+    raise SystemExit(0)
+
+# Only patch simple JS/CJS/MJS configs safely.
+# If structure is unexpected, abort with instruction.
+if "module.exports" not in txt and "export default" not in txt:
+    print(f"[warn] {p}: unknown next config style; please patch rewrites manually")
+    raise SystemExit(0)
+
+# Try to inject rewrites into an existing nextConfig object
+m = re.search(r"(const\s+nextConfig\s*=\s*\{)", txt)
+if not m:
+    # Try export default { ... }
+    m2 = re.search(r"(export\s+default\s*\{)", txt)
+    if not m2:
+        print(f"[warn] {p}: cannot find nextConfig object; please patch rewrites manually")
+        raise SystemExit(0)
+    insert_pos = m2.end()
+    injected = """
+  async rewrites() {
+    const API_BASE =
+      process.env.NEXT_PUBLIC_API_BASE_URL ||
+      process.env.API_BASE_URL ||
+      "http://127.0.0.1:7000";
+    return [
+      { source: "/api/:path*", destination: `${API_BASE}/api/:path*` },
+    ];
+  },
+"""
+    txt = txt[:insert_pos] + injected + txt[insert_pos:]
+    p.write_text(txt, encoding="utf-8")
+    print(f"[ok] {p}: injected rewrites into export default object")
+    raise SystemExit(0)
+
+insert_pos = m.end()
+injected = """
+  async rewrites() {
+    const API_BASE =
+      process.env.NEXT_PUBLIC_API_BASE_URL ||
+      process.env.API_BASE_URL ||
+      "http://127.0.0.1:7000";
+    return [
+      { source: "/api/:path*", destination: `${API_BASE}/api/:path*` },
+    ];
+  },
+"""
+txt = txt[:insert_pos] + injected + txt[insert_pos:]
+p.write_text(txt, encoding="utf-8")
+print(f"[ok] {p}: injected rewrites into nextConfig")
+PY "$cfg"
+fi
+
+########################################
+# 2) Add "Series" entry to sidebar nav (best-effort, no guessing of file path)
+########################################
+echo "[info] locating sidebar/layout file for nav insertion..."
+
+layout_file="$(rg -l 'AI Assistant Manager' apps/web/app apps/web/src -S | head -n 1 || true)"
+if [ -z "${layout_file:-}" ]; then
+  # fallback: find file that contains the 4 existing hrefs
+  layout_file="$(rg -l 'href="/projects"' apps/web/app apps/web/src -S | head -n 1 || true)"
+fi
+
+if [ -z "${layout_file:-}" ]; then
+  echo "[warn] could not locate layout/sidebar file automatically. Please add /series link manually."
+else
+  cp -a "$layout_file" "$layout_file.bak.$ts"
+  echo "[ok] backup: $layout_file.bak.$ts"
+
+  python - <<'PY'
+from pathlib import Path
+import re, sys
+
+p = Path(sys.argv[1])
+txt = p.read_text(encoding="utf-8")
+
+if "/series" in txt:
+    print(f"[ok] {p}: /series already present; skip")
+    raise SystemExit(0)
+
+# Strategy: clone the first nav link line that contains href="/projects"
+# and replace /projects->/series and Projects->Series.
+lines = txt.splitlines(True)
+idx = None
+for i, line in enumerate(lines):
+    if 'href="/projects"' in line:
+        idx = i
+        break
+
+if idx is None:
+    print(f"[warn] {p}: cannot find href=\"/projects\" line; skip nav insertion")
+    raise SystemExit(0)
+
+orig = lines[idx]
+new = orig.replace('/projects', '/series').replace('Projects', 'Series')
+
+if new == orig:
+    # attempt children:"Projects" style
+    new = orig.replace('/projects', '/series').replace('children":"Projects"', 'children":"Series"')
+
+lines.insert(idx + 1, new)
+p.write_text("".join(lines), encoding="utf-8")
+print(f"[ok] {p}: inserted Series link after Projects")
+PY "$layout_file"
+fi
+
+########################################
+# 3) Build
+########################################
+echo "[info] running next build (won't exit terminal on failure)"
+set +e
+cd apps/web
+npm run build
+rc=$?
+cd "$repo_root"
+echo "[info] next build rc=$rc"
+if [ "$rc" -ne 0 ]; then
+  echo "[warn] build failed; fix build errors above."
+  exit 1
+fi
+
+echo "[done] M02_WEB_R2_FIX_PROXY_AND_NAV completed."

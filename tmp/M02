@@ -1,0 +1,778 @@
+#!/usr/bin/env bash
+set -u
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+echo "[info] M02 starting..."
+echo "[info] repo_root=$repo_root"
+cd "$repo_root" || exit 1
+
+# Activate venv if present (safe)
+source .venv/Scripts/activate 2>/dev/null || true
+
+# -----------------------------
+# Backend: modules/series
+# -----------------------------
+mkdir -p "apps/api/src/app/modules/series"
+mkdir -p "apps/api/tests"
+
+cat > "apps/api/src/app/modules/series/dto.py" <<'PY'
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Literal
+from pydantic import BaseModel, Field
+
+class SeriesCreate(BaseModel):
+    project_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    style_text: str = Field(default="")
+    continuity_text: str = Field(default="")
+
+class SeriesPatch(BaseModel):
+    # partial update; explicit null for archived_at is allowed (restore)
+    name: Optional[str] = Field(default=None, min_length=1)
+    style_text: Optional[str] = None
+    continuity_text: Optional[str] = None
+    archived_at: Optional[str] = None  # ISO string or null
+
+class SeriesOut(BaseModel):
+    id: str
+    project_id: str
+    name: str
+    style_text: str
+    continuity_text: str
+    created_at: str
+    updated_at: str
+    archived_at: Optional[str] = None
+
+class SeriesListResponse(BaseModel):
+    items: List[SeriesOut]
+    total: int
+    limit: int
+    offset: int
+PY
+
+cat > "apps/api/src/app/modules/series/store_sqlite.py" <<'PY'
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+import os
+import sqlite3
+from datetime import datetime, timezone
+import uuid
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def _default_db_path() -> str:
+    # keep consistent with existing modules (env override first)
+    return os.getenv("AAM_SQLITE_PATH") or os.getenv("SQLITE_PATH") or str(Path("apps/api/.data/app.sqlite").resolve())
+
+def _connect() -> sqlite3.Connection:
+    db_path = _default_db_path()
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+    return conn
+
+def _ensure(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS series (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            style_text TEXT NOT NULL DEFAULT '',
+            continuity_text TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            archived_at TEXT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_series_project_id ON series(project_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_series_created_at ON series(created_at)")
+
+def create_series(data: Dict[str, Any]) -> Dict[str, Any]:
+    conn = _connect()
+    try:
+        _ensure(conn)
+        sid = uuid.uuid4().hex
+        now = _now()
+        row = {
+            "id": sid,
+            "project_id": data["project_id"],
+            "name": data["name"],
+            "style_text": data.get("style_text") or "",
+            "continuity_text": data.get("continuity_text") or "",
+            "created_at": now,
+            "updated_at": now,
+            "archived_at": None,
+        }
+        conn.execute(
+            """
+            INSERT INTO series (id, project_id, name, style_text, continuity_text, created_at, updated_at, archived_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                row["id"], row["project_id"], row["name"], row["style_text"], row["continuity_text"],
+                row["created_at"], row["updated_at"], row["archived_at"],
+            ],
+        )
+        conn.commit()
+        return row
+    finally:
+        conn.close()
+
+def get_series(series_id: str) -> Optional[Dict[str, Any]]:
+    conn = _connect()
+    try:
+        _ensure(conn)
+        r = conn.execute("SELECT * FROM series WHERE id=?", [series_id]).fetchone()
+        return dict(r) if r else None
+    finally:
+        conn.close()
+
+def list_series(
+    *,
+    project_id: str,
+    q: Optional[str],
+    archived: Optional[bool],
+    limit: int,
+    offset: int,
+) -> Tuple[List[Dict[str, Any]], int]:
+    conn = _connect()
+    try:
+        _ensure(conn)
+        where = ["project_id=?"]
+        args: List[Any] = [project_id]
+
+        if q:
+            where.append("name LIKE ?")
+            args.append(f"%{q}%")
+
+        if archived is True:
+            where.append("archived_at IS NOT NULL")
+        elif archived is False:
+            where.append("archived_at IS NULL")
+
+        where_sql = " WHERE " + " AND ".join(where)
+        total = conn.execute(f"SELECT COUNT(1) AS c FROM series{where_sql}", args).fetchone()["c"]
+
+        rows = conn.execute(
+            f"SELECT * FROM series{where_sql} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            [*args, int(limit), int(offset)],
+        ).fetchall()
+        items = [dict(r) for r in rows]
+        return items, int(total)
+    finally:
+        conn.close()
+
+def update_series(series_id: str, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    conn = _connect()
+    try:
+        _ensure(conn)
+        current = conn.execute("SELECT * FROM series WHERE id=?", [series_id]).fetchone()
+        if not current:
+            return None
+
+        # apply patch (including explicit None)
+        allowed = {"name", "style_text", "continuity_text", "archived_at"}
+        sets = []
+        args: List[Any] = []
+        for k, v in patch.items():
+            if k not in allowed:
+                continue
+            sets.append(f"{k}=?")
+            args.append(v)
+
+        # always update updated_at if anything patched
+        if sets:
+            sets.append("updated_at=?")
+            args.append(_now())
+            args.append(series_id)
+            sql = f"UPDATE series SET {', '.join(sets)} WHERE id=?"
+            conn.execute(sql, args)
+            conn.commit()
+
+        r = conn.execute("SELECT * FROM series WHERE id=?", [series_id]).fetchone()
+        return dict(r) if r else None
+    finally:
+        conn.close()
+PY
+
+cat > "apps/api/src/app/modules/series/service.py" <<'PY'
+from __future__ import annotations
+
+from typing import Any, Dict, Optional, Tuple, List
+from .store_sqlite import create_series, get_series, list_series, update_series
+
+def create(data: Dict[str, Any]) -> Dict[str, Any]:
+    return create_series(data)
+
+def get(series_id: str) -> Optional[Dict[str, Any]]:
+    return get_series(series_id)
+
+def list_(
+    *,
+    project_id: str,
+    q: Optional[str],
+    archived: Optional[bool],
+    limit: int,
+    offset: int,
+) -> Tuple[List[Dict[str, Any]], int]:
+    return list_series(project_id=project_id, q=q, archived=archived, limit=limit, offset=offset)
+
+def patch(series_id: str, patch_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    return update_series(series_id, patch_data)
+PY
+
+cat > "apps/api/src/app/modules/series/router.py" <<'PY'
+from __future__ import annotations
+
+from typing import Optional
+from fastapi import APIRouter, HTTPException, Query
+from .dto import SeriesCreate, SeriesPatch, SeriesOut, SeriesListResponse
+from . import service
+
+router = APIRouter(prefix="/api/series", tags=["series"])
+
+@router.post("", response_model=SeriesOut)
+def create_series(body: SeriesCreate):
+    row = service.create(body.model_dump())
+    return row
+
+@router.get("/{series_id}", response_model=SeriesOut)
+def get_series(series_id: str):
+    row = service.get(series_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="series not found")
+    return row
+
+@router.get("", response_model=SeriesListResponse)
+def list_series(
+    project_id: str = Query(..., min_length=1),
+    q: Optional[str] = Query(default=None),
+    archived: Optional[bool] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    items, total = service.list_(project_id=project_id, q=q, archived=archived, limit=limit, offset=offset)
+    return {"items": items, "total": total, "limit": int(limit), "offset": int(offset)}
+
+@router.patch("/{series_id}", response_model=SeriesOut)
+def patch_series(series_id: str, body: SeriesPatch):
+    # keep explicit null (restore) if user explicitly set archived_at=null
+    patch_data = body.model_dump(exclude_unset=True)
+    if "archived_at" in getattr(body, "model_fields_set", set()):
+        patch_data["archived_at"] = body.archived_at
+
+    row = service.patch(series_id, patch_data)
+    if not row:
+        raise HTTPException(status_code=404, detail="series not found")
+    return row
+PY
+
+# -----------------------------
+# Patch registry: add series router before "return routers"
+# -----------------------------
+python - <<'PY'
+from __future__ import annotations
+from pathlib import Path
+
+p = Path("apps/api/src/app/modules/_registry.py")
+if not p.exists():
+    raise SystemExit("[fatal] missing: apps/api/src/app/modules/_registry.py")
+
+s = p.read_text(encoding="utf-8")
+marker_begin = "# --- M02 Series begin ---"
+marker_end = "# --- M02 Series end ---"
+
+if marker_begin in s and marker_end in s:
+    print("[ok] registry already has M02 Series block; skip")
+else:
+    needle = "return routers"
+    idx = s.find(needle)
+    if idx < 0:
+        raise SystemExit("[fatal] cannot find 'return routers' in _registry.py; abort")
+
+    insert = (
+        "    # --- M02 Series begin ---\n"
+        "    from .series.router import router as series_router\n"
+        "    routers.append(series_router)\n"
+        "    # --- M02 Series end ---\n\n"
+    )
+    # Insert immediately before return routers, preserving indentation style (4 spaces assumed per existing blocks)
+    s2 = s[:idx] + insert + s[idx:]
+    p.write_text(s2, encoding="utf-8")
+    print("[ok] registry patched: inserted M02 Series block before return")
+PY
+
+# -----------------------------
+# Tests: enforce project_id filter
+# -----------------------------
+cat > "apps/api/tests/test_series_crud.py" <<'PY'
+from fastapi.testclient import TestClient
+from app.main import app
+
+def test_series_list_requires_project_id():
+    c = TestClient(app)
+    r = c.get("/api/series")
+    assert r.status_code == 422
+
+def test_series_crud_and_project_filtering():
+    c = TestClient(app)
+
+    r = c.post("/api/series", json={
+        "project_id": "p_a",
+        "name": "SeriesA",
+        "style_text": "style a",
+        "continuity_text": "cont a"
+    })
+    assert r.status_code == 200, r.text
+    sid_a = r.json()["id"]
+
+    r = c.post("/api/series", json={
+        "project_id": "p_b",
+        "name": "SeriesB",
+        "style_text": "style b",
+        "continuity_text": "cont b"
+    })
+    assert r.status_code == 200, r.text
+
+    r = c.get("/api/series", params={"project_id": "p_a"})
+    assert r.status_code == 200
+    js = r.json()
+    assert js["total"] >= 1
+    assert all(x["project_id"] == "p_a" for x in js["items"])
+
+    # patch style_text
+    r = c.patch(f"/api/series/{sid_a}", json={"style_text": "style a2"})
+    assert r.status_code == 200, r.text
+    assert r.json()["style_text"] == "style a2"
+
+def test_series_archived_at_restore_null():
+    c = TestClient(app)
+
+    r = c.post("/api/series", json={"project_id": "p_demo", "name": "S1"})
+    assert r.status_code == 200
+    sid = r.json()["id"]
+
+    r = c.patch(f"/api/series/{sid}", json={"archived_at": "2025-01-01T00:00:00Z"})
+    assert r.status_code == 200
+    assert r.json().get("archived_at") is not None
+
+    r = c.patch(f"/api/series/{sid}", json={"archived_at": None})
+    assert r.status_code == 200, r.text
+
+    r = c.get(f"/api/series/{sid}")
+    assert r.status_code == 200
+    assert r.json().get("archived_at") is None
+PY
+
+echo "[info] running backend tests..."
+(
+  cd "apps/api" || exit 1
+  PYTHONPATH=./src pytest -q
+)
+rc=$?
+echo "[info] pytest rc=$rc"
+if [ "$rc" -ne 0 ]; then
+  echo "[fail] backend tests failed"
+  exit 1
+fi
+
+# -----------------------------
+# Contract export + verify (requires api :7000)
+# -----------------------------
+echo "[info] starting api server (7000) in background for contract export..."
+(
+  cd "apps/api" || exit 1
+  PYTHONPATH=./src uvicorn app.main:app --host 0.0.0.0 --port 7000 > /tmp/api_7000.log 2>&1 &
+  echo $! > /tmp/api_7000.pid
+  echo "[ok] api started pid=$(cat /tmp/api_7000.pid)"
+)
+
+# health smoke
+curl -sS http://localhost:7000/health -o /tmp/h.json
+echo "[info] api /health: $(cat /tmp/h.json)"
+
+echo "[info] bump contract version (YYYYMMDD-NN)"
+python - <<'PY'
+from __future__ import annotations
+from pathlib import Path
+import re
+from datetime import datetime
+
+p = Path("packages/contracts/contract_version.txt")
+old = p.read_text(encoding="utf-8").strip() if p.exists() else ""
+today = datetime.now().strftime("%Y%m%d")
+
+m = re.fullmatch(r"(\d{8})-(\d{2})", old)
+if m and m.group(1) == today:
+    nn = int(m.group(2)) + 1
+    new = f"{today}-{nn:02d}"
+else:
+    new = f"{today}-01"
+
+p.parent.mkdir(parents=True, exist_ok=True)
+p.write_text(new + "\n", encoding="utf-8")
+print(f"[ok] contract_version: {old!r} -> {new!r}")
+PY
+
+./scripts/export_openapi.sh
+rc=$?
+echo "[info] export_openapi rc=$rc"
+if [ "$rc" -ne 0 ]; then
+  echo "[fail] export_openapi failed"
+  kill "$(cat /tmp/api_7000.pid)" 2>/dev/null || true
+  exit 1
+fi
+
+./scripts/verify_contracts.sh
+rc=$?
+echo "[info] verify_contracts rc=$rc"
+if [ "$rc" -ne 0 ]; then
+  echo "[fail] verify_contracts failed"
+  kill "$(cat /tmp/api_7000.pid)" 2>/dev/null || true
+  exit 1
+fi
+
+echo "[info] stopping api server..."
+kill "$(cat /tmp/api_7000.pid)" 2>/dev/null || true
+echo "[ok] killed pid=$(cat /tmp/api_7000.pid)"
+
+# -----------------------------
+# Frontend: Series Workspace (/series + /series/[series_id])
+# -----------------------------
+mkdir -p "apps/web/src/lib/api"
+mkdir -p "apps/web/src/ui/series"
+mkdir -p "apps/web/app/(app)/series"
+mkdir -p "apps/web/app/(app)/series/[series_id]"
+
+cat > "apps/web/src/lib/api/series.ts" <<'TS'
+import { apiFetch } from "./client";
+
+export type Series = {
+  id: string;
+  project_id: string;
+  name: string;
+  style_text: string;
+  continuity_text: string;
+  created_at: string;
+  updated_at: string;
+  archived_at?: string | null;
+};
+
+export type SeriesListResponse = {
+  items: Series[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
+export async function listSeries(params: {
+  project_id: string;
+  q?: string;
+  archived?: boolean;
+  limit?: number;
+  offset?: number;
+}): Promise<SeriesListResponse> {
+  const qs = new URLSearchParams();
+  qs.set("project_id", params.project_id);
+  if (params.q) qs.set("q", params.q);
+  if (typeof params.archived === "boolean") qs.set("archived", String(params.archived));
+  if (typeof params.limit === "number") qs.set("limit", String(params.limit));
+  if (typeof params.offset === "number") qs.set("offset", String(params.offset));
+
+  return apiFetch<SeriesListResponse>(`/api/series?${qs.toString()}`, { method: "GET" });
+}
+
+export async function createSeries(body: {
+  project_id: string;
+  name: string;
+  style_text?: string;
+  continuity_text?: string;
+}): Promise<Series> {
+  return apiFetch<Series>(`/api/series`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function getSeries(series_id: string): Promise<Series> {
+  return apiFetch<Series>(`/api/series/${series_id}`, { method: "GET" });
+}
+
+export async function patchSeries(series_id: string, patch: Partial<Pick<Series, "name" | "style_text" | "continuity_text" | "archived_at">>): Promise<Series> {
+  return apiFetch<Series>(`/api/series/${series_id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch ?? {}),
+  });
+}
+TS
+
+cat > "apps/web/src/ui/series/SeriesWorkspace.tsx" <<'TSX'
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import { Series, getSeries, patchSeries } from "../../lib/api/series";
+
+export function SeriesWorkspace(props: { seriesId: string }) {
+  const seriesId = props.seriesId;
+
+  const [item, setItem] = useState<Series | null>(null);
+  const [loading, setLoading] = useState<boolean>(true);
+  const [err, setErr] = useState<string | null>(null);
+
+  const [name, setName] = useState<string>("");
+  const [styleText, setStyleText] = useState<string>("");
+  const [contText, setContText] = useState<string>("");
+
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      setLoading(true); setErr(null);
+      try {
+        const s = await getSeries(seriesId);
+        if (!mounted) return;
+        setItem(s);
+        setName(s.name || "");
+        setStyleText(s.style_text || "");
+        setContText(s.continuity_text || "");
+      } catch (e: any) {
+        if (!mounted) return;
+        setErr(e?.message || "failed to load series");
+      } finally {
+        if (mounted) setLoading(false);
+      }
+    })();
+    return () => { mounted = false; };
+  }, [seriesId]);
+
+  async function onSave() {
+    if (!item) return;
+    setErr(null);
+    try {
+      const s = await patchSeries(seriesId, {
+        name: name.trim() || item.name,
+        style_text: styleText ?? "",
+        continuity_text: contText ?? "",
+      });
+      setItem(s);
+    } catch (e: any) {
+      setErr(e?.message || "save failed");
+    }
+  }
+
+  if (loading) return <div>Loading...</div>;
+  if (err) return <div style={{ color: "crimson" }}>{err}</div>;
+  if (!item) return <div>Not found</div>;
+
+  return (
+    <div style={{ display: "grid", gap: 14 }}>
+      <div style={{ display: "grid", gap: 6 }}>
+        <div style={{ fontSize: 14, color: "#666" }}>Series ID: {item.id}</div>
+        <label style={{ fontWeight: 600 }}>Name</label>
+        <input value={name} onChange={(e) => setName(e.target.value)} style={{ padding: 8, width: "100%" }} />
+      </div>
+
+      <div style={{ display: "grid", gap: 6 }}>
+        <label style={{ fontWeight: 600 }}>Style / Visual Continuity (text)</label>
+        <textarea value={styleText} onChange={(e) => setStyleText(e.target.value)} style={{ padding: 8, width: "100%", minHeight: 120 }} />
+      </div>
+
+      <div style={{ display: "grid", gap: 6 }}>
+        <label style={{ fontWeight: 600 }}>Plot Mainline / Continuity Notes (text)</label>
+        <textarea value={contText} onChange={(e) => setContText(e.target.value)} style={{ padding: 8, width: "100%", minHeight: 140 }} />
+      </div>
+
+      <div style={{ display: "grid", gap: 8, borderTop: "1px solid #eee", paddingTop: 12 }}>
+        <div style={{ fontWeight: 700 }}>Associations (Prompts / Roles)</div>
+        <div style={{ color: "#666" }}>
+          Placeholder: link Prompts / Roles in later modules. This workspace only stores series texts now.
+        </div>
+
+        <div style={{ display: "flex", gap: 10 }}>
+          <button onClick={onSave} style={{ padding: "8px 12px" }}>Save</button>
+          <button onClick={() => alert("Episode/Video creation entry is a stub (future module).")} style={{ padding: "8px 12px" }}>
+            Create Episode/Video (stub)
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+TSX
+
+cat > "apps/web/src/ui/series/SeriesHome.tsx" <<'TSX'
+"use client";
+
+import { useEffect, useState } from "react";
+import { Series, createSeries, listSeries } from "../../lib/api/series";
+
+export function SeriesHome() {
+  const [projectId, setProjectId] = useState<string>("");
+  const [items, setItems] = useState<Series[]>([]);
+  const [total, setTotal] = useState<number>(0);
+  const [loading, setLoading] = useState<boolean>(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const [newName, setNewName] = useState<string>("");
+  const [newStyle, setNewStyle] = useState<string>("");
+  const [newCont, setNewCont] = useState<string>("");
+
+  async function refresh() {
+    setErr(null);
+    if (!projectId.trim()) {
+      setErr("project_id is required to list series");
+      return;
+    }
+    setLoading(true);
+    try {
+      const r = await listSeries({ project_id: projectId.trim(), limit: 50, offset: 0 });
+      setItems(r.items || []);
+      setTotal(r.total || 0);
+    } catch (e: any) {
+      setErr(e?.message || "failed to list series");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function onCreate() {
+    setErr(null);
+    const pid = projectId.trim();
+    const name = newName.trim();
+    if (!pid) { setErr("project_id is required"); return; }
+    if (!name) { setErr("name is required"); return; }
+
+    try {
+      await createSeries({
+        project_id: pid,
+        name,
+        style_text: newStyle ?? "",
+        continuity_text: newCont ?? "",
+      });
+      setNewName("");
+      setNewStyle("");
+      setNewCont("");
+      await refresh();
+    } catch (e: any) {
+      setErr(e?.message || "create failed");
+    }
+  }
+
+  return (
+    <div style={{ display: "grid", gap: 14 }}>
+      <div style={{ display: "grid", gap: 6 }}>
+        <label style={{ fontWeight: 700 }}>project_id (required)</label>
+        <input value={projectId} onChange={(e) => setProjectId(e.target.value)} style={{ padding: 8, width: "100%" }} />
+        <div style={{ display: "flex", gap: 10 }}>
+          <button onClick={refresh} style={{ padding: "8px 12px" }}>{loading ? "Loading..." : "Refresh"}</button>
+        </div>
+      </div>
+
+      <div style={{ borderTop: "1px solid #eee", paddingTop: 12, display: "grid", gap: 8 }}>
+        <div style={{ fontWeight: 800 }}>Create Series</div>
+        <label>Name *</label>
+        <input value={newName} onChange={(e) => setNewName(e.target.value)} style={{ padding: 8, width: "100%" }} />
+        <label>Style Text</label>
+        <textarea value={newStyle} onChange={(e) => setNewStyle(e.target.value)} style={{ padding: 8, width: "100%", minHeight: 90 }} />
+        <label>Continuity Text</label>
+        <textarea value={newCont} onChange={(e) => setNewCont(e.target.value)} style={{ padding: 8, width: "100%", minHeight: 90 }} />
+        <button onClick={onCreate} style={{ padding: "8px 12px", width: 160 }}>Create</button>
+      </div>
+
+      <div style={{ borderTop: "1px solid #eee", paddingTop: 12 }}>
+        <div style={{ fontWeight: 800, marginBottom: 8 }}>Series List (total: {total})</div>
+        {err ? <div style={{ color: "crimson", marginBottom: 8 }}>{err}</div> : null}
+        <div style={{ display: "grid", gap: 10 }}>
+          {items.map((it) => (
+            <a key={it.id} href={`/series/${it.id}`} style={{ display: "block", padding: 12, border: "1px solid #eee", borderRadius: 8 }}>
+              <div style={{ fontWeight: 700 }}>{it.name}</div>
+              <div style={{ fontSize: 12, color: "#666" }}>{it.id}</div>
+            </a>
+          ))}
+          {items.length === 0 ? <div style={{ color: "#666" }}>No items.</div> : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+TSX
+
+cat > "apps/web/app/(app)/series/page.tsx" <<'TSX'
+import { SeriesHome } from "../../../src/ui/series/SeriesHome";
+
+export default function SeriesPage() {
+  return (
+    <div style={{ padding: 24 }}>
+      <h1 style={{ fontSize: 32, fontWeight: 700, marginBottom: 8 }}>Series</h1>
+      <p style={{ marginBottom: 16, color: "#555" }}>
+        M02 Series Workspace (style / continuity text). Listing requires project_id.
+      </p>
+      <SeriesHome />
+    </div>
+  );
+}
+TSX
+
+cat > "apps/web/app/(app)/series/[series_id]/page.tsx" <<'TSX'
+import { SeriesWorkspace } from "../../../../src/ui/series/SeriesWorkspace";
+
+export default function SeriesDetailPage({ params }: { params: { series_id: string } }) {
+  return (
+    <div style={{ padding: 24 }}>
+      <h1 style={{ fontSize: 28, fontWeight: 700, marginBottom: 12 }}>Series Workspace</h1>
+      <SeriesWorkspace seriesId={params.series_id} />
+    </div>
+  );
+}
+TSX
+
+# Optional: patch nav_items.ts to add /series (best-effort; warn if can't)
+python - <<'PY'
+from __future__ import annotations
+from pathlib import Path
+
+p = Path("apps/web/src/ui/nav/nav_items.ts")
+if not p.exists():
+    print("[warn] nav_items.ts not found; skip nav patch")
+    raise SystemExit(0)
+
+s = p.read_text(encoding="utf-8")
+if '"/series"' in s or "'/series'" in s:
+    print("[ok] nav already contains /series; skip")
+    raise SystemExit(0)
+
+# best-effort: insert near end before final "];"
+idx = s.rfind("];")
+if idx < 0:
+    print("[warn] cannot find closing '];' in nav_items.ts; skip nav patch")
+    raise SystemExit(0)
+
+item = '  { label: "Series", href: "/series" },\n'
+s2 = s[:idx] + item + s[idx:]
+p.write_text(s2, encoding="utf-8")
+print("[ok] nav_items patched: appended Series link (best-effort)")
+PY
+
+echo "[info] running next build (won't exit terminal on failure)"
+(
+  cd "apps/web" || exit 1
+  npm ci 2>/dev/null || npm install
+  npm run build
+)
+rc=$?
+echo "[info] next build rc=$rc"
+if [ "$rc" -ne 0 ]; then
+  echo "[fail] web build failed"
+  exit 1
+fi
+
+echo "[done] M02 completed."

@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+source .venv/Scripts/activate 2>/dev/null || true
+
+f="apps/api/src/app/modules/_registry.py"
+ts="$(date +%Y%m%d_%H%M%S)"
+
+if [[ ! -f "$f" ]]; then
+  echo "[fail] missing file: $f"
+  exit 1
+fi
+
+cp -f "$f" "$f.bak.$ts"
+echo "[ok] backup: $f.bak.$ts"
+
+python - <<'PY'
+from __future__ import annotations
+from pathlib import Path
+import re
+
+p = Path("apps/api/src/app/modules/_registry.py")
+lines = p.read_text(encoding="utf-8").splitlines(True)
+
+# locate function def
+idx = None
+for i, l in enumerate(lines):
+    if re.match(r"^def\s+get_module_routers\s*\(", l):
+        idx = i
+        break
+if idx is None:
+    raise SystemExit("[fail] def get_module_routers(...) not found")
+
+# indent any non-empty top-level lines AFTER def (most likely broken insertion)
+for j in range(idx + 1, len(lines)):
+    s = lines[j]
+    if s.strip() == "":
+        continue
+    if not s.startswith((" ", "\t")):
+        lines[j] = "    " + s
+
+# ensure return routers is not top-level
+for j, s in enumerate(lines):
+    if re.match(r"^return\s+routers\b", s):
+        lines[j] = "    " + s
+
+p.write_text("".join(lines), encoding="utf-8")
+print("[ok] patched: _registry.py (re-indented body + return routers)")
+PY
+
+python -m py_compile "$f"
+echo "[ok] py_compile: $f"
+
+cd apps/api
+PYTHONPATH=./src pytest -q
+echo "[ok] pytest passed"

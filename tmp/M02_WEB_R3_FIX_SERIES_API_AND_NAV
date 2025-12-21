@@ -1,0 +1,494 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$repo_root"
+
+echo "[info] M02_WEB_R3 starting..."
+echo "[info] repo_root=$repo_root"
+
+# ----------------------------
+# A) Fix web api base fallback (avoid calling :2000 /api/*)
+# ----------------------------
+echo "[step] locate apiFetch/getApiBaseUrl implementation..."
+
+api_base_file=""
+# prefer: file that mentions NEXT_PUBLIC_API_BASE_URL or getApiBaseUrl or apiFetch
+for cand in \
+  $(rg -n "NEXT_PUBLIC_API_BASE_URL|getApiBaseUrl|export async function apiFetch|function apiFetch" apps/web/src -S --files-with-matches || true)
+do
+  api_base_file="$cand"
+  break
+done
+
+if [[ -z "${api_base_file}" ]]; then
+  echo "[fatal] cannot locate api base implementation in apps/web/src (no matches for NEXT_PUBLIC_API_BASE_URL|getApiBaseUrl|apiFetch)"
+  exit 1
+fi
+
+echo "[info] api base file candidate: $api_base_file"
+cp -a "$api_base_file" "$api_base_file.bak.$(date +%Y%m%d_%H%M%S)"
+echo "[ok] backup: $api_base_file.bak.*"
+
+python - <<'PY'
+from pathlib import Path
+import re, sys, datetime
+
+p = Path(sys.argv[1])
+t = p.read_text(encoding="utf-8", errors="ignore")
+
+# If there's an existing getApiBaseUrl, patch it to have fallback localhost:7000.
+if "function getApiBaseUrl" in t or "export function getApiBaseUrl" in t:
+    # Replace entire function body conservatively.
+    pat = re.compile(r"(export\s+)?function\s+getApiBaseUrl\s*\(\s*\)\s*:\s*string\s*\{.*?\n\}", re.S)
+    if not pat.search(t):
+        pat = re.compile(r"(export\s+)?function\s+getApiBaseUrl\s*\(\s*\)\s*\{.*?\n\}", re.S)
+
+    repl = """export function getApiBaseUrl(): string {
+  const v = (process.env.NEXT_PUBLIC_API_BASE_URL || "").trim();
+  // Hard fallback for local dev to avoid hitting Next(:2000) /api/* and receiving HTML
+  const base = v || "http://localhost:7000";
+  return base.replace(/\\/+$/, "");
+}"""
+    if pat.search(t):
+        t2 = pat.sub(repl, t, count=1)
+    else:
+        # If signature not found, append a safe helper and do not risk breaking existing code.
+        t2 = t + "\n\n" + repl + "\n"
+    p.write_text(t2, encoding="utf-8")
+    print(f"[ok] patched getApiBaseUrl fallback in {p}")
+    sys.exit(0)
+
+# Otherwise, try to patch common pattern inside apiFetch where base is derived.
+# We do NOT try to rewrite unknown architectures; we only add a fallback if a base variable is present.
+if "NEXT_PUBLIC_API_BASE_URL" in t and "http://localhost:7000" not in t:
+    t2 = t.replace('process.env.NEXT_PUBLIC_API_BASE_URL', '(process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:7000")')
+    p.write_text(t2, encoding="utf-8")
+    print(f"[ok] injected fallback into NEXT_PUBLIC_API_BASE_URL usage in {p}")
+    sys.exit(0)
+
+# If neither recognizable, fail loudly (no guessing).
+print(f"[fatal] cannot safely patch api base logic in {p}: no getApiBaseUrl() and no recognizable NEXT_PUBLIC_API_BASE_URL usage")
+sys.exit(2)
+PY "$api_base_file"
+
+# ----------------------------
+# B) Ensure series API wrapper exists (client-side fetch only)
+#    (Uses same apiFetch import path as other wrappers if present)
+# ----------------------------
+echo "[step] write series api wrapper..."
+
+api_sample=""
+for s in apps/web/src/lib/api/prompts.ts apps/web/src/lib/api/projects.ts apps/web/src/lib/api/providers.ts; do
+  if [[ -f "$s" ]]; then api_sample="$s"; break; fi
+done
+if [[ -z "$api_sample" ]]; then
+  echo "[fatal] cannot find sample api wrapper in apps/web/src/lib/api (prompts.ts/projects.ts/providers.ts missing)"
+  exit 1
+fi
+
+api_import_line="$(python - <<'PY'
+import re, sys
+from pathlib import Path
+t = Path(sys.argv[1]).read_text(encoding="utf-8", errors="ignore").splitlines()
+for ln in t:
+    if "apiFetch" in ln and "from" in ln and "import" in ln:
+        print(ln.strip())
+        raise SystemExit(0)
+print("")
+PY "$api_sample")"
+
+if [[ -z "$api_import_line" ]]; then
+  echo "[fatal] cannot infer apiFetch import from sample: $api_sample"
+  echo "[hint] please rg -n \"apiFetch\" $api_sample and paste the import line"
+  exit 1
+fi
+
+mkdir -p "apps/web/src/lib/api"
+
+cat > "apps/web/src/lib/api/series.ts" <<EOF
+${api_import_line}
+
+export type Series = {
+  id: string;
+  project_id: string;
+  name: string;
+  style_text?: string | null;
+  continuity_text?: string | null;
+  archived_at?: string | null;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type SeriesCreate = {
+  project_id: string;
+  name: string;
+  style_text?: string | null;
+  continuity_text?: string | null;
+};
+
+export type SeriesPatch = Partial<{
+  name: string;
+  style_text: string | null;
+  continuity_text: string | null;
+  archived_at: string | null;
+}>;
+
+export type ListResp<T> = {
+  items: T[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
+export async function listSeries(params: { project_id: string; q?: string; archived?: boolean; limit?: number; offset?: number; sort?: string; }) {
+  const qs = new URLSearchParams();
+  qs.set("project_id", params.project_id);
+  if (params.q) qs.set("q", params.q);
+  if (typeof params.archived === "boolean") qs.set("archived", String(params.archived));
+  if (typeof params.limit === "number") qs.set("limit", String(params.limit));
+  if (typeof params.offset === "number") qs.set("offset", String(params.offset));
+  if (params.sort) qs.set("sort", params.sort);
+
+  return apiFetch<ListResp<Series>>(\`/api/series?\${qs.toString()}\`);
+}
+
+export async function createSeries(body: SeriesCreate) {
+  return apiFetch<Series>("/api/series", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function getSeries(series_id: string) {
+  return apiFetch<Series>(\`/api/series/\${series_id}\`);
+}
+
+export async function updateSeries(series_id: string, patch: SeriesPatch) {
+  return apiFetch<Series>(\`/api/series/\${series_id}\`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch ?? {}),
+  });
+}
+EOF
+
+echo "[ok] wrote: apps/web/src/lib/api/series.ts"
+
+# ----------------------------
+# C) Write Series UI (client-side only; no build-time API calls)
+# ----------------------------
+echo "[step] write series ui..."
+
+mkdir -p "apps/web/src/ui/series"
+
+cat > "apps/web/src/ui/series/SeriesList.tsx" <<'EOF'
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import { Series, createSeries, listSeries, updateSeries } from "../../lib/api/series";
+
+function nowIsoZ(): string {
+  return new Date().toISOString();
+}
+
+export function SeriesList() {
+  const [projectId, setProjectId] = useState<string>("p_demo");
+  const [items, setItems] = useState<Series[]>([]);
+  const [total, setTotal] = useState<number>(0);
+  const [loading, setLoading] = useState<boolean>(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const [name, setName] = useState<string>("");
+  const [styleText, setStyleText] = useState<string>("");
+  const [contText, setContText] = useState<string>("");
+
+  const canCreate = useMemo(() => (projectId || "").trim().length > 0 && (name || "").trim().length > 0, [projectId, name]);
+
+  async function refresh() {
+    setLoading(true);
+    setErr(null);
+    try {
+      const r = await listSeries({ project_id: projectId.trim(), limit: 50, offset: 0 });
+      setItems(r.items || []);
+      setTotal(r.total || 0);
+    } catch (e: any) {
+      setErr(e?.message || "failed to load series");
+      setItems([]);
+      setTotal(0);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    // do not auto-load if projectId empty
+    if ((projectId || "").trim()) refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function onCreate() {
+    if (!canCreate) return;
+    setLoading(true);
+    setErr(null);
+    try {
+      await createSeries({
+        project_id: projectId.trim(),
+        name: name.trim(),
+        style_text: styleText.trim() || undefined,
+        continuity_text: contText.trim() || undefined,
+      });
+      setName(""); setStyleText(""); setContText("");
+      await refresh();
+    } catch (e: any) {
+      setErr(e?.message || "create failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function toggleArchive(s: Series) {
+    setLoading(true);
+    setErr(null);
+    try {
+      const next = s.archived_at ? null : nowIsoZ();
+      await updateSeries(s.id, { archived_at: next });
+      await refresh();
+    } catch (e: any) {
+      setErr(e?.message || "update failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+        <label style={{ fontWeight: 600 }}>project_id</label>
+        <input value={projectId} onChange={(e) => setProjectId(e.target.value)} style={{ padding: 8, width: 240 }} />
+        <button onClick={refresh} disabled={loading || !(projectId || "").trim()} style={{ padding: "8px 12px" }}>
+          Refresh
+        </button>
+        {loading ? <span style={{ color: "#666" }}>Loading...</span> : null}
+      </div>
+
+      {err ? (
+        <div style={{ padding: 12, background: "#fee", border: "1px solid #f99", borderRadius: 8 }}>
+          <div style={{ fontWeight: 700, marginBottom: 6 }}>Series Error</div>
+          <pre style={{ margin: 0, whiteSpace: "pre-wrap" }}>{err}</pre>
+        </div>
+      ) : null}
+
+      <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 10 }}>
+        <div style={{ fontWeight: 700, marginBottom: 10 }}>Create Series</div>
+        <div style={{ display: "grid", gridTemplateColumns: "140px 1fr", gap: 10, alignItems: "center" }}>
+          <div style={{ color: "#333" }}>name *</div>
+          <input value={name} onChange={(e) => setName(e.target.value)} style={{ padding: 8 }} />
+
+          <div style={{ color: "#333" }}>style_text</div>
+          <textarea value={styleText} onChange={(e) => setStyleText(e.target.value)} style={{ padding: 8, minHeight: 70 }} />
+
+          <div style={{ color: "#333" }}>continuity_text</div>
+          <textarea value={contText} onChange={(e) => setContText(e.target.value)} style={{ padding: 8, minHeight: 70 }} />
+        </div>
+
+        <div style={{ marginTop: 10 }}>
+          <button onClick={onCreate} disabled={loading || !canCreate} style={{ padding: "8px 12px" }}>
+            Create
+          </button>
+          {!canCreate ? <span style={{ marginLeft: 10, color: "#777" }}>require project_id and name</span> : null}
+        </div>
+      </div>
+
+      <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 10 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+          <div style={{ fontWeight: 700 }}>Series List</div>
+          <div style={{ color: "#666" }}>total: {total}</div>
+        </div>
+
+        <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 8 }}>
+          {items.map((s) => (
+            <div key={s.id} style={{ display: "flex", gap: 10, alignItems: "center", borderBottom: "1px solid #eee", paddingBottom: 8 }}>
+              <a href={`/series/${s.id}`} style={{ fontFamily: "monospace" }}>{s.id}</a>
+              <div style={{ fontWeight: 700 }}>{s.name}</div>
+              <div style={{ color: "#666" }}>project: {s.project_id}</div>
+              <div style={{ marginLeft: "auto", display: "flex", gap: 10, alignItems: "center" }}>
+                <span style={{ color: s.archived_at ? "#b00" : "#090" }}>
+                  {s.archived_at ? "archived" : "active"}
+                </span>
+                <button onClick={() => toggleArchive(s)} disabled={loading} style={{ padding: "6px 10px" }}>
+                  {s.archived_at ? "Restore" : "Archive"}
+                </button>
+              </div>
+            </div>
+          ))}
+          {items.length === 0 ? <div style={{ color: "#777" }}>No items.</div> : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+EOF
+
+cat > "apps/web/src/ui/series/SeriesDetail.tsx" <<'EOF'
+"use client";
+
+import { useEffect, useState } from "react";
+import { Series, getSeries } from "../../lib/api/series";
+
+export function SeriesDetail({ seriesId }: { seriesId: string }) {
+  const [item, setItem] = useState<Series | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    let ok = true;
+    (async () => {
+      try {
+        const r = await getSeries(seriesId);
+        if (!ok) return;
+        setItem(r);
+      } catch (e: any) {
+        if (!ok) return;
+        setErr(e?.message || "failed to load");
+      }
+    })();
+    return () => { ok = false; };
+  }, [seriesId]);
+
+  if (err) {
+    return (
+      <div style={{ padding: 12, background: "#fee", border: "1px solid #f99", borderRadius: 8 }}>
+        <div style={{ fontWeight: 700, marginBottom: 6 }}>Series Error</div>
+        <pre style={{ margin: 0, whiteSpace: "pre-wrap" }}>{err}</pre>
+      </div>
+    );
+  }
+
+  if (!item) return <div style={{ color: "#666" }}>Loading...</div>;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      <div style={{ fontSize: 20, fontWeight: 800 }}>{item.name}</div>
+      <div style={{ fontFamily: "monospace" }}>id: {item.id}</div>
+      <div>project_id: {item.project_id}</div>
+      <div>archived_at: {item.archived_at || "(null)"}</div>
+      <div style={{ marginTop: 10 }}>
+        <div style={{ fontWeight: 700, marginBottom: 6 }}>style_text</div>
+        <pre style={{ padding: 10, background: "#f7f7f7", borderRadius: 8, whiteSpace: "pre-wrap" }}>{item.style_text || ""}</pre>
+      </div>
+      <div>
+        <div style={{ fontWeight: 700, marginBottom: 6 }}>continuity_text</div>
+        <pre style={{ padding: 10, background: "#f7f7f7", borderRadius: 8, whiteSpace: "pre-wrap" }}>{item.continuity_text || ""}</pre>
+      </div>
+    </div>
+  );
+}
+EOF
+
+echo "[ok] wrote: apps/web/src/ui/series/SeriesList.tsx"
+echo "[ok] wrote: apps/web/src/ui/series/SeriesDetail.tsx"
+
+# pages (quote paths with parentheses)
+mkdir -p "apps/web/app/(app)/series"
+mkdir -p "apps/web/app/(app)/series/[series_id]"
+
+cat > "apps/web/app/(app)/series/page.tsx" <<'EOF'
+import { SeriesList } from "../../../src/ui/series/SeriesList";
+
+export default function SeriesPage() {
+  return (
+    <div style={{ padding: 24 }}>
+      <h1 style={{ fontSize: 32, fontWeight: 700, marginBottom: 8 }}>Series</h1>
+      <p style={{ marginBottom: 16, color: "#555" }}>
+        M02 Series Workspace (minimal): project-scoped list + create + archive/restore.
+      </p>
+      <SeriesList />
+    </div>
+  );
+}
+EOF
+
+cat > "apps/web/app/(app)/series/[series_id]/page.tsx" <<'EOF'
+import { SeriesDetail } from "../../../../src/ui/series/SeriesDetail";
+
+export default function SeriesDetailPage({ params }: { params: { series_id: string } }) {
+  return (
+    <div style={{ padding: 24 }}>
+      <a href="/series" style={{ display: "inline-block", marginBottom: 12 }}>← Back to Series</a>
+      <SeriesDetail seriesId={params.series_id} />
+    </div>
+  );
+}
+EOF
+
+echo "[ok] wrote: apps/web/app/(app)/series/page.tsx"
+echo "[ok] wrote: apps/web/app/(app)/series/[series_id]/page.tsx"
+
+# ----------------------------
+# D) Insert Series nav into the actual sidebar nav source (no guessing)
+# ----------------------------
+echo "[step] locate nav source used by sidebar..."
+
+# candidate files that contain /projects and /settings links/config
+mapfile -t nav_candidates < <(rg -n "\"/projects\"|href=\\\"/projects\\\"|href: \"/projects\"" apps/web/src -S --files-with-matches | rg -n "nav|sidebar|layout" -S || true)
+
+if [[ ${#nav_candidates[@]} -eq 0 ]]; then
+  echo "[fatal] cannot locate nav/sidebar source file under apps/web/src (no matches for /projects in nav|sidebar|layout files)"
+  echo "[hint] run: rg -n '\"/projects\"' apps/web/src -S and paste the output"
+  exit 1
+fi
+
+nav_file="${nav_candidates[0]}"
+echo "[info] nav candidate: $nav_file"
+cp -a "$nav_file" "$nav_file.bak.$(date +%Y%m%d_%H%M%S)"
+echo "[ok] backup: $nav_file.bak.*"
+
+python - <<'PY'
+from pathlib import Path
+import re, sys
+
+p = Path(sys.argv[1])
+t = p.read_text(encoding="utf-8", errors="ignore")
+
+if "/series" in t:
+    print("[ok] nav already contains /series; skip")
+    raise SystemExit(0)
+
+# Case 1: JSX links: <Link href="/projects">Projects</Link> or <a href="/projects">
+m = re.search(r'(^.*?(Link|a)\s+[^>\n]*href\s*=\s*["\']\/projects["\'][^\n]*\n?)', t, re.M)
+if m:
+    line = m.group(1)
+    # try to clone line and adjust label if it's literal Projects
+    series_line = line.replace('/projects', '/series')
+    series_line = series_line.replace('Projects', 'Series').replace('projects', 'series')
+    # insert immediately after the projects line
+    t2 = t[:m.end(1)] + series_line + t[m.end(1):]
+    p.write_text(t2, encoding="utf-8")
+    print(f"[ok] inserted /series nav after JSX /projects in {p}")
+    raise SystemExit(0)
+
+# Case 2: object-based config: href: "/projects"
+m = re.search(r'(href\s*:\s*["\']\/projects["\']\s*,.*?\n)', t)
+if m:
+    # naive insertion: add a sibling object entry near projects entry if we can detect object literal block
+    # We insert a minimal block that should typecheck if only label+href are required; if more keys exist, this may fail (and that's OK: we will stop further changes).
+    insert = '  { label: "Series", href: "/series" },\n'
+    t2 = t[:m.end(1)] + insert + t[m.end(1):]
+    p.write_text(t2, encoding="utf-8")
+    print(f"[ok] inserted minimal object nav item for /series in {p}")
+    raise SystemExit(0)
+
+print(f"[fatal] cannot safely patch nav file {p}: unrecognized structure (no JSX href=\"/projects\" and no href: \"/projects\")")
+raise SystemExit(2)
+PY "$nav_file"
+
+# ----------------------------
+# E) Build web
+# ----------------------------
+echo "[step] next build..."
+cd apps/web
+npm run build
+echo "[ok] next build passed"
+
+echo "[done] M02_WEB_R3 completed."
