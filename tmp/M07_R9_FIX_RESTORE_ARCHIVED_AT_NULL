@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+set -e
+set -o pipefail
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$repo_root"
+ts="$(date +%Y%m%d_%H%M%S)"
+
+backup () {
+  local f="$1"
+  if [ -f "$f" ]; then
+    cp "$f" "$f.bak.$ts"
+    echo "[ok] backup: $f.bak.$ts"
+  fi
+}
+
+echo "[info] repo_root=$repo_root"
+
+# ---- backups ----
+for f in \
+  apps/api/src/app/modules/providers/router.py \
+  apps/api/src/app/modules/workflows/router.py \
+  apps/api/src/app/modules/tools/router.py \
+  apps/api/src/app/modules/providers/store_sqlite.py \
+  apps/api/src/app/modules/workflows/store_sqlite.py \
+  apps/api/src/app/modules/tools/store_sqlite.py
+do
+  backup "$f"
+done
+
+echo "[step] patch routers: keep archived_at=None in PATCH body"
+python - <<'PY'
+from __future__ import annotations
+from pathlib import Path
+import re
+
+router_files = [
+  Path("apps/api/src/app/modules/providers/router.py"),
+  Path("apps/api/src/app/modules/workflows/router.py"),
+  Path("apps/api/src/app/modules/tools/router.py"),
+]
+
+def patch_router(text: str) -> tuple[str, bool]:
+  orig = text
+
+  # 1) If someone used exclude_none=True, remove it (we need archived_at=None to be retained)
+  text = re.sub(r"model_dump\(([^)]*)exclude_none\s*=\s*True\s*,?\s*([^)]*)\)",
+                lambda m: "model_dump(" + (m.group(1) + m.group(2)).replace(",,", ",").strip().strip(",") + ")",
+                text)
+
+  # 2) If patch dict comprehension drops None, allow archived_at through
+  #    patch = {k: v for k, v in body.model_dump(...).items() if v is not None}
+  text = re.sub(
+    r"(patch\s*=\s*\{k:\s*v\s*for\s*k,\s*v\s*in\s*body\.model_dump\((?:[^)]*)\)\.items\(\)\s*if\s*)v\s*is\s*not\s*None(\s*\})",
+    r"\1(v is not None or k == \"archived_at\")\2",
+    text,
+  )
+
+  # 3) If there is an explicit loop that skips None, allow archived_at
+  #    if v is None: continue  -> if v is None and k != "archived_at": continue
+  text = re.sub(
+    r"(\s+)if\s+v\s+is\s+None\s*:\s*\n\1(\s+)continue",
+    r"\1if v is None and k != \"archived_at\":\n\1\2continue",
+    text
+  )
+
+  # 4) If nothing above exists, we still try a safe insertion:
+  #    Convert "patch = body.model_dump(exclude_unset=True)" then ensure no subsequent filtering removes None
+  #    (no-op if already present)
+  return text, (text != orig)
+
+for p in router_files:
+  if not p.exists():
+    print("[warn] missing:", p)
+    continue
+  s = p.read_text(encoding="utf-8")
+  s2, changed = patch_router(s)
+  if changed:
+    p.write_text(s2, encoding="utf-8")
+    print("[ok] patched:", p)
+  else:
+    print("[warn] no change applied:", p, "(please confirm PATCH handler doesn't drop None)")
+PY
+
+echo "[step] patch stores: allow archived_at to be explicitly set to None (clear)"
+python - <<'PY'
+from __future__ import annotations
+from pathlib import Path
+import re
+
+store_files = [
+  Path("apps/api/src/app/modules/providers/store_sqlite.py"),
+  Path("apps/api/src/app/modules/workflows/store_sqlite.py"),
+  Path("apps/api/src/app/modules/tools/store_sqlite.py"),
+]
+
+def rewrite_update_loop_block(lines: list[str], i: int) -> tuple[list[str], int, bool]:
+  """
+  Look for:
+    for k, v in patch.items():
+        if v is None: continue
+        setattr(obj, k, v)
+  or:
+    for k, v in patch.items():
+        if v is not None:
+            setattr(obj, k, v)
+  and rewrite to:
+    for k, v in patch.items():
+        if k == "archived_at":
+            setattr(obj, k, v)
+            continue
+        if v is None:
+            continue
+        setattr(obj, k, v)
+  This preserves existing behavior for other fields, but allows clearing archived_at.
+  """
+  line = lines[i]
+  m_for = re.match(r"^(\s*)for\s+k\s*,\s*v\s+in\s+patch\.items\(\)\s*:\s*$", line)
+  if not m_for:
+    return lines, i, False
+
+  indent_for = m_for.group(1)
+  # find block end by indentation
+  j = i + 1
+  while j < len(lines):
+    if lines[j].strip() == "":
+      j += 1
+      continue
+    if not lines[j].startswith(indent_for + "    "):
+      break
+    j += 1
+
+  block = lines[i:j]
+  block_text = "\n".join(block)
+
+  # find obj variable used in setattr(obj, k, v)
+  m_set = re.search(r"setattr\(\s*(\w+)\s*,\s*k\s*,\s*v\s*\)", block_text)
+  if not m_set:
+    return lines, i, False
+  obj = m_set.group(1)
+
+  # Only rewrite if we see a None-skip or not-none guard
+  has_skip_none = re.search(r"if\s+v\s+is\s+None\s*:\s*", block_text) is not None
+  has_if_not_none = re.search(r"if\s+v\s+is\s+not\s+None\s*:\s*", block_text) is not None
+  if not (has_skip_none or has_if_not_none):
+    return lines, i, False
+
+  ind = indent_for + "    "
+  new_block = [
+    f"{indent_for}for k, v in patch.items():",
+    f"{ind}if k == \"archived_at\":",
+    f"{ind}    setattr({obj}, k, v)",
+    f"{ind}    continue",
+    f"{ind}if v is None:",
+    f"{ind}    continue",
+    f"{ind}setattr({obj}, k, v)",
+  ]
+
+  out = lines[:i] + [x + "\n" for x in new_block] + lines[j:]
+  return out, i + len(new_block), True
+
+def patch_store(text: str) -> tuple[str, bool]:
+  lines = text.splitlines(keepends=True)
+  changed_any = False
+  i = 0
+  while i < len(lines):
+    new_lines, new_i, changed = rewrite_update_loop_block(lines, i)
+    if changed:
+      lines = new_lines
+      changed_any = True
+      i = new_i
+    else:
+      i += 1
+
+  # Also patch dict-comprehension filter if present:
+  # patch = {k: v for k, v in patch.items() if v is not None}
+  joined = "".join(lines)
+  joined2 = re.sub(
+    r"(patch\s*=\s*\{k:\s*v\s*for\s*k,\s*v\s*in\s*patch\.items\(\)\s*if\s*)v\s*is\s*not\s*None(\s*\})",
+    r"\1(v is not None or k == \"archived_at\")\2",
+    joined
+  )
+  if joined2 != joined:
+    joined = joined2
+    changed_any = True
+
+  return joined, changed_any
+
+for p in store_files:
+  if not p.exists():
+    print("[warn] missing:", p)
+    continue
+  s = p.read_text(encoding="utf-8")
+  s2, changed = patch_store(s)
+  if changed:
+    p.write_text(s2, encoding="utf-8")
+    print("[ok] patched:", p)
+  else:
+    print("[warn] no change applied:", p, "(please confirm update loop doesn't skip None)")
+PY
+
+echo "[step] run backend tests"
+cd apps/api
+PYTHONPATH=./src pytest -q
+echo "[done] M07_R9_FIX_RESTORE_ARCHIVED_AT_NULL completed."

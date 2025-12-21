@@ -1,0 +1,176 @@
+HandoffPack — M01 / M05 / M07（截至当前状态）
+0) 当前工程状态（证据）
+
+Repo：AI-Assitant-Manager（Windows + Git Bash）
+
+你刚跑完：apps/api 全量测试 19 passed（rc=0），说明后端当前处于一致可用状态。
+
+OpenAPI 合约采用 lockfile 机制：packages/contracts/openapi.json + openapi.sha256 + contract_version.txt，通过 scripts/export_openapi.sh 与 scripts/verify_contracts.sh 管控漂移。
+
+1) 全局硬约束（所有后续模块必须继承）
+端口与运行形态
+
+API：FastAPI / Uvicorn 7000
+
+Web：Next.js 2000
+
+前后端解耦；前端通过运行时 baseUrl 指向后端。
+
+错误与可观测性（冻结）
+
+ErrorEnvelope：所有错误必须统一封装（包含 error.code/message/details，并保持 request_id 贯穿）
+
+每个响应/错误都必须带 X-Request-Id
+
+/health 存在且稳定返回 200 JSON
+
+合约门禁（冻结）
+
+改动 API 后必须：
+
+运行后端
+
+scripts/export_openapi.sh 更新 openapi.json 与 openapi.sha256
+
+scripts/verify_contracts.sh 必须通过
+
+contract_version.txt 使用 YYYYMMDD-NN 递增（当天多次变更递增 NN）
+
+2) M01 — Baseline & Observability Skeleton（已完成）
+后端
+
+FastAPI app 初始化流程固定：注册 exception handlers、CORS、middleware（ErrorEnvelope / RequestLog / RequestId）、平台路由（health/meta）、再挂载业务模块 routers（来自 modules/_registry.py）。
+
+回归用例覆盖：health、error envelope、request id、分页契约等基础门禁。
+
+前端
+
+Next.js 能 build，通过最小 app shell / 路由骨架。
+
+API client 具备 request_id 注入、ErrorEnvelope 解析与 ApiError 抛出（M00/M01 基座能力）。
+
+3) M05 — Prompt Library + PromptVersion（已完成到可用骨架）
+目标范围
+
+Prompt：可 CRUD（提示词资产）
+
+PromptVersion：不可变快照（Create / Get / List；Update 必须不存在）
+
+PromptVersion 结构包含：composition_blocks、resolved_prompt_text、resolved_params、workflow_ref（按契约落地）
+
+后端交付
+
+/api/prompts CRUD
+
+/api/prompt_versions Create/Get/List（无 update）
+
+modules registry 已挂载 prompts 相关 router
+
+pytest 已覆盖 prompts/prompt_versions 基本 CRUD 与不可变规则（你已跑通）
+
+前端交付（当前为“可访问+可拉取”的薄 UI）
+
+/prompts 页面存在；PromptList 能调用 API 获取列表并渲染
+
+prompt_versions 的 API wrapper 已存在（用于后续 prompt detail / composer 生成快照）
+
+注：你之前的 JSX.Element 类型问题已修复（改为不显式标注 JSX 命名空间）。
+
+4) M07 — Providers / Workflows / Tools（可插拔目录）（已完成并修复归档恢复）
+目标范围
+
+后端：
+
+/api/providers CRUD + list(q, enabled, archived…)
+
+/api/workflows CRUD + list(q, type, archived…)
+
+/api/tools CRUD + list(q, type, archived…)
+
+Provider 必须声明 supported_kinds
+
+Workflow 可引用 workflow_blob_asset_id
+
+前端：
+
+Settings 页面展示三个 Panel：Providers / Workflows / Tools，可 Create / Refresh / Archive（以及必要的 Update/Patch）
+
+关键实现点（已落地）
+
+modules/_registry.py 已插入 M07 routers（providers/workflows/tools）并通过测试与合约导出
+
+Settings 页面不再是 Placeholder，已渲染三块 Panel
+
+本轮关键 Bug 与最终修复状态
+
+问题：PATCH archived_at: null 无法“恢复/取消归档”，原因是 PATCH 处理把 None 过滤掉（导致 store 层永远拿不到显式 null）
+
+修复：PATCH 使用 body.model_dump(exclude_unset=True) 保留“显式传入的 null”，从而允许 archived_at 清空
+
+结果：test_m07_archive_patch.py 相关用例通过；当前后端全量测试 19 passed
+
+5) 当前目录与主要挂载点（给下一模块开发者）
+后端模块位置
+
+apps/api/src/app/modules/_registry.py：所有业务 router 注册入口（新增模块必须在此挂载）
+
+M05：
+
+apps/api/src/app/modules/prompts/*
+
+M07：
+
+apps/api/src/app/modules/providers/*
+
+apps/api/src/app/modules/workflows/*
+
+apps/api/src/app/modules/tools/*
+
+前端页面与组件位置
+
+路由（App Router）：
+
+apps/web/app/(app)/projects
+
+apps/web/app/(app)/prompts
+
+apps/web/app/(app)/settings
+
+API wrappers：
+
+apps/web/src/lib/api/*
+
+UI：
+
+apps/web/src/ui/prompts/*
+
+apps/web/src/ui/settings/*
+
+6) 下一模块开发的统一门禁（建议直接复用）
+
+在做任何新模块（例如后续 Runs/Jobs/Assets/Generation 等）前后：
+
+后端测试：
+
+cd "$(git rev-parse --show-toplevel)"
+cd apps/api
+PYTHONPATH=./src pytest -q
+
+
+前端 build：
+
+cd "$(git rev-parse --show-toplevel)"
+cd apps/web
+npm run build
+
+
+合约（如果 API 变更）：
+
+cd "$(git rev-parse --show-toplevel)"
+# 后端需运行在 7000
+./scripts/export_openapi.sh
+./scripts/verify_contracts.sh
+
+7) 给“新聊天窗口”的一句话指令（复制即可）
+
+你在 AI-Assitant-Manager 仓库上继续开发后续模块。必须保持：API 7000、Web 2000；ErrorEnvelope + X-Request-Id + /health 冻结；新增模块必须通过 modules/_registry.py 注册；任何 API 变更必须 export_openapi + verify_contracts 更新 lockfiles；当前已完成 M01/M05/M07，后端 pytest 全绿（19 passed）。

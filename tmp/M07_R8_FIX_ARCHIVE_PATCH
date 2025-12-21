@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+set -u
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$repo_root" || exit 1
+echo "[info] repo_root=$repo_root"
+
+ts="$(date +%Y%m%d_%H%M%S)"
+
+backup_file() {
+  local f="$1"
+  if [ -f "$f" ]; then
+    cp -f "$f" "$f.bak.$ts"
+    echo "[ok] backup: $f.bak.$ts"
+  fi
+}
+
+python - <<'PY'
+from __future__ import annotations
+from pathlib import Path
+import re
+
+def add_archived_to_patch(path: Path, class_names: list[str]) -> bool:
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines(True)
+
+    def find_class_idx(name: str) -> int:
+        for i, ln in enumerate(lines):
+            if re.match(rf"^\s*class\s+{re.escape(name)}\b", ln):
+                return i
+        return -1
+
+    changed = False
+    for cls in class_names:
+        i = find_class_idx(cls)
+        if i < 0:
+            continue
+
+        # find class block end
+        j = i + 1
+        while j < len(lines):
+            ln = lines[j]
+            if ln.strip() == "":
+                j += 1
+                continue
+            if not (ln.startswith(" ") or ln.startswith("\t")):
+                break
+            j += 1
+
+        block = "".join(lines[i:j])
+        if re.search(r"^\s+archived\s*:", block, flags=re.M):
+            continue
+
+        # insert before class end (before trailing blank lines)
+        insert_at = j
+        while insert_at > i+1 and lines[insert_at-1].strip() == "":
+            insert_at -= 1
+
+        # ensure Optional is imported (best-effort)
+        if "Optional" not in text:
+            # try to extend typing import
+            m = re.search(r"^from\s+typing\s+import\s+([^\n]+)\n", text, flags=re.M)
+            if m:
+                imported = m.group(1)
+                if "Optional" not in imported:
+                    new_imported = imported.rstrip()
+                    if new_imported.endswith(","):
+                        new_imported += " Optional"
+                    else:
+                        new_imported += ", Optional"
+                    text2 = text[:m.start(1)] + new_imported + text[m.end(1):]
+                    lines[:] = text2.splitlines(True)
+                    text = text2
+
+        lines.insert(insert_at, "    archived: Optional[bool] = None\n")
+        changed = True
+
+    if changed:
+        path.write_text("".join(lines), encoding="utf-8")
+    return changed
+
+targets = [
+    (Path("apps/api/src/app/modules/providers/dto.py"), ["ProviderPatch", "ProviderUpdate", "ProviderPatchDTO"]),
+    (Path("apps/api/src/app/modules/workflows/dto.py"), ["WorkflowPatch", "WorkflowUpdate", "WorkflowPatchDTO"]),
+    (Path("apps/api/src/app/modules/tools/dto.py"), ["ToolPatch", "ToolUpdate", "ToolPatchDTO"]),
+]
+
+any_changed = False
+for p, class_names in targets:
+    if not p.exists():
+        print(f"[warn] missing: {p}")
+        continue
+    if add_archived_to_patch(p, class_names):
+        print(f"[ok] patched archived field in: {p}")
+        any_changed = True
+    else:
+        print(f"[ok] no change needed: {p}")
+
+if not any_changed:
+    print("[info] dto patch: nothing changed (archived already supported?)")
+PY
+
+# Add regression tests (M07 archive)
+mkdir -p apps/api/tests
+testf="apps/api/tests/test_m07_archive_patch.py"
+backup_file "$testf"
+cat > "$testf" <<'PY'
+from fastapi.testclient import TestClient
+from app.main import app
+
+def _ids(resp_json):
+    return [it["id"] for it in (resp_json.get("items") or [])]
+
+def test_m07_archive_patch_tool():
+    c = TestClient(app)
+
+    r = c.post("/api/tools", json={
+        "project_id": "p_demo",
+        "name": "ToolArchive",
+        "tool_type": "postprocess",
+        "config": {"strength": 0.5},
+        "description": "demo"
+    })
+    assert r.status_code == 200
+    tid = r.json()["id"]
+
+    r = c.patch(f"/api/tools/{tid}", json={"archived": True})
+    assert r.status_code == 200, r.text
+
+    r = c.get(f"/api/tools/{tid}")
+    assert r.status_code == 200
+    assert r.json()["archived"] is True
+
+    r = c.get("/api/tools?archived=true")
+    assert r.status_code == 200
+    assert tid in _ids(r.json())
+
+def test_m07_archive_patch_provider():
+    c = TestClient(app)
+
+    r = c.post("/api/providers", json={
+        "name": "ProviderArchive",
+        "provider_type": "http_api",
+        "supported_kinds": ["text2image"],
+        "endpoint_config": {"base_url": "http://example"},
+        "is_enabled": True
+    })
+    assert r.status_code == 200
+    pid = r.json()["id"]
+
+    r = c.patch(f"/api/providers/{pid}", json={"archived": True})
+    assert r.status_code == 200, r.text
+
+    r = c.get(f"/api/providers/{pid}")
+    assert r.status_code == 200
+    assert r.json()["archived"] is True
+
+    r = c.get("/api/providers?archived=true")
+    assert r.status_code == 200
+    assert pid in _ids(r.json())
+
+def test_m07_archive_patch_workflow():
+    c = TestClient(app)
+
+    r = c.post("/api/workflows", json={
+        "project_id": "p_demo",
+        "name": "WFArchive",
+        "workflow_type": "comfyui_workflow",
+        "workflow_blob_asset_id": "asset_wf_1",
+        "default_params": {"steps": 20}
+    })
+    assert r.status_code == 200
+    wid = r.json()["id"]
+
+    r = c.patch(f"/api/workflows/{wid}", json={"archived": True})
+    assert r.status_code == 200, r.text
+
+    r = c.get(f"/api/workflows/{wid}")
+    assert r.status_code == 200
+    assert r.json()["archived"] is True
+
+    r = c.get("/api/workflows?archived=true")
+    assert r.status_code == 200
+    assert wid in _ids(r.json())
+PY
+echo "[ok] wrote: $testf"
+
+echo "[info] running backend tests..."
+cd apps/api || exit 1
+PYTHONPATH=./src pytest -q
+rc=$?
+echo "[info] pytest rc=$rc"
+if [ $rc -ne 0 ]; then
+  echo "[fail] backend tests failed"
+  exit 1
+fi
+cd "$repo_root" || exit 1
+
+echo "[info] start api server (7000) for contract export..."
+(
+  cd apps/api || exit 1
+  source ../../.venv/Scripts/activate 2>/dev/null || true
+  PYTHONPATH=./src uvicorn app.main:app --host 0.0.0.0 --port 7000 > /tmp/api_7000.log 2>&1 &
+  echo $! > /tmp/api_7000.pid
+  echo "[ok] api started pid=$(cat /tmp/api_7000.pid)"
+)
+
+# wait health
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  if curl -sS http://localhost:7000/health >/tmp/h.json 2>/dev/null; then
+    echo "[ok] api health: $(cat /tmp/h.json)"
+    break
+  fi
+  sleep 0.3
+done
+
+echo "[info] bump contract version + export + verify..."
+python - <<'PY'
+from __future__ import annotations
+from pathlib import Path
+import re
+from datetime import datetime
+
+p = Path("packages/contracts/contract_version.txt")
+old = p.read_text(encoding="utf-8").strip() if p.exists() else ""
+today = datetime.now().strftime("%Y%m%d")
+m = re.fullmatch(r"(\d{8})-(\d{2})", old)
+if m and m.group(1) == today:
+    nn = int(m.group(2)) + 1
+    new = f"{today}-{nn:02d}"
+else:
+    new = f"{today}-01"
+p.parent.mkdir(parents=True, exist_ok=True)
+p.write_text(new + "\n", encoding="utf-8")
+print(f"[ok] contract_version: {old!r} -> {new!r}")
+PY
+
+./scripts/export_openapi.sh
+./scripts/verify_contracts.sh
+
+echo "[info] stopping api server..."
+if [ -f /tmp/api_7000.pid ]; then
+  kill "$(cat /tmp/api_7000.pid)" 2>/dev/null || true
+  echo "[ok] killed pid=$(cat /tmp/api_7000.pid)"
+fi
+
+echo "[info] running next build..."
+cd apps/web || exit 1
+npm run build
+rc=$?
+echo "[info] next build rc=$rc"
+if [ $rc -ne 0 ]; then
+  echo "[fail] next build failed"
+  exit 1
+fi
+
+echo "[done] M07 archive patch fix completed."

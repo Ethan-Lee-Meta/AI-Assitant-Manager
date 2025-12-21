@@ -1,0 +1,251 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import { createProvider, listProviders, Provider } from "../../lib/api/providers";
+import { createWorkflow, listWorkflows, Workflow } from "../../lib/api/workflows";
+import { createTool, listTools, Tool } from "../../lib/api/tools";
+
+function FieldRow(props: { label: string; children: React.ReactNode }) {
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <div style={{ fontSize: 12, color: "#666", marginBottom: 6 }}>{props.label}</div>
+      {props.children}
+    </div>
+  );
+}
+
+export function IntegrationsSettings() {
+  // Providers
+  const [pItems, setPItems] = useState<Provider[]>([]);
+  const [pTotal, setPTotal] = useState<number>(0);
+  const [pLoading, setPLoading] = useState<boolean>(false);
+  const [pErr, setPErr] = useState<string | null>(null);
+
+  const [pName, setPName] = useState<string>("");
+  const [pType, setPType] = useState<string>("http_api");
+  const [pKinds, setPKinds] = useState<string>("text2image,text2video");
+  const [pBaseUrl, setPBaseUrl] = useState<string>("http://example");
+  const [pEnabled, setPEnabled] = useState<boolean>(true);
+
+  // Workflows
+  const [wItems, setWItems] = useState<Workflow[]>([]);
+  const [wTotal, setWTotal] = useState<number>(0);
+  const [wLoading, setWLoading] = useState<boolean>(false);
+  const [wErr, setWErr] = useState<string | null>(null);
+
+  // Tools
+  const [tItems, setTItems] = useState<Tool[]>([]);
+  const [tTotal, setTTotal] = useState<number>(0);
+  const [tLoading, setTLoading] = useState<boolean>(false);
+  const [tErr, setTErr] = useState<string | null>(null);
+
+  async function refreshProviders() {
+    setPLoading(true);
+    setPErr(null);
+    try {
+      const r = await listProviders({ limit: 50, offset: 0, archived: false });
+      setPItems(r.items || []);
+      setPTotal(r.total || 0);
+    } catch (e: any) {
+      setPErr(e?.message || "failed to load providers");
+    } finally {
+      setPLoading(false);
+    }
+  }
+
+  async function refreshWorkflows() {
+    setWLoading(true);
+    setWErr(null);
+    try {
+      const r = await listWorkflows({ limit: 50, offset: 0, archived: false });
+      setWItems(r.items || []);
+      setWTotal(r.total || 0);
+    } catch (e: any) {
+      setWErr(e?.message || "failed to load workflows");
+    } finally {
+      setWLoading(false);
+    }
+  }
+
+  async function refreshTools() {
+    setTLoading(true);
+    setTErr(null);
+    try {
+      const r = await listTools({ limit: 50, offset: 0, archived: false });
+      setTItems(r.items || []);
+      setTTotal(r.total || 0);
+    } catch (e: any) {
+      setTErr(e?.message || "failed to load tools");
+    } finally {
+      setTLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    // safe: client-side only
+    refreshProviders();
+    refreshWorkflows();
+    refreshTools();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function onCreateProvider() {
+    setPErr(null);
+    try {
+      const kinds = pKinds
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+
+      await createProvider({
+        name: pName || "DemoProvider",
+        provider_type: pType || "http_api",
+        supported_kinds: kinds.length ? kinds : ["text2image"],
+        endpoint_config: { base_url: pBaseUrl || "http://example" },
+        is_enabled: pEnabled,
+      });
+
+      setPName("");
+      await refreshProviders();
+    } catch (e: any) {
+      setPErr(e?.message || "create provider failed");
+    }
+  }
+
+  async function onCreateWorkflow() {
+    setWErr(null);
+    try {
+      await createWorkflow({
+        project_id: "p_demo",
+        name: "WF1",
+        workflow_type: "comfyui_workflow",
+        workflow_blob_asset_id: "asset_wf_1",
+        default_params: { steps: 20 },
+      });
+      await refreshWorkflows();
+    } catch (e: any) {
+      setWErr(e?.message || "create workflow failed");
+    }
+  }
+
+  async function onCreateTool() {
+    setTErr(null);
+    try {
+      await createTool({
+        project_id: "p_demo",
+        name: "Tool1",
+        tool_type: "postprocess",
+        config: { strength: 0.5 },
+        description: "demo",
+      });
+      await refreshTools();
+    } catch (e: any) {
+      setTErr(e?.message || "create tool failed");
+    }
+  }
+
+  return (
+    <div style={{ display: "grid", gap: 24 }}>
+      <section style={{ border: "1px solid #eee", borderRadius: 12, padding: 16 }}>
+        <h2 style={{ margin: 0, marginBottom: 8 }}>Providers</h2>
+        <div style={{ color: "#666", fontSize: 12, marginBottom: 12 }}>
+          total={pTotal} (showing up to 50)
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 12 }}>
+          <FieldRow label="Name">
+            <input value={pName} onChange={(e) => setPName(e.target.value)} placeholder="e.g. DemoProvider" style={{ width: "100%" }} />
+          </FieldRow>
+          <FieldRow label="Type">
+            <select value={pType} onChange={(e) => setPType(e.target.value)} style={{ width: "100%" }}>
+              <option value="http_api">http_api</option>
+              <option value="local">local</option>
+            </select>
+          </FieldRow>
+          <FieldRow label="Supported kinds (comma-separated)">
+            <input value={pKinds} onChange={(e) => setPKinds(e.target.value)} placeholder="text2image,text2video" style={{ width: "100%" }} />
+          </FieldRow>
+          <FieldRow label="Base URL">
+            <input value={pBaseUrl} onChange={(e) => setPBaseUrl(e.target.value)} placeholder="http://example" style={{ width: "100%" }} />
+          </FieldRow>
+        </div>
+
+        <label style={{ display: "inline-flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+          <input type="checkbox" checked={pEnabled} onChange={(e) => setPEnabled(e.target.checked)} />
+          enabled
+        </label>
+
+        <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+          <button onClick={onCreateProvider} disabled={pLoading}>Create</button>
+          <button onClick={refreshProviders} disabled={pLoading}>Refresh</button>
+        </div>
+        {pErr ? <div style={{ color: "crimson", marginBottom: 8 }}>{pErr}</div> : null}
+
+        <div style={{ display: "grid", gap: 12 }}>
+          {pItems.map((p) => (
+            <div key={p.id} style={{ border: "1px solid #f0f0f0", borderRadius: 10, padding: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                <div style={{ fontWeight: 700 }}>{p.name}</div>
+                <div style={{ fontSize: 12, color: "#666" }}>{p.provider_type}</div>
+              </div>
+              <div style={{ fontSize: 12, color: "#666" }}>{p.id}</div>
+              <div style={{ marginTop: 8, fontSize: 12 }}>
+                kinds: {Array.isArray(p.supported_kinds) ? p.supported_kinds.join(", ") : ""}
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section style={{ border: "1px solid #eee", borderRadius: 12, padding: 16 }}>
+        <h2 style={{ margin: 0, marginBottom: 8 }}>Workflows</h2>
+        <div style={{ color: "#666", fontSize: 12, marginBottom: 12 }}>
+          total={wTotal} (showing up to 50)
+        </div>
+        <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+          <button onClick={onCreateWorkflow} disabled={wLoading}>Create demo</button>
+          <button onClick={refreshWorkflows} disabled={wLoading}>Refresh</button>
+        </div>
+        {wErr ? <div style={{ color: "crimson", marginBottom: 8 }}>{wErr}</div> : null}
+
+        <div style={{ display: "grid", gap: 12 }}>
+          {wItems.map((w) => (
+            <div key={w.id} style={{ border: "1px solid #f0f0f0", borderRadius: 10, padding: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                <div style={{ fontWeight: 700 }}>{w.name}</div>
+                <div style={{ fontSize: 12, color: "#666" }}>{w.workflow_type}</div>
+              </div>
+              <div style={{ fontSize: 12, color: "#666" }}>{w.id}</div>
+              <div style={{ marginTop: 8, fontSize: 12 }}>project_id: {w.project_id}</div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section style={{ border: "1px solid #eee", borderRadius: 12, padding: 16 }}>
+        <h2 style={{ margin: 0, marginBottom: 8 }}>Tools</h2>
+        <div style={{ color: "#666", fontSize: 12, marginBottom: 12 }}>
+          total={tTotal} (showing up to 50)
+        </div>
+        <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+          <button onClick={onCreateTool} disabled={tLoading}>Create demo</button>
+          <button onClick={refreshTools} disabled={tLoading}>Refresh</button>
+        </div>
+        {tErr ? <div style={{ color: "crimson", marginBottom: 8 }}>{tErr}</div> : null}
+
+        <div style={{ display: "grid", gap: 12 }}>
+          {tItems.map((t) => (
+            <div key={t.id} style={{ border: "1px solid #f0f0f0", borderRadius: 10, padding: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                <div style={{ fontWeight: 700 }}>{t.name}</div>
+                <div style={{ fontSize: 12, color: "#666" }}>{t.tool_type}</div>
+              </div>
+              <div style={{ fontSize: 12, color: "#666" }}>{t.id}</div>
+              <div style={{ marginTop: 8, fontSize: 12 }}>project_id: {t.project_id}</div>
+            </div>
+          ))}
+        </div>
+      </section>
+    </div>
+  );
+}

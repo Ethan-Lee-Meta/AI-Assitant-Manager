@@ -1,0 +1,417 @@
+#!/usr/bin/env bash
+set -u
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+echo "[info] repo_root=$repo_root"
+cd "$repo_root" || exit 1
+
+# ---------- files ----------
+mkdir -p apps/web/src/lib/api
+mkdir -p apps/web/src/ui/settings
+
+# providers client
+cat > apps/web/src/lib/api/providers.ts <<'TS'
+import { apiGet, apiPost } from "./client";
+
+export type Provider = {
+  id: string;
+  name: string;
+  provider_type: string;
+  supported_kinds: string[];
+  endpoint_config: Record<string, unknown>;
+  is_enabled: boolean;
+  created_at?: string;
+  updated_at?: string;
+  [k: string]: unknown;
+};
+
+export type ProviderListResponse = {
+  items: Provider[];
+  total: number;
+  page: number;
+  page_size: number;
+};
+
+export async function listProviders(params?: { q?: string; type?: string; enabled?: boolean; page?: number; page_size?: number }) {
+  const usp = new URLSearchParams();
+  if (params?.q) usp.set("q", params.q);
+  if (params?.type) usp.set("type", params.type);
+  if (typeof params?.enabled === "boolean") usp.set("enabled", String(params.enabled));
+  usp.set("page", String(params?.page ?? 1));
+  usp.set("page_size", String(params?.page_size ?? 50));
+  const qs = usp.toString();
+  return apiGet<ProviderListResponse>(`/api/providers${qs ? `?${qs}` : ""}`);
+}
+
+export async function createProvider(input: {
+  name: string;
+  provider_type: string;
+  supported_kinds: string[];
+  endpoint_config: Record<string, unknown>;
+  is_enabled: boolean;
+}) {
+  return apiPost<Provider>(`/api/providers`, input);
+}
+TS
+
+# workflows client
+cat > apps/web/src/lib/api/workflows.ts <<'TS'
+import { apiGet, apiPost } from "./client";
+
+export type Workflow = {
+  id: string;
+  project_id: string;
+  name: string;
+  workflow_type: string;
+  workflow_blob_asset_id?: string | null;
+  default_params?: Record<string, unknown> | null;
+  created_at?: string;
+  updated_at?: string;
+  [k: string]: unknown;
+};
+
+export type WorkflowListResponse = {
+  items: Workflow[];
+  total: number;
+  page: number;
+  page_size: number;
+};
+
+export async function listWorkflows(params?: { q?: string; type?: string; project_id?: string; page?: number; page_size?: number }) {
+  const usp = new URLSearchParams();
+  if (params?.q) usp.set("q", params.q);
+  if (params?.type) usp.set("type", params.type);
+  if (params?.project_id) usp.set("project_id", params.project_id);
+  usp.set("page", String(params?.page ?? 1));
+  usp.set("page_size", String(params?.page_size ?? 50));
+  const qs = usp.toString();
+  return apiGet<WorkflowListResponse>(`/api/workflows${qs ? `?${qs}` : ""}`);
+}
+
+export async function createWorkflow(input: {
+  project_id: string;
+  name: string;
+  workflow_type: string;
+  workflow_blob_asset_id?: string | null;
+  default_params?: Record<string, unknown> | null;
+}) {
+  return apiPost<Workflow>(`/api/workflows`, input);
+}
+TS
+
+# tools client
+cat > apps/web/src/lib/api/tools.ts <<'TS'
+import { apiGet, apiPost } from "./client";
+
+export type Tool = {
+  id: string;
+  project_id: string;
+  name: string;
+  tool_type: string;
+  config: Record<string, unknown>;
+  description?: string | null;
+  created_at?: string;
+  updated_at?: string;
+  [k: string]: unknown;
+};
+
+export type ToolListResponse = {
+  items: Tool[];
+  total: number;
+  page: number;
+  page_size: number;
+};
+
+export async function listTools(params?: { q?: string; type?: string; project_id?: string; page?: number; page_size?: number }) {
+  const usp = new URLSearchParams();
+  if (params?.q) usp.set("q", params.q);
+  if (params?.type) usp.set("type", params.type);
+  if (params?.project_id) usp.set("project_id", params.project_id);
+  usp.set("page", String(params?.page ?? 1));
+  usp.set("page_size", String(params?.page_size ?? 50));
+  const qs = usp.toString();
+  return apiGet<ToolListResponse>(`/api/tools${qs ? `?${qs}` : ""}`);
+}
+
+export async function createTool(input: {
+  project_id: string;
+  name: string;
+  tool_type: string;
+  config: Record<string, unknown>;
+  description?: string | null;
+}) {
+  return apiPost<Tool>(`/api/tools`, input);
+}
+TS
+
+# UI
+cat > apps/web/src/ui/settings/IntegrationsSettings.tsx <<'TSX'
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import { createProvider, listProviders, Provider } from "../../lib/api/providers";
+import { createWorkflow, listWorkflows, Workflow } from "../../lib/api/workflows";
+import { createTool, listTools, Tool } from "../../lib/api/tools";
+
+function safeJsonParse(s: string): { ok: true; value: any } | { ok: false; error: string } {
+  try {
+    return { ok: true, value: s.trim() ? JSON.parse(s) : {} };
+  } catch (e: any) {
+    return { ok: false, error: e?.message || "invalid json" };
+  }
+}
+
+export function IntegrationsSettings() {
+  // providers
+  const [providers, setProviders] = useState<Provider[]>([]);
+  const [pLoading, setPLoading] = useState(false);
+  const [pErr, setPErr] = useState<string | null>(null);
+
+  // workflows
+  const [workflows, setWorkflows] = useState<Workflow[]>([]);
+  const [wLoading, setWLoading] = useState(false);
+  const [wErr, setWErr] = useState<string | null>(null);
+
+  // tools
+  const [tools, setTools] = useState<Tool[]>([]);
+  const [tLoading, setTLoading] = useState(false);
+  const [tErr, setTErr] = useState<string | null>(null);
+
+  async function refreshProviders() {
+    setPLoading(true); setPErr(null);
+    try {
+      const r = await listProviders({ page: 1, page_size: 50 });
+      setProviders(r.items || []);
+    } catch (e: any) {
+      setPErr(e?.message || "failed to load providers");
+    } finally {
+      setPLoading(false);
+    }
+  }
+
+  async function refreshWorkflows() {
+    setWLoading(true); setWErr(null);
+    try {
+      const r = await listWorkflows({ page: 1, page_size: 50 });
+      setWorkflows(r.items || []);
+    } catch (e: any) {
+      setWErr(e?.message || "failed to load workflows");
+    } finally {
+      setWLoading(false);
+    }
+  }
+
+  async function refreshTools() {
+    setTLoading(true); setTErr(null);
+    try {
+      const r = await listTools({ page: 1, page_size: 50 });
+      setTools(r.items || []);
+    } catch (e: any) {
+      setTErr(e?.message || "failed to load tools");
+    } finally {
+      setTLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    refreshProviders();
+    refreshWorkflows();
+    refreshTools();
+  }, []);
+
+  // create forms
+  const [pName, setPName] = useState("DemoProvider");
+  const [pType, setPType] = useState("http_api");
+  const [pKinds, setPKinds] = useState("text2image,text2video");
+  const [pBaseUrl, setPBaseUrl] = useState("http://example");
+  const [pEnabled, setPEnabled] = useState(true);
+
+  const [wProjectId, setWProjectId] = useState("p_demo");
+  const [wName, setWName] = useState("WF1");
+  const [wType, setWType] = useState("comfyui_workflow");
+  const [wBlob, setWBlob] = useState("asset_wf_1");
+  const [wParams, setWParams] = useState('{"steps":20}');
+
+  const [tProjectId, setTProjectId] = useState("p_demo");
+  const [tName, setTName] = useState("Tool1");
+  const [tType, setTType] = useState("postprocess");
+  const [tCfg, setTCfg] = useState('{"strength":0.5}');
+  const [tDesc, setTDesc] = useState("demo");
+
+  const pKindsList = useMemo(() => pKinds.split(",").map(s => s.trim()).filter(Boolean), [pKinds]);
+
+  async function onCreateProvider() {
+    setPErr(null);
+    try {
+      await createProvider({
+        name: pName.trim(),
+        provider_type: pType.trim(),
+        supported_kinds: pKindsList,
+        endpoint_config: { base_url: pBaseUrl.trim() },
+        is_enabled: pEnabled,
+      });
+      await refreshProviders();
+    } catch (e: any) {
+      setPErr(e?.message || "create provider failed");
+    }
+  }
+
+  async function onCreateWorkflow() {
+    setWErr(null);
+    const parsed = safeJsonParse(wParams);
+    if (!parsed.ok) { setWErr(`default_params json error: ${parsed.error}`); return; }
+    try {
+      await createWorkflow({
+        project_id: wProjectId.trim(),
+        name: wName.trim(),
+        workflow_type: wType.trim(),
+        workflow_blob_asset_id: wBlob.trim() || null,
+        default_params: parsed.value,
+      });
+      await refreshWorkflows();
+    } catch (e: any) {
+      setWErr(e?.message || "create workflow failed");
+    }
+  }
+
+  async function onCreateTool() {
+    setTErr(null);
+    const parsed = safeJsonParse(tCfg);
+    if (!parsed.ok) { setTErr(`config json error: ${parsed.error}`); return; }
+    try {
+      await createTool({
+        project_id: tProjectId.trim(),
+        name: tName.trim(),
+        tool_type: tType.trim(),
+        config: parsed.value,
+        description: tDesc.trim(),
+      });
+      await refreshTools();
+    } catch (e: any) {
+      setTErr(e?.message || "create tool failed");
+    }
+  }
+
+  return (
+    <div style={{ padding: 16 }}>
+      <h1 style={{ fontSize: 20, fontWeight: 700 }}>Settings</h1>
+      <p style={{ marginTop: 8, opacity: 0.8 }}>
+        Manage Providers / Workflows / Tools (M07).
+      </p>
+
+      <hr style={{ margin: "16px 0" }} />
+
+      <section style={{ marginBottom: 20 }}>
+        <h2 style={{ fontSize: 16, fontWeight: 700 }}>Providers</h2>
+        {pErr ? <div style={{ marginTop: 8, color: "crimson" }}>{pErr}</div> : null}
+
+        <div style={{ display: "grid", gap: 8, gridTemplateColumns: "repeat(2, minmax(0, 1fr))", marginTop: 12 }}>
+          <label>Name<br /><input value={pName} onChange={e => setPName(e.target.value)} style={{ width: "100%" }} /></label>
+          <label>provider_type<br /><input value={pType} onChange={e => setPType(e.target.value)} style={{ width: "100%" }} /></label>
+          <label>supported_kinds (comma)<br /><input value={pKinds} onChange={e => setPKinds(e.target.value)} style={{ width: "100%" }} /></label>
+          <label>endpoint base_url<br /><input value={pBaseUrl} onChange={e => setPBaseUrl(e.target.value)} style={{ width: "100%" }} /></label>
+          <label style={{ gridColumn: "1 / -1" }}>
+            <input type="checkbox" checked={pEnabled} onChange={e => setPEnabled(e.target.checked)} /> enabled
+          </label>
+        </div>
+
+        <button onClick={onCreateProvider} style={{ marginTop: 10, padding: "6px 10px" }}>
+          Create Provider
+        </button>
+
+        <div style={{ marginTop: 12, opacity: 0.8 }}>{pLoading ? "Loading..." : `Count: ${providers.length}`}</div>
+        <ul style={{ marginTop: 8 }}>
+          {providers.map(p => (
+            <li key={p.id}>
+              <code>{p.name}</code> — {p.provider_type} — enabled={String(p.is_enabled)} — kinds=[{(p.supported_kinds || []).join(", ")}]
+            </li>
+          ))}
+        </ul>
+      </section>
+
+      <hr style={{ margin: "16px 0" }} />
+
+      <section style={{ marginBottom: 20 }}>
+        <h2 style={{ fontSize: 16, fontWeight: 700 }}>Workflows</h2>
+        {wErr ? <div style={{ marginTop: 8, color: "crimson" }}>{wErr}</div> : null}
+
+        <div style={{ display: "grid", gap: 8, gridTemplateColumns: "repeat(2, minmax(0, 1fr))", marginTop: 12 }}>
+          <label>project_id<br /><input value={wProjectId} onChange={e => setWProjectId(e.target.value)} style={{ width: "100%" }} /></label>
+          <label>name<br /><input value={wName} onChange={e => setWName(e.target.value)} style={{ width: "100%" }} /></label>
+          <label>workflow_type<br /><input value={wType} onChange={e => setWType(e.target.value)} style={{ width: "100%" }} /></label>
+          <label>workflow_blob_asset_id<br /><input value={wBlob} onChange={e => setWBlob(e.target.value)} style={{ width: "100%" }} /></label>
+          <label style={{ gridColumn: "1 / -1" }}>default_params (JSON)<br />
+            <textarea value={wParams} onChange={e => setWParams(e.target.value)} style={{ width: "100%", height: 80 }} />
+          </label>
+        </div>
+
+        <button onClick={onCreateWorkflow} style={{ marginTop: 10, padding: "6px 10px" }}>
+          Create Workflow
+        </button>
+
+        <div style={{ marginTop: 12, opacity: 0.8 }}>{wLoading ? "Loading..." : `Count: ${workflows.length}`}</div>
+        <ul style={{ marginTop: 8 }}>
+          {workflows.map(wf => (
+            <li key={wf.id}>
+              <code>{wf.name}</code> — {wf.workflow_type} — project={wf.project_id} — blob={String(wf.workflow_blob_asset_id || "")}
+            </li>
+          ))}
+        </ul>
+      </section>
+
+      <hr style={{ margin: "16px 0" }} />
+
+      <section style={{ marginBottom: 20 }}>
+        <h2 style={{ fontSize: 16, fontWeight: 700 }}>Tools</h2>
+        {tErr ? <div style={{ marginTop: 8, color: "crimson" }}>{tErr}</div> : null}
+
+        <div style={{ display: "grid", gap: 8, gridTemplateColumns: "repeat(2, minmax(0, 1fr))", marginTop: 12 }}>
+          <label>project_id<br /><input value={tProjectId} onChange={e => setTProjectId(e.target.value)} style={{ width: "100%" }} /></label>
+          <label>name<br /><input value={tName} onChange={e => setTName(e.target.value)} style={{ width: "100%" }} /></label>
+          <label>tool_type<br /><input value={tType} onChange={e => setTType(e.target.value)} style={{ width: "100%" }} /></label>
+          <label>description<br /><input value={tDesc} onChange={e => setTDesc(e.target.value)} style={{ width: "100%" }} /></label>
+          <label style={{ gridColumn: "1 / -1" }}>config (JSON)<br />
+            <textarea value={tCfg} onChange={e => setTCfg(e.target.value)} style={{ width: "100%", height: 80 }} />
+          </label>
+        </div>
+
+        <button onClick={onCreateTool} style={{ marginTop: 10, padding: "6px 10px" }}>
+          Create Tool
+        </button>
+
+        <div style={{ marginTop: 12, opacity: 0.8 }}>{tLoading ? "Loading..." : `Count: ${tools.length}`}</div>
+        <ul style={{ marginTop: 8 }}>
+          {tools.map(tl => (
+            <li key={tl.id}>
+              <code>{tl.name}</code> — {tl.tool_type} — project={tl.project_id}
+            </li>
+          ))}
+        </ul>
+      </section>
+    </div>
+  );
+}
+TSX
+
+# patch settings page to render IntegrationsSettings
+SETTINGS_PAGE="apps/web/app/(app)/settings/page.tsx"
+if [ -f "$SETTINGS_PAGE" ]; then
+  cp "$SETTINGS_PAGE" "$SETTINGS_PAGE.bak.$(date +%Y%m%d_%H%M%S)"
+  echo "[ok] backup: $SETTINGS_PAGE.bak.$(date +%Y%m%d_%H%M%S)"
+fi
+
+cat > "$SETTINGS_PAGE" <<'TSX'
+import { IntegrationsSettings } from "../../../src/ui/settings/IntegrationsSettings";
+
+export default function SettingsPage() {
+  return <IntegrationsSettings />;
+}
+TSX
+echo "[ok] wrote: $SETTINGS_PAGE"
+
+# build (won't exit terminal)
+echo "[info] running next build (won't exit terminal on failure)..."
+cd apps/web || exit 1
+npm run build
+rc=$?
+echo "[info] next build rc=$rc"
+exit 0

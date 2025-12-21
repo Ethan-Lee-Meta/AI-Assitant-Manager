@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -u
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+ts="$(date +%Y%m%d_%H%M%S)"
+cd "$repo_root" || exit 1
+
+f="apps/web/src/ui/settings/IntegrationsSettings.tsx"
+if [ ! -f "$f" ]; then
+  echo "[skip] $f not found; nothing to patch"
+  exit 0
+fi
+
+cp "$f" "${f}.bak.${ts}"
+echo "[ok] backup: ${f}.bak.${ts}"
+
+python - <<'PY'
+from __future__ import annotations
+from pathlib import Path
+import re
+
+p = Path("apps/web/src/ui/settings/IntegrationsSettings.tsx")
+s = p.read_text(encoding="utf-8")
+
+def fix_call(fn: str, s: str) -> str:
+    # handles: listXxx({ page: 1, page_size: 50 })
+    pat = re.compile(rf"{fn}\(\s*\{{\s*page\s*:\s*1\s*,\s*page_size\s*:\s*(\d+)\s*\}}\s*\)")
+    s2, n = pat.subn(lambda m: f"{fn}({{ limit: {m.group(1)}, offset: 0 }})", s)
+    return s2
+
+s2 = s
+for fn in ["listProviders", "listWorkflows", "listTools"]:
+    s2 = fix_call(fn, s2)
+
+if s2 == s:
+    # broader fallback: if someone wrote page/page_size with constants in different spacing
+    s2 = re.sub(r"page_size\s*:\s*50", "limit: 50, offset: 0", s2)
+    s2 = re.sub(r"page\s*:\s*1\s*,\s*limit:\s*50\s*,\s*offset:\s*0", "limit: 50, offset: 0", s2)
+
+p.write_text(s2, encoding="utf-8")
+print("[ok] patched IntegrationsSettings.tsx: page/page_size -> limit/offset (constants)")
+PY
+
+echo "[info] re-run next build (won't exit terminal on failure)"
+cd "$repo_root/apps/web" || exit 1
+npm run build
+rc=$?
+echo "[info] next build rc=$rc"
+exit 0
+BASH
+
+chmod +x ./tmp/M07_WEB_R2_FIX
+echo "[ok] wrote: ./tmp/M07_WEB_R2_FIX"

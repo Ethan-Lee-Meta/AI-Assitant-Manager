@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$repo_root"
+
+echo "[info] M07_WEB_R4_SMOKE starting..."
+echo "[info] repo_root=$repo_root"
+
+# --- detect FastAPI import path (best-effort) ---
+APP_IMPORT="$(
+python - <<'PY'
+import os, re, sys
+root = os.path.join("apps","api","src")
+pat = re.compile(r"\bapp\s*=\s*FastAPI\s*\(")
+for dp, _, fns in os.walk(root):
+    for fn in fns:
+        if not fn.endswith(".py"):
+            continue
+        p = os.path.join(dp, fn)
+        try:
+            txt = open(p, "r", encoding="utf-8").read()
+        except Exception:
+            continue
+        if "FastAPI(" in txt and pat.search(txt):
+            rel = os.path.relpath(p, root)
+            mod = rel[:-3].replace(os.sep, ".")
+            print(f"{mod}:app")
+            sys.exit(0)
+print("app.main:app")
+PY
+)"
+echo "[info] APP_IMPORT=$APP_IMPORT"
+
+# --- start api ---
+echo "[info] starting API on :7000 ..."
+(
+  cd apps/api
+  PYTHONPATH=./src python -m uvicorn "$APP_IMPORT" --host 127.0.0.1 --port 7000 --log-level warning
+) &
+API_PID=$!
+echo "[ok] api pid=$API_PID"
+
+# wait health
+for i in $(seq 1 40); do
+  if curl -fsS "http://localhost:7000/health" >/tmp/m07_health.json 2>/dev/null; then
+    echo "[ok] api /health: $(cat /tmp/m07_health.json)"
+    break
+  fi
+  sleep 0.2
+  if [ "$i" -eq 40 ]; then
+    echo "[fatal] api /health not ready"
+    kill "$API_PID" >/dev/null 2>&1 || true
+    exit 1
+  fi
+done
+
+# --- seed demo data (unique names) ---
+ts="$(date +%s)"
+prov_name="DemoProvider_$ts"
+wf_name="DemoWorkflow_$ts"
+tool_name="DemoTool_$ts"
+
+echo "[info] creating provider/workflow/tool seed..."
+
+curl -fsS -X POST "http://localhost:7000/api/providers" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"name\": \"${prov_name}\",
+    \"provider_type\": \"http_api\",
+    \"supported_kinds\": [\"text2image\",\"text2video\"],
+    \"endpoint_config\": {\"base_url\": \"http://example\"},
+    \"is_enabled\": true
+  }" >/tmp/m07_provider.json
+echo "[ok] provider created: $(python -c 'import json;print(json.load(open("/tmp/m07_provider.json"))["id"])')"
+
+curl -fsS -X POST "http://localhost:7000/api/workflows" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"project_id\": \"p_demo\",
+    \"name\": \"${wf_name}\",
+    \"workflow_type\": \"comfyui_workflow\",
+    \"workflow_blob_asset_id\": \"asset_wf_${ts}\",
+    \"default_params\": {\"steps\": 20}
+  }" >/tmp/m07_workflow.json
+echo "[ok] workflow created: $(python -c 'import json;print(json.load(open("/tmp/m07_workflow.json"))["id"])')"
+
+curl -fsS -X POST "http://localhost:7000/api/tools" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"project_id\": \"p_demo\",
+    \"name\": \"${tool_name}\",
+    \"tool_type\": \"postprocess\",
+    \"config\": {\"strength\": 0.5},
+    \"description\": \"demo\"
+  }" >/tmp/m07_tool.json
+echo "[ok] tool created: $(python -c 'import json;print(json.load(open("/tmp/m07_tool.json"))["id"])')"
+
+# --- list checks (contract: limit/offset) ---
+echo "[info] list providers..."
+curl -fsS "http://localhost:7000/api/providers?limit=50&offset=0" >/tmp/m07_providers_list.json
+python - <<'PY'
+import json
+j=json.load(open("/tmp/m07_providers_list.json"))
+print("[ok] providers total=", j.get("total"), "items=", len(j.get("items") or []))
+PY
+
+echo "[info] list workflows..."
+curl -fsS "http://localhost:7000/api/workflows?limit=50&offset=0" >/tmp/m07_workflows_list.json
+python - <<'PY'
+import json
+j=json.load(open("/tmp/m07_workflows_list.json"))
+print("[ok] workflows total=", j.get("total"), "items=", len(j.get("items") or []))
+PY
+
+echo "[info] list tools..."
+curl -fsS "http://localhost:7000/api/tools?limit=50&offset=0" >/tmp/m07_tools_list.json
+python - <<'PY'
+import json
+j=json.load(open("/tmp/m07_tools_list.json"))
+print("[ok] tools total=", j.get("total"), "items=", len(j.get("items") or []))
+PY
+
+echo "[info] stopping api..."
+kill "$API_PID" >/dev/null 2>&1 || true
+echo "[done] M07_WEB_R4_SMOKE OK"
+
+echo
+echo "NEXT (manual UI check):"
+echo "  1) start api + web"
+echo "  2) open http://localhost:2000/settings"
+echo "  3) you should see Providers / Workflows / Tools panels and the seed items"

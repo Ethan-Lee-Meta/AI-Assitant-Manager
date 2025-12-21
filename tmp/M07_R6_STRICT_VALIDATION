@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+set -u
+set -o pipefail
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+ts="$(date +%Y%m%d_%H%M%S)"
+echo "[info] M07_R6_STRICT_VALIDATION starting..."
+echo "[info] repo_root=$repo_root"
+cd "$repo_root"
+
+bak() { local f="$1"; [ -f "$f" ] && cp -f "$f" "$f.bak.$ts" && echo "[ok] backup: $f.bak.$ts" || true; }
+
+# -----------------------
+# 1) FRONTEND: remove fallback defaults + disable create when invalid
+# -----------------------
+ui="apps/web/src/ui/settings/IntegrationsSettings.tsx"
+bak "$ui"
+
+python - <<'PY'
+from pathlib import Path
+p = Path("apps/web/src/ui/settings/IntegrationsSettings.tsx")
+s = p.read_text(encoding="utf-8")
+
+# Remove fallback like: pName || "DemoProvider" etc (best-effort)
+s = s.replace('name: pName || "DemoProvider",', 'name: pName,')
+s = s.replace('provider_type: pType || "http_api",', 'provider_type: pType,')
+s = s.replace('endpoint_config: { base_url: pBaseUrl || "http://example" },', 'endpoint_config: { base_url: pBaseUrl },')
+
+s = s.replace('project_id: wProjectId || "p_demo",', 'project_id: wProjectId,')
+s = s.replace('name: wName || "WF1",', 'name: wName,')
+s = s.replace('workflow_type: wType || "comfyui_workflow",', 'workflow_type: wType,')
+
+s = s.replace('project_id: tProjectId || "p_demo",', 'project_id: tProjectId,')
+s = s.replace('name: tName || "Tool1",', 'name: tName,')
+s = s.replace('tool_type: tType || "postprocess",', 'tool_type: tType,')
+
+# Add api_key_env input to providers block (simple insert near base_url input)
+needle = 'FieldRow label="endpoint_config.base_url">'
+if needle in s and 'api_key_env' not in s:
+    s = s.replace(
+        needle,
+        'FieldRow label="endpoint_config.base_url">\n'
+    )
+    insert = '''
+            </FieldRow>
+            <FieldRow label="endpoint_config.api_key_env (recommended)">
+              <input value={(pApiKeyEnv ?? "")} onChange={(e) => setPApiKeyEnv(e.target.value)} style={{ width: "100%", padding: 8 }} />
+            </FieldRow>
+            <FieldRow label="endpoint_config.api_key (NOT recommended; plaintext)">
+              <input value={(pApiKey ?? "")} onChange={(e) => setPApiKey(e.target.value)} style={{ width: "100%", padding: 8 }} />
+'''
+    # We need to add states pApiKeyEnv/pApiKey.
+    # Insert state declarations after existing provider states.
+    if 'const [pBaseUrl' in s and 'pApiKeyEnv' not in s:
+        s = s.replace(
+            '  const [pBaseUrl, setPBaseUrl] = useState<string>("http://example");',
+            '  const [pBaseUrl, setPBaseUrl] = useState<string>("http://example");\n'
+            '  const [pApiKeyEnv, setPApiKeyEnv] = useState<string>("");\n'
+            '  const [pApiKey, setPApiKey] = useState<string>("");'
+        )
+    # Insert inputs after base_url FieldRow block
+    s = s.replace('</FieldRow>\n            <FieldRow label="endpoint_config.base_url">', '</FieldRow>\n            <FieldRow label="endpoint_config.base_url">')
+    # After base_url input FieldRow closing, append our insert
+    s = s.replace(
+        '              <input value={pBaseUrl} onChange={(e) => setPBaseUrl(e.target.value)} style={{ width: "100%", padding: 8 }} />\n            </FieldRow>',
+        '              <input value={pBaseUrl} onChange={(e) => setPBaseUrl(e.target.value)} style={{ width: "100%", padding: 8 }} />\n            </FieldRow>' + insert
+    )
+
+    # Include api_key/api_key_env in createProvider payload
+    s = s.replace(
+        'endpoint_config: { base_url: pBaseUrl },',
+        'endpoint_config: { base_url: pBaseUrl, api_key_env: (pApiKeyEnv || "").trim() || undefined, api_key: (pApiKey || "").trim() || undefined },'
+    )
+
+# Disable Create buttons when invalid (minimal checks)
+if 'const canCreateProvider' not in s:
+    s = s.replace(
+        '  useEffect(() => {',
+        '  const canCreateProvider = (pName || "").trim().length > 0 && (pType || "").trim().length > 0 && (pBaseUrl || "").trim().length > 0;\n'
+        '  const canCreateWorkflow = (wName || "").trim().length > 0 && (wType || "").trim().length > 0;\n'
+        '  const canCreateTool = (tName || "").trim().length > 0 && (tType || "").trim().length > 0;\n\n'
+        '  useEffect(() => {'
+    )
+
+s = s.replace('<button onClick={onCreateProvider}', '<button disabled={!canCreateProvider} onClick={onCreateProvider}')
+s = s.replace('<button onClick={onCreateWorkflow}', '<button disabled={!canCreateWorkflow} onClick={onCreateWorkflow}')
+s = s.replace('<button onClick={onCreateTool}', '<button disabled={!canCreateTool} onClick={onCreateTool}')
+
+p.write_text(s, encoding="utf-8")
+print("[ok] patched frontend IntegrationsSettings: removed fallbacks + added basic validation + api_key_env/api_key inputs (best-effort)")
+PY
+
+# -----------------------
+# 2) BACKEND: minimal DTO validations (best-effort, no contract field rename)
+# -----------------------
+# We patch providers/workflows/tools dto.py to enforce non-empty name/type and supported_kinds non-empty.
+# NOTE: This is heuristic; it will only touch common patterns "name: str" etc.
+
+patch_dto() {
+  local f="$1"
+  bak "$f"
+  python - <<PY
+from pathlib import Path
+import re
+p = Path("$f")
+s = p.read_text(encoding="utf-8")
+
+# Ensure Field is imported
+if "from pydantic import" in s and "Field" not in s:
+    s = re.sub(r"from pydantic import ([^\n]+)", lambda m: m.group(0) + ", Field", s, count=1)
+
+# Replace common fields in *Create models: name/provider_type/workflow_type/tool_type
+# non-empty constraint via Field(min_length=1)
+s = re.sub(r"(name:\s*)str(\s*=\s*[^\\n]+)?", r"\1str = Field(min_length=1)", s)
+s = re.sub(r"(provider_type:\s*)str(\s*=\s*[^\\n]+)?", r"\1str = Field(min_length=1)", s)
+s = re.sub(r"(workflow_type:\s*)str(\s*=\s*[^\\n]+)?", r"\1str = Field(min_length=1)", s)
+s = re.sub(r"(tool_type:\s*)str(\s*=\s*[^\\n]+)?", r"\1str = Field(min_length=1)", s)
+
+# supported_kinds: require at least 1 item if pattern matches List[str] / list[str]
+s = re.sub(r"(supported_kinds:\s*(?:List\[str\]|list\[str\]))(\s*=\s*[^\\n]+)?", r"\1 = Field(min_length=1)", s)
+
+p.write_text(s, encoding="utf-8")
+print(f"[ok] patched dto: {p}")
+PY
+}
+
+patch_dto "apps/api/src/app/modules/providers/dto.py"
+patch_dto "apps/api/src/app/modules/workflows/dto.py"
+patch_dto "apps/api/src/app/modules/tools/dto.py"
+
+# -----------------------
+# 3) TESTS + BUILD
+# -----------------------
+echo "[info] running backend tests..."
+cd "$repo_root/apps/api"
+PYTHONPATH=./src pytest -q
+rc=$?
+echo "[info] pytest rc=$rc"
+cd "$repo_root"
+
+echo "[info] running next build..."
+cd "$repo_root/apps/web"
+npm run build
+rc2=$?
+echo "[info] next build rc=$rc2"
+cd "$repo_root"
+
+if [ $rc -ne 0 ] || [ $rc2 -ne 0 ]; then
+  echo "[fail] tests/build failed"
+  exit 1
+fi
+
+echo "[done] M07_R6_STRICT_VALIDATION completed."

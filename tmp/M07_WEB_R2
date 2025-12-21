@@ -1,0 +1,716 @@
+#!/usr/bin/env bash
+set -u
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+ts="$(date +%Y%m%d_%H%M%S)"
+
+echo "[info] M07_WEB_R2 starting..."
+echo "[info] repo_root=$repo_root"
+cd "$repo_root" || exit 1
+
+# -------- dirs --------
+mkdir -p "apps/web/src/lib/api"
+mkdir -p "apps/web/src/ui/settings"
+mkdir -p "apps/web/app/(app)/settings"
+
+# -------- API clients --------
+cat > "apps/web/src/lib/api/providers.ts" <<'TS'
+import { apiFetch } from "./client";
+
+export type Provider = {
+  id: string;
+  name: string;
+  provider_type: string;
+  supported_kinds: string[];
+  endpoint_config?: Record<string, any> | null;
+  is_enabled: boolean;
+  archived_at?: string | null;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type ListResponse<T> = {
+  items: T[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
+export async function listProviders(params?: {
+  q?: string;
+  archived?: boolean;
+  limit?: number;
+  offset?: number;
+  sort?: string;
+}): Promise<ListResponse<Provider>> {
+  const q = params?.q ? `&q=${encodeURIComponent(params.q)}` : "";
+  const archived = typeof params?.archived === "boolean" ? `&archived=${params.archived ? "true" : "false"}` : "";
+  const limit = `&limit=${params?.limit ?? 50}`;
+  const offset = `&offset=${params?.offset ?? 0}`;
+  const sort = `&sort=${encodeURIComponent(params?.sort ?? "created_at:desc")}`;
+  return apiFetch<ListResponse<Provider>>(`/api/providers?${q}${archived}${limit}${offset}${sort}`.replace("?&", "?"));
+}
+
+export async function createProvider(body: {
+  name: string;
+  provider_type: string;
+  supported_kinds: string[];
+  endpoint_config?: Record<string, any> | null;
+  is_enabled?: boolean;
+}): Promise<Provider> {
+  return apiFetch<Provider>("/api/providers", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function updateProvider(id: string, patch: Partial<Provider>): Promise<Provider> {
+  return apiFetch<Provider>(`/api/providers/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+}
+TS
+
+cat > "apps/web/src/lib/api/workflows.ts" <<'TS'
+import { apiFetch } from "./client";
+
+export type Workflow = {
+  id: string;
+  project_id: string;
+  name: string;
+  workflow_type: string;
+  workflow_blob_asset_id?: string | null;
+  default_params?: Record<string, any> | null;
+  is_enabled?: boolean;
+  archived_at?: string | null;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type ListResponse<T> = {
+  items: T[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
+export async function listWorkflows(params?: {
+  q?: string;
+  project_id?: string;
+  archived?: boolean;
+  limit?: number;
+  offset?: number;
+  sort?: string;
+}): Promise<ListResponse<Workflow>> {
+  const q = params?.q ? `&q=${encodeURIComponent(params.q)}` : "";
+  const project = params?.project_id ? `&project_id=${encodeURIComponent(params.project_id)}` : "";
+  const archived = typeof params?.archived === "boolean" ? `&archived=${params.archived ? "true" : "false"}` : "";
+  const limit = `&limit=${params?.limit ?? 50}`;
+  const offset = `&offset=${params?.offset ?? 0}`;
+  const sort = `&sort=${encodeURIComponent(params?.sort ?? "created_at:desc")}`;
+  return apiFetch<ListResponse<Workflow>>(`/api/workflows?${q}${project}${archived}${limit}${offset}${sort}`.replace("?&", "?"));
+}
+
+export async function createWorkflow(body: {
+  project_id: string;
+  name: string;
+  workflow_type: string;
+  workflow_blob_asset_id?: string | null;
+  default_params?: Record<string, any> | null;
+}): Promise<Workflow> {
+  return apiFetch<Workflow>("/api/workflows", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function updateWorkflow(id: string, patch: Partial<Workflow>): Promise<Workflow> {
+  return apiFetch<Workflow>(`/api/workflows/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+}
+TS
+
+cat > "apps/web/src/lib/api/tools.ts" <<'TS'
+import { apiFetch } from "./client";
+
+export type Tool = {
+  id: string;
+  project_id: string;
+  name: string;
+  tool_type: string;
+  description?: string | null;
+  config?: Record<string, any> | null;
+  is_enabled?: boolean;
+  archived_at?: string | null;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type ListResponse<T> = {
+  items: T[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
+export async function listTools(params?: {
+  q?: string;
+  project_id?: string;
+  archived?: boolean;
+  limit?: number;
+  offset?: number;
+  sort?: string;
+}): Promise<ListResponse<Tool>> {
+  const q = params?.q ? `&q=${encodeURIComponent(params.q)}` : "";
+  const project = params?.project_id ? `&project_id=${encodeURIComponent(params.project_id)}` : "";
+  const archived = typeof params?.archived === "boolean" ? `&archived=${params.archived ? "true" : "false"}` : "";
+  const limit = `&limit=${params?.limit ?? 50}`;
+  const offset = `&offset=${params?.offset ?? 0}`;
+  const sort = `&sort=${encodeURIComponent(params?.sort ?? "created_at:desc")}`;
+  return apiFetch<ListResponse<Tool>>(`/api/tools?${q}${project}${archived}${limit}${offset}${sort}`.replace("?&", "?"));
+}
+
+export async function createTool(body: {
+  project_id: string;
+  name: string;
+  tool_type: string;
+  description?: string | null;
+  config?: Record<string, any> | null;
+}): Promise<Tool> {
+  return apiFetch<Tool>("/api/tools", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function updateTool(id: string, patch: Partial<Tool>): Promise<Tool> {
+  return apiFetch<Tool>(`/api/tools/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+}
+TS
+
+# -------- UI panels --------
+cat > "apps/web/src/ui/settings/ProvidersPanel.tsx" <<'TSX'
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import { Provider, createProvider, listProviders, updateProvider } from "../../lib/api/providers";
+
+function parseJsonOrNull(s: string): Record<string, any> | null {
+  const t = (s || "").trim();
+  if (!t) return null;
+  return JSON.parse(t);
+}
+
+export function ProvidersPanel() {
+  const [items, setItems] = useState<Provider[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const [name, setName] = useState("DemoProvider");
+  const [providerType, setProviderType] = useState("http_api");
+  const [supportedKinds, setSupportedKinds] = useState("text2image,text2video");
+  const [endpointConfig, setEndpointConfig] = useState('{"base_url":"http://example"}');
+  const [isEnabled, setIsEnabled] = useState(true);
+
+  const kinds = useMemo(() => {
+    return supportedKinds
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
+  }, [supportedKinds]);
+
+  async function refresh() {
+    setLoading(true);
+    setErr(null);
+    try {
+      const r = await listProviders({ limit: 50, offset: 0, archived: false });
+      setItems(r.items || []);
+    } catch (e: any) {
+      setErr(e?.message || "Failed to load providers");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    refresh();
+  }, []);
+
+  async function onCreate() {
+    setLoading(true);
+    setErr(null);
+    try {
+      const cfg = parseJsonOrNull(endpointConfig);
+      await createProvider({
+        name,
+        provider_type: providerType,
+        supported_kinds: kinds,
+        endpoint_config: cfg,
+        is_enabled: isEnabled,
+      });
+      await refresh();
+    } catch (e: any) {
+      setErr(e?.message || "Create failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function onToggle(p: Provider) {
+    setLoading(true);
+    setErr(null);
+    try {
+      await updateProvider(p.id, { is_enabled: !p.is_enabled });
+      await refresh();
+    } catch (e: any) {
+      setErr(e?.message || "Update failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function onArchive(p: Provider) {
+    setLoading(true);
+    setErr(null);
+    try {
+      await updateProvider(p.id, { archived_at: new Date().toISOString() } as any);
+      await refresh();
+    } catch (e: any) {
+      setErr(e?.message || "Archive failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="rounded border p-3">
+        <div className="font-medium">Create Provider</div>
+        <div className="mt-2 grid grid-cols-1 gap-2 md:grid-cols-2">
+          <label className="text-sm">
+            <div className="mb-1 text-xs opacity-70">name</div>
+            <input className="w-full rounded border px-2 py-1" value={name} onChange={(e) => setName(e.target.value)} />
+          </label>
+          <label className="text-sm">
+            <div className="mb-1 text-xs opacity-70">provider_type</div>
+            <input className="w-full rounded border px-2 py-1" value={providerType} onChange={(e) => setProviderType(e.target.value)} />
+          </label>
+          <label className="text-sm md:col-span-2">
+            <div className="mb-1 text-xs opacity-70">supported_kinds (comma-separated)</div>
+            <input className="w-full rounded border px-2 py-1" value={supportedKinds} onChange={(e) => setSupportedKinds(e.target.value)} />
+          </label>
+          <label className="text-sm md:col-span-2">
+            <div className="mb-1 text-xs opacity-70">endpoint_config (JSON)</div>
+            <textarea className="w-full rounded border px-2 py-1 font-mono text-xs" rows={3} value={endpointConfig} onChange={(e) => setEndpointConfig(e.target.value)} />
+          </label>
+          <label className="flex items-center gap-2 text-sm">
+            <input type="checkbox" checked={isEnabled} onChange={(e) => setIsEnabled(e.target.checked)} />
+            is_enabled
+          </label>
+        </div>
+        <div className="mt-3 flex gap-2">
+          <button className="rounded bg-black px-3 py-1 text-white disabled:opacity-50" onClick={onCreate} disabled={loading}>
+            Create
+          </button>
+          <button className="rounded border px-3 py-1 disabled:opacity-50" onClick={refresh} disabled={loading}>
+            Refresh
+          </button>
+        </div>
+        {err ? <div className="mt-2 text-sm text-red-600">{err}</div> : null}
+      </div>
+
+      <div className="rounded border p-3">
+        <div className="flex items-center justify-between">
+          <div className="font-medium">Providers</div>
+          <div className="text-sm opacity-70">{loading ? "Loading..." : `${items.length} items`}</div>
+        </div>
+        <div className="mt-2 space-y-2">
+          {items.map((p) => (
+            <div key={p.id} className="flex items-center justify-between rounded border p-2">
+              <div className="min-w-0">
+                <div className="truncate font-mono text-xs opacity-70">{p.id}</div>
+                <div className="truncate">{p.name}</div>
+                <div className="text-xs opacity-70">
+                  type={p.provider_type} enabled={String(p.is_enabled)} kinds={Array.isArray(p.supported_kinds) ? p.supported_kinds.join(",") : ""}
+                </div>
+              </div>
+              <div className="ml-2 flex shrink-0 gap-2">
+                <button className="rounded border px-2 py-1 text-sm disabled:opacity-50" onClick={() => onToggle(p)} disabled={loading}>
+                  Toggle
+                </button>
+                <button className="rounded border px-2 py-1 text-sm disabled:opacity-50" onClick={() => onArchive(p)} disabled={loading}>
+                  Archive
+                </button>
+              </div>
+            </div>
+          ))}
+          {items.length === 0 && !loading ? <div className="text-sm opacity-70">No providers yet.</div> : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+TSX
+
+cat > "apps/web/src/ui/settings/WorkflowsPanel.tsx" <<'TSX'
+"use client";
+
+import { useEffect, useState } from "react";
+import { Workflow, createWorkflow, listWorkflows, updateWorkflow } from "../../lib/api/workflows";
+
+function parseJsonOrNull(s: string): Record<string, any> | null {
+  const t = (s || "").trim();
+  if (!t) return null;
+  return JSON.parse(t);
+}
+
+export function WorkflowsPanel() {
+  const [items, setItems] = useState<Workflow[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const [projectId, setProjectId] = useState("p_demo");
+  const [name, setName] = useState("WF1");
+  const [workflowType, setWorkflowType] = useState("comfyui_workflow");
+  const [workflowBlobAssetId, setWorkflowBlobAssetId] = useState("asset_wf_1");
+  const [defaultParams, setDefaultParams] = useState('{"steps":20}');
+
+  async function refresh() {
+    setLoading(true);
+    setErr(null);
+    try {
+      const r = await listWorkflows({ limit: 50, offset: 0, archived: false });
+      setItems(r.items || []);
+    } catch (e: any) {
+      setErr(e?.message || "Failed to load workflows");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    refresh();
+  }, []);
+
+  async function onCreate() {
+    setLoading(true);
+    setErr(null);
+    try {
+      const dp = parseJsonOrNull(defaultParams);
+      await createWorkflow({
+        project_id: projectId,
+        name,
+        workflow_type: workflowType,
+        workflow_blob_asset_id: workflowBlobAssetId || null,
+        default_params: dp,
+      });
+      await refresh();
+    } catch (e: any) {
+      setErr(e?.message || "Create failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function onArchive(w: Workflow) {
+    setLoading(true);
+    setErr(null);
+    try {
+      await updateWorkflow(w.id, { archived_at: new Date().toISOString() } as any);
+      await refresh();
+    } catch (e: any) {
+      setErr(e?.message || "Archive failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="rounded border p-3">
+        <div className="font-medium">Create Workflow</div>
+        <div className="mt-2 grid grid-cols-1 gap-2 md:grid-cols-2">
+          <label className="text-sm">
+            <div className="mb-1 text-xs opacity-70">project_id</div>
+            <input className="w-full rounded border px-2 py-1" value={projectId} onChange={(e) => setProjectId(e.target.value)} />
+          </label>
+          <label className="text-sm">
+            <div className="mb-1 text-xs opacity-70">name</div>
+            <input className="w-full rounded border px-2 py-1" value={name} onChange={(e) => setName(e.target.value)} />
+          </label>
+          <label className="text-sm">
+            <div className="mb-1 text-xs opacity-70">workflow_type</div>
+            <input className="w-full rounded border px-2 py-1" value={workflowType} onChange={(e) => setWorkflowType(e.target.value)} />
+          </label>
+          <label className="text-sm">
+            <div className="mb-1 text-xs opacity-70">workflow_blob_asset_id</div>
+            <input className="w-full rounded border px-2 py-1" value={workflowBlobAssetId} onChange={(e) => setWorkflowBlobAssetId(e.target.value)} />
+          </label>
+          <label className="text-sm md:col-span-2">
+            <div className="mb-1 text-xs opacity-70">default_params (JSON)</div>
+            <textarea className="w-full rounded border px-2 py-1 font-mono text-xs" rows={3} value={defaultParams} onChange={(e) => setDefaultParams(e.target.value)} />
+          </label>
+        </div>
+        <div className="mt-3 flex gap-2">
+          <button className="rounded bg-black px-3 py-1 text-white disabled:opacity-50" onClick={onCreate} disabled={loading}>
+            Create
+          </button>
+          <button className="rounded border px-3 py-1 disabled:opacity-50" onClick={refresh} disabled={loading}>
+            Refresh
+          </button>
+        </div>
+        {err ? <div className="mt-2 text-sm text-red-600">{err}</div> : null}
+      </div>
+
+      <div className="rounded border p-3">
+        <div className="flex items-center justify-between">
+          <div className="font-medium">Workflows</div>
+          <div className="text-sm opacity-70">{loading ? "Loading..." : `${items.length} items`}</div>
+        </div>
+        <div className="mt-2 space-y-2">
+          {items.map((w) => (
+            <div key={w.id} className="flex items-center justify-between rounded border p-2">
+              <div className="min-w-0">
+                <div className="truncate font-mono text-xs opacity-70">{w.id}</div>
+                <div className="truncate">{w.name}</div>
+                <div className="text-xs opacity-70">project={w.project_id} type={w.workflow_type}</div>
+              </div>
+              <div className="ml-2 flex shrink-0 gap-2">
+                <button className="rounded border px-2 py-1 text-sm disabled:opacity-50" onClick={() => onArchive(w)} disabled={loading}>
+                  Archive
+                </button>
+              </div>
+            </div>
+          ))}
+          {items.length === 0 && !loading ? <div className="text-sm opacity-70">No workflows yet.</div> : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+TSX
+
+cat > "apps/web/src/ui/settings/ToolsPanel.tsx" <<'TSX'
+"use client";
+
+import { useEffect, useState } from "react";
+import { Tool, createTool, listTools, updateTool } from "../../lib/api/tools";
+
+function parseJsonOrNull(s: string): Record<string, any> | null {
+  const t = (s || "").trim();
+  if (!t) return null;
+  return JSON.parse(t);
+}
+
+export function ToolsPanel() {
+  const [items, setItems] = useState<Tool[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const [projectId, setProjectId] = useState("p_demo");
+  const [name, setName] = useState("Tool1");
+  const [toolType, setToolType] = useState("postprocess");
+  const [description, setDescription] = useState("demo");
+  const [config, setConfig] = useState('{"strength":0.5}');
+
+  async function refresh() {
+    setLoading(true);
+    setErr(null);
+    try {
+      const r = await listTools({ limit: 50, offset: 0, archived: false });
+      setItems(r.items || []);
+    } catch (e: any) {
+      setErr(e?.message || "Failed to load tools");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    refresh();
+  }, []);
+
+  async function onCreate() {
+    setLoading(true);
+    setErr(null);
+    try {
+      const cfg = parseJsonOrNull(config);
+      await createTool({
+        project_id: projectId,
+        name,
+        tool_type: toolType,
+        description: description || null,
+        config: cfg,
+      });
+      await refresh();
+    } catch (e: any) {
+      setErr(e?.message || "Create failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function onArchive(t: Tool) {
+    setLoading(true);
+    setErr(null);
+    try {
+      await updateTool(t.id, { archived_at: new Date().toISOString() } as any);
+      await refresh();
+    } catch (e: any) {
+      setErr(e?.message || "Archive failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="rounded border p-3">
+        <div className="font-medium">Create Tool</div>
+        <div className="mt-2 grid grid-cols-1 gap-2 md:grid-cols-2">
+          <label className="text-sm">
+            <div className="mb-1 text-xs opacity-70">project_id</div>
+            <input className="w-full rounded border px-2 py-1" value={projectId} onChange={(e) => setProjectId(e.target.value)} />
+          </label>
+          <label className="text-sm">
+            <div className="mb-1 text-xs opacity-70">name</div>
+            <input className="w-full rounded border px-2 py-1" value={name} onChange={(e) => setName(e.target.value)} />
+          </label>
+          <label className="text-sm">
+            <div className="mb-1 text-xs opacity-70">tool_type</div>
+            <input className="w-full rounded border px-2 py-1" value={toolType} onChange={(e) => setToolType(e.target.value)} />
+          </label>
+          <label className="text-sm">
+            <div className="mb-1 text-xs opacity-70">description</div>
+            <input className="w-full rounded border px-2 py-1" value={description} onChange={(e) => setDescription(e.target.value)} />
+          </label>
+          <label className="text-sm md:col-span-2">
+            <div className="mb-1 text-xs opacity-70">config (JSON)</div>
+            <textarea className="w-full rounded border px-2 py-1 font-mono text-xs" rows={3} value={config} onChange={(e) => setConfig(e.target.value)} />
+          </label>
+        </div>
+        <div className="mt-3 flex gap-2">
+          <button className="rounded bg-black px-3 py-1 text-white disabled:opacity-50" onClick={onCreate} disabled={loading}>
+            Create
+          </button>
+          <button className="rounded border px-3 py-1 disabled:opacity-50" onClick={refresh} disabled={loading}>
+            Refresh
+          </button>
+        </div>
+        {err ? <div className="mt-2 text-sm text-red-600">{err}</div> : null}
+      </div>
+
+      <div className="rounded border p-3">
+        <div className="flex items-center justify-between">
+          <div className="font-medium">Tools</div>
+          <div className="text-sm opacity-70">{loading ? "Loading..." : `${items.length} items`}</div>
+        </div>
+        <div className="mt-2 space-y-2">
+          {items.map((t) => (
+            <div key={t.id} className="flex items-center justify-between rounded border p-2">
+              <div className="min-w-0">
+                <div className="truncate font-mono text-xs opacity-70">{t.id}</div>
+                <div className="truncate">{t.name}</div>
+                <div className="text-xs opacity-70">project={t.project_id} type={t.tool_type}</div>
+              </div>
+              <div className="ml-2 flex shrink-0 gap-2">
+                <button className="rounded border px-2 py-1 text-sm disabled:opacity-50" onClick={() => onArchive(t)} disabled={loading}>
+                  Archive
+                </button>
+              </div>
+            </div>
+          ))}
+          {items.length === 0 && !loading ? <div className="text-sm opacity-70">No tools yet.</div> : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+TSX
+
+# -------- Settings page (tabs) --------
+settings_page="apps/web/app/(app)/settings/page.tsx"
+if [ -f "$settings_page" ]; then
+  cp "$settings_page" "${settings_page}.bak.${ts}"
+  echo "[ok] backup: ${settings_page}.bak.${ts}"
+fi
+
+cat > "$settings_page" <<'TSX'
+"use client";
+
+import { useMemo, useState } from "react";
+import { ProvidersPanel } from "../../../src/ui/settings/ProvidersPanel";
+import { WorkflowsPanel } from "../../../src/ui/settings/WorkflowsPanel";
+import { ToolsPanel } from "../../../src/ui/settings/ToolsPanel";
+
+type TabKey = "providers" | "workflows" | "tools";
+
+export default function SettingsPage() {
+  const tabs = useMemo(() => {
+    return [
+      { key: "providers" as const, label: "Providers" },
+      { key: "workflows" as const, label: "Workflows" },
+      { key: "tools" as const, label: "Tools" },
+    ];
+  }, []);
+
+  const [tab, setTab] = useState<TabKey>("providers");
+
+  return (
+    <div className="p-4 space-y-4">
+      <div>
+        <div className="text-xl font-semibold">Settings</div>
+        <div className="text-sm opacity-70">Manage Providers / Workflows / Tools (M07)</div>
+      </div>
+
+      <div className="flex gap-2 border-b pb-2">
+        {tabs.map((t) => (
+          <button
+            key={t.key}
+            className={`rounded px-3 py-1 text-sm border ${tab === t.key ? "bg-black text-white" : "bg-white"}`}
+            onClick={() => setTab(t.key)}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {tab === "providers" ? <ProvidersPanel /> : null}
+      {tab === "workflows" ? <WorkflowsPanel /> : null}
+      {tab === "tools" ? <ToolsPanel /> : null}
+    </div>
+  );
+}
+TSX
+echo "[ok] wrote: $settings_page"
+
+# -------- build gate --------
+echo "[info] running next build (won't exit terminal on failure)"
+cd "$repo_root/apps/web" || exit 1
+npm ci 2>/dev/null || npm install
+npm run build
+rc=$?
+echo "[info] next build rc=$rc"
+
+if [ $rc -ne 0 ]; then
+  echo "[warn] next build failed. check output above."
+fi
+
+echo "[done] M07_WEB_R2 completed."
+exit 0
+BASH
+
+chmod +x ./tmp/M07_WEB_R2
+echo "[ok] wrote: ./tmp/M07_WEB_R2"

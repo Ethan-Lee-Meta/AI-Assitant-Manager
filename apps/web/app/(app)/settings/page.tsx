@@ -1,10 +1,14 @@
+import { IntegrationsSettings } from "../../../src/ui/settings/IntegrationsSettings";
+
 export default function SettingsPage() {
   return (
-    <div style={{ padding: 16 }}>
-      <h1 style={{ margin: "0 0 8px 0" }}>Settings</h1>
-      <div style={{ color: "#555" }}>
-        Placeholder (M00-C). No business logic / no API calls here.
-      </div>
+    <div style={{ padding: 24 }}>
+      <h1 style={{ fontSize: 32, fontWeight: 700, marginBottom: 8 }}>Settings</h1>
+      <p style={{ marginBottom: 16, color: "#555" }}>
+        Manage Providers / Workflows / Tools (M07).
+      </p>
+
+      <IntegrationsSettings />
     </div>
   );
 }

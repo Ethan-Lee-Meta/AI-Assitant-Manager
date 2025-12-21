@@ -1,0 +1,45 @@
+"use client";
+
+import { useMemo, useState } from "react";
+import { ProvidersPanel } from "../../../src/ui/settings/ProvidersPanel";
+import { WorkflowsPanel } from "../../../src/ui/settings/WorkflowsPanel";
+import { ToolsPanel } from "../../../src/ui/settings/ToolsPanel";
+
+type TabKey = "providers" | "workflows" | "tools";
+
+export default function SettingsPage() {
+  const tabs = useMemo(() => {
+    return [
+      { key: "providers" as const, label: "Providers" },
+      { key: "workflows" as const, label: "Workflows" },
+      { key: "tools" as const, label: "Tools" },
+    ];
+  }, []);
+
+  const [tab, setTab] = useState<TabKey>("providers");
+
+  return (
+    <div className="p-4 space-y-4">
+      <div>
+        <div className="text-xl font-semibold">Settings</div>
+        <div className="text-sm opacity-70">Manage Providers / Workflows / Tools (M07)</div>
+      </div>
+
+      <div className="flex gap-2 border-b pb-2">
+        {tabs.map((t) => (
+          <button
+            key={t.key}
+            className={`rounded px-3 py-1 text-sm border ${tab === t.key ? "bg-black text-white" : "bg-white"}`}
+            onClick={() => setTab(t.key)}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {tab === "providers" ? <ProvidersPanel /> : null}
+      {tab === "workflows" ? <WorkflowsPanel /> : null}
+      {tab === "tools" ? <ToolsPanel /> : null}
+    </div>
+  );
+}

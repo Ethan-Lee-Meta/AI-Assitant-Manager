@@ -19,7 +19,7 @@ def get_workflow(workflow_id: str):
 @router.patch("/{workflow_id}", response_model=Workflow)
 def update_workflow(workflow_id: str, body: WorkflowUpdate):
     try:
-        return store.update(workflow_id, {k: v for k, v in body.model_dump().items() if v is not None})
+        return store.update(workflow_id, body.model_dump(exclude_unset=True))
     except KeyError:
         raise HTTPException(status_code=404, detail="Workflow not found")
 

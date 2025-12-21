@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -u
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$repo_root" || { echo "[fatal] cannot cd repo_root=$repo_root"; exit 1; }
+
+echo "[info] M07_WEB_R3_FIX_DOLLAR_VAR starting..."
+echo "[info] repo_root=$repo_root"
+
+python - <<'PY'
+from __future__ import annotations
+from pathlib import Path
+import re, time
+
+FILES = [
+    Path("apps/web/src/lib/api/providers.ts"),
+    Path("apps/web/src/lib/api/workflows.ts"),
+    Path("apps/web/src/lib/api/tools.ts"),
+]
+
+pat = re.compile(r"\$\{\$([A-Za-z_]\w*)\}")
+
+for p in FILES:
+    if not p.exists():
+        print(f"[skip] missing: {p}")
+        continue
+    s = p.read_text(encoding="utf-8")
+    if not pat.search(s):
+        print(f"[skip] no '${{$var}}' pattern found: {p}")
+        continue
+
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    bak = p.with_name(p.name + f".bak.{ts}")
+    bak.write_text(s, encoding="utf-8")
+    print(f"[ok] backup: {bak}")
+
+    s2 = pat.sub(r"${\1}", s)
+    p.write_text(s2, encoding="utf-8")
+    print(f"[ok] patched: {p} (replaced '${{$var}}' -> '${{var}}')")
+PY
+
+echo "[info] re-run next build (won't exit terminal on failure)"
+cd apps/web || { echo "[fatal] missing apps/web"; exit 1; }
+npm run build
+rc=$?
+echo "[info] next build rc=$rc"
+exit $rc

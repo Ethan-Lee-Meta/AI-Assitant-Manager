@@ -1,0 +1,45 @@
+import { apiGet, apiPost } from "./client";
+
+export type Tool = {
+  id: string;
+  project_id: string;
+  name: string;
+  tool_type: string;
+  config?: Record<string, unknown> | null;
+  description?: string | null;
+  archived: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ToolCreate = {
+  project_id: string;
+  name: string;
+  tool_type: string;
+  config?: Record<string, unknown> | null;
+  description?: string | null;
+};
+
+export type ListResponse<T> = { total: number; items: T[] };
+
+export async function listTools(params?: {
+  q?: string;
+  archived?: boolean;
+  limit?: number;
+  offset?: number;
+  sort?: string;
+}): Promise<ListResponse<Tool>> {
+  const sp = new URLSearchParams();
+  if (params?.q) sp.set("q", params.q);
+  if (typeof params?.archived === "boolean") sp.set("archived", String(params.archived));
+  if (typeof params?.limit === "number") sp.set("limit", String(params.limit));
+  if (typeof params?.offset === "number") sp.set("offset", String(params.offset));
+  if (params?.sort) sp.set("sort", params.sort);
+
+  const qs = sp.toString();
+  return apiGet<ListResponse<Tool>>(`/api/tools${qs ? `?${qs}` : ""}`);
+}
+
+export async function createTool(body: ToolCreate): Promise<Tool> {
+  return apiPost<Tool>("/api/tools", body);
+}

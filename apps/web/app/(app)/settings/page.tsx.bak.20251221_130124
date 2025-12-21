@@ -1,0 +1,13 @@
+import { IntegrationsSettings } from "../../../src/ui/settings/IntegrationsSettings";
+
+export default function SettingsPage() {
+  return (
+    <div style={ padding: 24 }>
+      <h1 style={ fontSize: 32, fontWeight: 700, marginBottom: 8 }>Settings</h1>
+      <p style={ marginBottom: 16, color: "#555" }>
+        Manage Providers / Workflows / Tools (M07).
+      </p>
+      <IntegrationsSettings />
+    </div>
+  );
+}

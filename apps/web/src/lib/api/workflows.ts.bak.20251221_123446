@@ -1,0 +1,57 @@
+import { apiFetch, apiGet, apiPost } from "./client";
+
+export type Workflow = {
+  id: string;
+  project_id: string;
+  name: string;
+  workflow_type: string;
+  workflow_blob_asset_id?: string | null;
+  default_params?: Record<string, unknown> | null;
+  archived: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+export type WorkflowCreate = {
+  project_id: string;
+  name: string;
+  workflow_type: string;
+  workflow_blob_asset_id?: string | null;
+  default_params?: Record<string, unknown> | null;
+};
+
+export type ListResponse<T> = { total: number; items: T[] };
+
+export async function listWorkflows(params?: {
+  q?: string;
+  archived?: boolean;
+  limit?: number;
+  offset?: number;
+  sort?: string;
+}): Promise<ListResponse<Workflow>> {
+  const sp = new URLSearchParams();
+  if (params?.q) sp.set("q", params.q);
+  if (typeof params?.archived === "boolean") sp.set("archived", String(params.archived));
+  if (typeof params?.limit === "number") sp.set("limit", String(params.limit));
+  if (typeof params?.offset === "number") sp.set("offset", String(params.offset));
+  if (params?.sort) sp.set("sort", params.sort);
+
+  const qs = sp.toString();
+  return apiGet<ListResponse<Workflow>>(`/api/workflows${qs ? `?${qs}` : ""}`);
+}
+
+export async function createWorkflow(body: WorkflowCreate): Promise<Workflow> {
+  return apiPost<Workflow>("/api/workflows", body);
+}
+
+
+export type WorkflowPatch = Record<string, any>;
+
+
+export async function updateWorkflow(workflow_id: string, patch: WorkflowPatch) {
+  return apiFetch<Workflow>(`/api/workflows/${$workflow_id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch ?? {}),
+  });
+}

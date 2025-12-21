@@ -20,7 +20,7 @@ def get_provider(provider_id: str):
 @router.patch("/{provider_id}", response_model=Provider)
 def update_provider(provider_id: str, body: ProviderUpdate):
     try:
-        return store.update(provider_id, {k: v for k, v in body.model_dump().items() if v is not None})
+        return store.update(provider_id, body.model_dump(exclude_unset=True))
     except KeyError:
         raise HTTPException(status_code=404, detail="Provider not found")
 

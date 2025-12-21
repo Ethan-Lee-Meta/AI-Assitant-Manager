@@ -16,7 +16,7 @@ class ToolType(str, Enum):
 class Tool(StrictModel):
     id: str
     project_id: Optional[str] = None
-    name: str
+    name: str = Field(min_length=1)
     tool_type: ToolType
     config: Dict[str, Any]
     description: Optional[str] = None
@@ -26,7 +26,7 @@ class Tool(StrictModel):
 
 class ToolCreate(StrictModel):
     project_id: Optional[str] = None
-    name: str = Field(min_length=1, max_length=200)
+    name: str = Field(min_length=1)
     tool_type: ToolType
     config: Dict[str, Any]
     description: Optional[str] = None
@@ -36,6 +36,7 @@ class ToolUpdate(StrictModel):
     config: Optional[Dict[str, Any]] = None
     description: Optional[str] = None
     archived_at: Optional[str] = None
+    archived: Optional[bool] = None
 
 class ListResp(StrictModel):
     items: list

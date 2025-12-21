@@ -20,7 +20,7 @@ class SupportedKind(str, Enum):
 
 class Provider(StrictModel):
     id: str
-    name: str
+    name: str = Field(min_length=1)
     provider_type: ProviderType
     supported_kinds: List[SupportedKind]
     endpoint_config: Optional[Dict[str, Any]] = None
@@ -30,7 +30,7 @@ class Provider(StrictModel):
     archived_at: Optional[str] = None
 
 class ProviderCreate(StrictModel):
-    name: str = Field(min_length=1, max_length=200)
+    name: str = Field(min_length=1)
     provider_type: ProviderType
     supported_kinds: List[SupportedKind]
     endpoint_config: Optional[Dict[str, Any]] = None
@@ -42,6 +42,7 @@ class ProviderUpdate(StrictModel):
     endpoint_config: Optional[Dict[str, Any]] = None
     is_enabled: Optional[bool] = None
     archived_at: Optional[str] = None
+    archived: Optional[bool] = None
 
 class ListResp(StrictModel):
     items: list

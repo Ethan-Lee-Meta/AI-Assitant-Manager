@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -u
+set -o pipefail
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+ts="$(date +%Y%m%d_%H%M%S)"
+echo "[info] M07_R6_FIX_JSX starting..."
+echo "[info] repo_root=$repo_root"
+cd "$repo_root"
+
+f="apps/web/src/ui/settings/IntegrationsSettings.tsx"
+if [ ! -f "$f" ]; then
+  echo "[fatal] missing file: $f"
+  exit 1
+fi
+
+cp -f "$f" "$f.bak.$ts"
+echo "[ok] backup: $f.bak.$ts"
+
+python - <<'PY'
+from pathlib import Path
+
+p = Path("apps/web/src/ui/settings/IntegrationsSettings.tsx")
+s = p.read_text(encoding="utf-8")
+
+# Fix the exact parse error you hit:
+# ... </FieldRow>
+#     </FieldRow>   <-- extra
+#     <FieldRow label="endpoint_config.api_key_env ...">
+needle = '\n            </FieldRow>\n            </FieldRow>\n            <FieldRow label="endpoint_config.api_key_env (recommended)">'
+if needle in s:
+    s = s.replace(
+        needle,
+        '\n            </FieldRow>\n            <FieldRow label="endpoint_config.api_key_env (recommended)">'
+    )
+    p.write_text(s, encoding="utf-8")
+    print("[ok] removed duplicate </FieldRow> before api_key_env block")
+else:
+    # Fallback: collapse any immediate duplicate closing tags at same indent
+    s2 = s.replace("\n            </FieldRow>\n            </FieldRow>\n", "\n            </FieldRow>\n")
+    if s2 != s:
+        p.write_text(s2, encoding="utf-8")
+        print("[ok] collapsed duplicate </FieldRow> (fallback)")
+    else:
+        print("[info] no duplicate </FieldRow> pattern found; nothing changed")
+PY
+
+echo "[info] quick grep around api_key_env block:"
+rg -n "api_key_env|</FieldRow>" "$f" | head -n 80 || true
+
+echo "[info] re-run next build (won't exit terminal on failure)"
+cd "$repo_root/apps/web"
+npm run build
+rc=$?
+echo "[info] next build rc=$rc"
+exit $rc

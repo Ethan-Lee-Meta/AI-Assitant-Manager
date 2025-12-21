@@ -13,7 +13,7 @@ class WorkflowType(str, Enum):
 class Workflow(StrictModel):
     id: str
     project_id: Optional[str] = None
-    name: str
+    name: str = Field(min_length=1)
     workflow_type: WorkflowType
     workflow_blob_asset_id: Optional[str] = None
     default_params: Optional[Dict[str, Any]] = None
@@ -23,7 +23,7 @@ class Workflow(StrictModel):
 
 class WorkflowCreate(StrictModel):
     project_id: Optional[str] = None
-    name: str = Field(min_length=1, max_length=200)
+    name: str = Field(min_length=1)
     workflow_type: WorkflowType
     workflow_blob_asset_id: Optional[str] = None
     default_params: Optional[Dict[str, Any]] = None
@@ -33,6 +33,7 @@ class WorkflowUpdate(StrictModel):
     workflow_blob_asset_id: Optional[str] = None
     default_params: Optional[Dict[str, Any]] = None
     archived_at: Optional[str] = None
+    archived: Optional[bool] = None
 
 class ListResp(StrictModel):
     items: list

@@ -1,0 +1,5 @@
+import { IntegrationsSettings } from "../../../src/ui/settings/IntegrationsSettings";
+
+export default function SettingsPage() {
+  return <IntegrationsSettings />;
+}

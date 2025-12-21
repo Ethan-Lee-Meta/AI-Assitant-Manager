@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+set -u
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$repo_root"
+
+OUTDIR=".tmp/m07"
+mkdir -p "$OUTDIR"
+
+echo "[info] M07_WEB_R4_SMOKE_WIN starting..."
+echo "[info] repo_root=$repo_root"
+echo "[info] outdir=$OUTDIR"
+
+APP_IMPORT="app.main:app"
+echo "[info] APP_IMPORT=$APP_IMPORT"
+
+# start api
+(
+  cd apps/api || exit 1
+  PYTHONPATH=./src python -m uvicorn "$APP_IMPORT" --host 127.0.0.1 --port 7000 --log-level warning
+) &
+API_PID=$!
+echo "[ok] api pid=$API_PID"
+
+# wait health
+ok=0
+for i in $(seq 1 40); do
+  if curl -fsS "http://localhost:7000/health" > "$OUTDIR/health.json" 2>/dev/null; then
+    echo "[ok] api /health: $(cat "$OUTDIR/health.json")"
+    ok=1
+    break
+  fi
+  sleep 0.2
+done
+if [ "$ok" -ne 1 ]; then
+  echo "[fatal] api /health not ready"
+  kill "$API_PID" >/dev/null 2>&1 || true
+  exit 1
+fi
+
+ts="$(date +%s)"
+prov_name="DemoProvider_$ts"
+wf_name="DemoWorkflow_$ts"
+tool_name="DemoTool_$ts"
+
+echo "[info] creating provider/workflow/tool seed..."
+
+# NOTE: capture both body and status for debugging
+curl -sS -w "\n%{http_code}\n" -X POST "http://localhost:7000/api/providers" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"name\": \"${prov_name}\",
+    \"provider_type\": \"http_api\",
+    \"supported_kinds\": [\"text2image\",\"text2video\"],
+    \"endpoint_config\": {\"base_url\": \"http://example\"},
+    \"is_enabled\": true
+  }" > "$OUTDIR/provider.resp"
+
+curl -sS -w "\n%{http_code}\n" -X POST "http://localhost:7000/api/workflows" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"project_id\": \"p_demo\",
+    \"name\": \"${wf_name}\",
+    \"workflow_type\": \"comfyui_workflow\",
+    \"workflow_blob_asset_id\": \"asset_wf_${ts}\",
+    \"default_params\": {\"steps\": 20}
+  }" > "$OUTDIR/workflow.resp"
+
+curl -sS -w "\n%{http_code}\n" -X POST "http://localhost:7000/api/tools" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"project_id\": \"p_demo\",
+    \"name\": \"${tool_name}\",
+    \"tool_type\": \"postprocess\",
+    \"config\": {\"strength\": 0.5},
+    \"description\": \"demo\"
+  }" > "$OUTDIR/tool.resp"
+
+python - <<'PY'
+import json
+from pathlib import Path
+
+out = Path(".tmp/m07")
+
+def parse(resp_file: str, label: str):
+    raw = out.joinpath(resp_file).read_text(encoding="utf-8").splitlines()
+    if len(raw) < 2:
+        raise SystemExit(f"[fatal] {label} response malformed: {resp_file}")
+    code = raw[-1].strip()
+    body = "\n".join(raw[:-1]).strip()
+    print(f"[info] {label} http={code}")
+    if code and code[0] != "2":
+        print(f"[fatal] {label} non-2xx body:\n{body}")
+        raise SystemExit(1)
+    j = json.loads(body) if body else {}
+    _id = j.get("id")
+    print(f"[ok] {label} id={_id}")
+    return _id
+
+parse("provider.resp", "provider")
+parse("workflow.resp", "workflow")
+parse("tool.resp", "tool")
+PY
+rc=$?
+echo "[info] seed rc=$rc"
+if [ "$rc" -ne 0 ]; then
+  echo "[info] stopping api..."
+  kill "$API_PID" >/dev/null 2>&1 || true
+  exit 1
+fi
+
+echo "[info] list providers/workflows/tools (limit/offset)..."
+curl -sS "http://localhost:7000/api/providers?limit=50&offset=0" > "$OUTDIR/providers_list.json"
+curl -sS "http://localhost:7000/api/workflows?limit=50&offset=0" > "$OUTDIR/workflows_list.json"
+curl -sS "http://localhost:7000/api/tools?limit=50&offset=0" > "$OUTDIR/tools_list.json"
+
+python - <<'PY'
+import json
+from pathlib import Path
+out = Path(".tmp/m07")
+
+for name in ["providers_list.json","workflows_list.json","tools_list.json"]:
+    j=json.loads(out.joinpath(name).read_text(encoding="utf-8"))
+    print("[ok]", name, "total=", j.get("total"), "items=", len(j.get("items") or []))
+PY
+
+echo "[info] stopping api..."
+kill "$API_PID" >/dev/null 2>&1 || true
+echo "[done] M07_WEB_R4_SMOKE_WIN OK"

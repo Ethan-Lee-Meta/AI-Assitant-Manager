@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+set -u
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$repo_root"
+
+PAGE="apps/web/app/(app)/settings/page.tsx"
+UI="apps/web/src/ui/settings/IntegrationsSettings.tsx"
+
+if [ ! -f "$UI" ]; then
+  echo "[fatal] missing: $UI"
+  exit 1
+fi
+
+ts="$(date +%Y%m%d_%H%M%S)"
+if [ -f "$PAGE" ]; then
+  cp "$PAGE" "$PAGE.bak.$ts"
+  echo "[ok] backup: $PAGE.bak.$ts"
+else
+  mkdir -p "apps/web/app/(app)/settings"
+  echo "[warn] page missing, will create: $PAGE"
+fi
+
+python - <<'PY'
+from __future__ import annotations
+from pathlib import Path
+import re
+
+page = Path("apps/web/app/(app)/settings/page.tsx")
+ui = Path("apps/web/src/ui/settings/IntegrationsSettings.tsx")
+
+txt = ui.read_text(encoding="utf-8")
+
+# ensure "use client" exists at top (for hooks)
+if not re.match(r'^\s*["\']use client["\']\s*;?\s*(\r?\n)', txt):
+    ui.write_text('"use client";\n\n' + txt, encoding="utf-8")
+    print("[ok] patched IntegrationsSettings.tsx: added \"use client\"")
+else:
+    print("[ok] IntegrationsSettings.tsx already has \"use client\"")
+
+has_default = bool(re.search(r'export\s+default\s+', txt))
+has_named = bool(re.search(r'export\s+(?:async\s+)?(?:function|const)\s+IntegrationsSettings\b', txt))
+
+# import path from app/(app)/settings/page.tsx to src/ui/settings/IntegrationsSettings.tsx
+import_path = "../../../src/ui/settings/IntegrationsSettings"
+
+if has_default and not has_named:
+    import_line = f'import IntegrationsSettings from "{import_path}";'
+    use = "<IntegrationsSettings />"
+else:
+    # prefer named if present; otherwise still try named (most common in this repo style)
+    import_line = f'import {{ IntegrationsSettings }} from "{import_path}";'
+    use = "<IntegrationsSettings />"
+
+content = f"""{import_line}
+
+export default function SettingsPage() {{
+  return (
+    <div style={{ padding: 24 }}>
+      <h1 style={{ fontSize: 32, fontWeight: 700, marginBottom: 8 }}>Settings</h1>
+      <p style={{ marginBottom: 16, color: "#555" }}>
+        Manage Providers / Workflows / Tools (M07).
+      </p>
+      {use}
+    </div>
+  );
+}}
+"""
+page.parent.mkdir(parents=True, exist_ok=True)
+page.write_text(content, encoding="utf-8")
+print("[ok] wrote settings page:", page)
+PY
+
+echo "[info] re-run next build (won't exit terminal on failure)"
+(
+  cd apps/web || exit 1
+  npm run build
+)
+rc=$?
+echo "[info] next build rc=$rc"
+exit $rc

@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+set -u
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+if [ -z "${repo_root}" ] || [ ! -d "${repo_root}" ]; then
+  echo "[fatal] cannot resolve repo_root. are you inside a git repo?"
+  exit 1
+fi
+cd "${repo_root}" || { echo "[fatal] cannot cd to repo_root=${repo_root}"; exit 1; }
+
+echo "[info] M07_WEB_R3_FIX_UPDATE_EXPORTS starting..."
+echo "[info] repo_root=${repo_root}"
+
+python - <<'PY'
+from __future__ import annotations
+from pathlib import Path
+import time
+import re
+
+def backup(p: Path) -> None:
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    b = p.with_name(p.name + f".bak.{ts}")
+    b.write_text(p.read_text(encoding="utf-8"), encoding="utf-8")
+    print(f"[ok] backup: {b}")
+
+def ensure_api_fetch_import(s: str) -> str:
+    # common patterns
+    patterns = [
+        (r'import\s+\{\s*apiGet\s*,\s*apiPost\s*\}\s+from\s+"\.\/client";',
+         'import { apiFetch, apiGet, apiPost } from "./client";'),
+        (r"import\s+\{\s*apiGet\s*,\s*apiPost\s*\}\s+from\s+'\.\/client';",
+         "import { apiFetch, apiGet, apiPost } from './client';"),
+        (r'import\s+\{\s*apiGet\s*,\s*apiPost\s*,\s*apiFetch\s*\}\s+from\s+"\.\/client";',
+         'import { apiFetch, apiGet, apiPost } from "./client";'),
+        (r"import\s+\{\s*apiGet\s*,\s*apiPost\s*,\s*apiFetch\s*\}\s+from\s+'\.\/client';",
+         "import { apiFetch, apiGet, apiPost } from './client';"),
+    ]
+    for pat, rep in patterns:
+        if re.search(pat, s):
+            return re.sub(pat, rep, s, count=1)
+    # if no client import found, do nothing; file may already use apiFetch or different layout
+    return s
+
+def append_update_fn(p: Path, entity: str, route: str) -> None:
+    if not p.exists():
+        print(f"[skip] missing: {p}")
+        return
+    s = p.read_text(encoding="utf-8")
+    fn = f"update{entity}"
+    if re.search(rf"export\s+async\s+function\s+{re.escape(fn)}\s*\(", s):
+        print(f"[skip] {p}: {fn} already exists")
+        return
+
+    backup(p)
+
+    s2 = ensure_api_fetch_import(s)
+
+    # minimal patch type to satisfy TS across panels without over-constraining shapes
+    patch_type = f"""
+export type {entity}Patch = Record<string, any>;
+""".rstrip()
+
+    if f"export type {entity}Patch" not in s2:
+        s2 = s2.rstrip() + "\n\n" + patch_type + "\n"
+
+    add = f"""
+export async function {fn}({entity.lower()}_id: string, patch: {entity}Patch) {{
+  return apiFetch<{entity}>(`{route}/${{${entity.lower()}_id}}`, {{
+    method: "PATCH",
+    headers: {{ "Content-Type": "application/json" }},
+    body: JSON.stringify(patch ?? {{}}),
+  }});
+}}
+""".rstrip() + "\n"
+
+    p.write_text(s2.rstrip() + "\n\n" + add, encoding="utf-8")
+    print(f"[ok] patched: {p} (added {fn})")
+
+append_update_fn(Path("apps/web/src/lib/api/providers.ts"), "Provider", "/api/providers")
+append_update_fn(Path("apps/web/src/lib/api/workflows.ts"), "Workflow", "/api/workflows")
+append_update_fn(Path("apps/web/src/lib/api/tools.ts"), "Tool", "/api/tools")
+PY
+
+echo "[info] re-run next build (won't exit terminal on failure)"
+cd apps/web || { echo "[fatal] missing apps/web"; exit 1; }
+
+npm run build
+rc=$?
+echo "[info] next build rc=$rc"
+
+exit $rc

@@ -19,7 +19,7 @@ def get_tool(tool_id: str):
 @router.patch("/{tool_id}", response_model=Tool)
 def update_tool(tool_id: str, body: ToolUpdate):
     try:
-        return store.update(tool_id, {k: v for k, v in body.model_dump().items() if v is not None})
+        return store.update(tool_id, body.model_dump(exclude_unset=True))
     except KeyError:
         raise HTTPException(status_code=404, detail="Tool not found")
 

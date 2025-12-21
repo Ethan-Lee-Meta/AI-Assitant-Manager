@@ -1,0 +1,478 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+
+import { createProvider, listProviders, updateProvider } from "../../lib/api/providers";
+import { createWorkflow, listWorkflows, updateWorkflow } from "../../lib/api/workflows";
+import { createTool, listTools, updateTool } from "../../lib/api/tools";
+
+type AnyObj = Record<string, any>;
+
+function trimOrEmpty(s: any): string {
+  return String(s ?? "").trim();
+}
+
+function parseJsonObjectOrUndefined(text: string): AnyObj | undefined {
+  const t = (text || "").trim();
+  if (!t) return undefined;
+  try {
+    const v = JSON.parse(t);
+    if (v && typeof v === "object" && !Array.isArray(v)) return v as AnyObj;
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function splitCsv(text: string): string[] {
+  return (text || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => !!s);
+}
+
+function ErrorBox(props: { title: string; error: string | null }) {
+  if (!props.error) return null;
+  return (
+    <div style={{ border: "1px solid #f3b4b4", background: "#fff4f4", padding: 12, borderRadius: 10, marginTop: 8 }}>
+      <div style={{ fontWeight: 700, marginBottom: 4 }}>{props.title}</div>
+      <div style={{ whiteSpace: "pre-wrap", fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" }}>
+        {props.error}
+      </div>
+    </div>
+  );
+}
+
+function Panel(props: { title: string; subtitle?: string; children: any }) {
+  return (
+    <div style={{ border: "1px solid #e5e5e5", borderRadius: 16, padding: 16 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "baseline" }}>
+        <div>
+          <div style={{ fontSize: 20, fontWeight: 800 }}>{props.title}</div>
+          {props.subtitle ? <div style={{ color: "#666", marginTop: 2 }}>{props.subtitle}</div> : null}
+        </div>
+      </div>
+      <div style={{ marginTop: 12 }}>{props.children}</div>
+    </div>
+  );
+}
+
+function FieldRow(props: { label: string; children: any }) {
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "260px 1fr", gap: 12, alignItems: "center", marginBottom: 10 }}>
+      <div style={{ color: "#333", fontSize: 13 }}>{props.label}</div>
+      <div>{props.children}</div>
+    </div>
+  );
+}
+
+function SmallBtn(props: { text: string; onClick: () => void; disabled?: boolean }) {
+  return (
+    <button
+      onClick={props.onClick}
+      disabled={!!props.disabled}
+      style={{
+        padding: "8px 12px",
+        borderRadius: 10,
+        border: "1px solid #ddd",
+        background: props.disabled ? "#f5f5f5" : "white",
+        cursor: props.disabled ? "not-allowed" : "pointer",
+        fontWeight: 700,
+      }}
+    >
+      {props.text}
+    </button>
+  );
+}
+
+function ProvidersPanel() {
+  const [items, setItems] = useState<any[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  // create form
+  const [name, setName] = useState("");
+  const [providerType, setProviderType] = useState("");
+  const [kindsCsv, setKindsCsv] = useState("");
+  const [baseUrl, setBaseUrl] = useState("");
+  const [isEnabled, setIsEnabled] = useState(true);
+  const [apiKeyEnv, setApiKeyEnv] = useState("");
+  const [apiKey, setApiKey] = useState("");
+
+  const kinds = useMemo(() => splitCsv(kindsCsv), [kindsCsv]);
+  const canCreate = useMemo(() => {
+    return trimOrEmpty(name).length > 0 && trimOrEmpty(providerType).length > 0 && kinds.length > 0 && trimOrEmpty(baseUrl).length > 0;
+  }, [name, providerType, kinds, baseUrl]);
+
+  async function refresh() {
+    setLoading(true);
+    setErr(null);
+    try {
+      const r = await listProviders({ limit: 50, offset: 0 });
+      setItems(Array.isArray((r as any)?.items) ? (r as any).items : []);
+    } catch (e: any) {
+      setErr(e?.message ? String(e.message) : "failed to load providers (is API running on :7000?)");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function doCreate() {
+    setErr(null);
+    if (!canCreate) {
+      setErr("Validation: name/provider_type/base_url required; supported_kinds must be non-empty (comma-separated).");
+      return;
+    }
+    try {
+      await createProvider({
+        name: trimOrEmpty(name),
+        provider_type: trimOrEmpty(providerType),
+        supported_kinds: kinds,
+        endpoint_config: {
+          base_url: trimOrEmpty(baseUrl),
+          api_key_env: trimOrEmpty(apiKeyEnv) || undefined,
+          api_key: trimOrEmpty(apiKey) || undefined, // NOT recommended
+        },
+        is_enabled: !!isEnabled,
+      } as any);
+      await refresh();
+    } catch (e: any) {
+      setErr(e?.message ? String(e.message) : "create provider failed");
+    }
+  }
+
+  async function toggleEnabled(item: any) {
+    setErr(null);
+    const id = item?.provider_id || item?.id;
+    if (!id) {
+      setErr("cannot update: missing provider_id");
+      return;
+    }
+    try {
+      await updateProvider(String(id), { is_enabled: !item?.is_enabled } as any);
+      await refresh();
+    } catch (e: any) {
+      setErr(e?.message ? String(e.message) : "update provider failed");
+    }
+  }
+
+  useEffect(() => {
+    refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return (
+    <Panel
+      title="Providers"
+      subtitle="M07: must declare supported_kinds. endpoint_config.base_url required; api_key_env recommended."
+    >
+      <div style={{ border: "1px solid #eee", borderRadius: 14, padding: 12, marginBottom: 12 }}>
+        <div style={{ fontWeight: 800, marginBottom: 10 }}>Create Provider</div>
+
+        <FieldRow label="name *">
+          <input value={name} onChange={(e) => setName(e.target.value)} style={{ width: "100%", padding: 8 }} />
+        </FieldRow>
+
+        <FieldRow label="provider_type * (e.g. http_api)">
+          <input value={providerType} onChange={(e) => setProviderType(e.target.value)} style={{ width: "100%", padding: 8 }} />
+        </FieldRow>
+
+        <FieldRow label="supported_kinds * (csv; e.g. text2image,text2video)">
+          <input value={kindsCsv} onChange={(e) => setKindsCsv(e.target.value)} style={{ width: "100%", padding: 8 }} />
+        </FieldRow>
+
+        <FieldRow label="endpoint_config.base_url *">
+          <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} style={{ width: "100%", padding: 8 }} />
+        </FieldRow>
+
+        <FieldRow label="endpoint_config.api_key_env (recommended)">
+          <input value={apiKeyEnv} onChange={(e) => setApiKeyEnv(e.target.value)} style={{ width: "100%", padding: 8 }} />
+        </FieldRow>
+
+        <FieldRow label="endpoint_config.api_key (NOT recommended; plaintext)">
+          <input value={apiKey} onChange={(e) => setApiKey(e.target.value)} style={{ width: "100%", padding: 8 }} />
+        </FieldRow>
+
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+            <input type="checkbox" checked={isEnabled} onChange={(e) => setIsEnabled(e.target.checked)} />
+            is_enabled
+          </label>
+
+          <SmallBtn text={loading ? "Loading..." : "Refresh"} onClick={refresh} disabled={loading} />
+          <SmallBtn text="Create" onClick={doCreate} disabled={!canCreate} />
+        </div>
+
+        <ErrorBox title="Provider Error" error={err} />
+      </div>
+
+      <div style={{ display: "flex", gap: 10, alignItems: "baseline", marginBottom: 8 }}>
+        <div style={{ fontWeight: 800 }}>List</div>
+        <div style={{ color: "#666" }}>{items.length} item(s)</div>
+      </div>
+
+      <div style={{ display: "grid", gap: 10 }}>
+        {items.map((it, idx) => {
+          const id = it?.provider_id || it?.id || idx;
+          return (
+            <div key={String(id)} style={{ border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                <div style={{ fontWeight: 800 }}>{it?.name || "(no name)"}</div>
+                <SmallBtn text={it?.is_enabled ? "Disable" : "Enable"} onClick={() => toggleEnabled(it)} />
+              </div>
+              <pre style={{ marginTop: 8, whiteSpace: "pre-wrap" }}>{JSON.stringify(it, null, 2)}</pre>
+            </div>
+          );
+        })}
+      </div>
+    </Panel>
+  );
+}
+
+function WorkflowsPanel() {
+  const [items, setItems] = useState<any[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const [projectId, setProjectId] = useState("");
+  const [name, setName] = useState("");
+  const [workflowType, setWorkflowType] = useState("");
+  const [blobAssetId, setBlobAssetId] = useState("");
+  const [defaultParamsJson, setDefaultParamsJson] = useState("");
+
+  const canCreate = useMemo(() => {
+    return trimOrEmpty(projectId) && trimOrEmpty(name) && trimOrEmpty(workflowType);
+  }, [projectId, name, workflowType]);
+
+  async function refresh() {
+    setLoading(true);
+    setErr(null);
+    try {
+      const r = await listWorkflows({ limit: 50, offset: 0 } as any);
+      setItems(Array.isArray((r as any)?.items) ? (r as any).items : []);
+    } catch (e: any) {
+      setErr(e?.message ? String(e.message) : "failed to load workflows (is API running on :7000?)");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function doCreate() {
+    setErr(null);
+    if (!canCreate) {
+      setErr("Validation: project_id/name/workflow_type required. workflow_blob_asset_id optional (but supported).");
+      return;
+    }
+    try {
+      await createWorkflow({
+        project_id: trimOrEmpty(projectId),
+        name: trimOrEmpty(name),
+        workflow_type: trimOrEmpty(workflowType),
+        workflow_blob_asset_id: trimOrEmpty(blobAssetId) || undefined,
+        default_params: parseJsonObjectOrUndefined(defaultParamsJson),
+      } as any);
+      await refresh();
+    } catch (e: any) {
+      setErr(e?.message ? String(e.message) : "create workflow failed");
+    }
+  }
+
+  async function patchName(it: any) {
+    setErr(null);
+    const id = it?.workflow_id || it?.id;
+    if (!id) {
+      setErr("cannot update: missing workflow_id");
+      return;
+    }
+    try {
+      await updateWorkflow(String(id), { name: String(it?.name || "") } as any);
+      await refresh();
+    } catch (e: any) {
+      setErr(e?.message ? String(e.message) : "update workflow failed");
+    }
+  }
+
+  useEffect(() => {
+    refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return (
+    <Panel title="Workflows" subtitle="M07: workflow may reference workflow_blob_asset_id.">
+      <div style={{ border: "1px solid #eee", borderRadius: 14, padding: 12, marginBottom: 12 }}>
+        <div style={{ fontWeight: 800, marginBottom: 10 }}>Create Workflow</div>
+
+        <FieldRow label="project_id *">
+          <input value={projectId} onChange={(e) => setProjectId(e.target.value)} style={{ width: "100%", padding: 8 }} />
+        </FieldRow>
+
+        <FieldRow label="name *">
+          <input value={name} onChange={(e) => setName(e.target.value)} style={{ width: "100%", padding: 8 }} />
+        </FieldRow>
+
+        <FieldRow label="workflow_type * (e.g. comfyui_workflow)">
+          <input value={workflowType} onChange={(e) => setWorkflowType(e.target.value)} style={{ width: "100%", padding: 8 }} />
+        </FieldRow>
+
+        <FieldRow label="workflow_blob_asset_id (optional)">
+          <input value={blobAssetId} onChange={(e) => setBlobAssetId(e.target.value)} style={{ width: "100%", padding: 8 }} />
+        </FieldRow>
+
+        <FieldRow label="default_params (json object; optional)">
+          <textarea value={defaultParamsJson} onChange={(e) => setDefaultParamsJson(e.target.value)} style={{ width: "100%", padding: 8, minHeight: 60 }} />
+        </FieldRow>
+
+        <div style={{ display: "flex", gap: 10 }}>
+          <SmallBtn text={loading ? "Loading..." : "Refresh"} onClick={refresh} disabled={loading} />
+          <SmallBtn text="Create" onClick={doCreate} disabled={!canCreate} />
+        </div>
+
+        <ErrorBox title="Workflow Error" error={err} />
+      </div>
+
+      <div style={{ display: "grid", gap: 10 }}>
+        {items.map((it, idx) => {
+          const id = it?.workflow_id || it?.id || idx;
+          return (
+            <div key={String(id)} style={{ border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                <div style={{ fontWeight: 800 }}>{it?.name || "(no name)"}</div>
+                <SmallBtn text="PATCH (noop)" onClick={() => patchName(it)} />
+              </div>
+              <pre style={{ marginTop: 8, whiteSpace: "pre-wrap" }}>{JSON.stringify(it, null, 2)}</pre>
+            </div>
+          );
+        })}
+      </div>
+    </Panel>
+  );
+}
+
+function ToolsPanel() {
+  const [items, setItems] = useState<any[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const [projectId, setProjectId] = useState("");
+  const [name, setName] = useState("");
+  const [toolType, setToolType] = useState("");
+  const [desc, setDesc] = useState("");
+  const [configJson, setConfigJson] = useState("");
+
+  const canCreate = useMemo(() => {
+    return trimOrEmpty(projectId) && trimOrEmpty(name) && trimOrEmpty(toolType);
+  }, [projectId, name, toolType]);
+
+  async function refresh() {
+    setLoading(true);
+    setErr(null);
+    try {
+      const r = await listTools({ limit: 50, offset: 0 } as any);
+      setItems(Array.isArray((r as any)?.items) ? (r as any).items : []);
+    } catch (e: any) {
+      setErr(e?.message ? String(e.message) : "failed to load tools (is API running on :7000?)");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function doCreate() {
+    setErr(null);
+    if (!canCreate) {
+      setErr("Validation: project_id/name/tool_type required. config should be json object if provided.");
+      return;
+    }
+    try {
+      await createTool({
+        project_id: trimOrEmpty(projectId),
+        name: trimOrEmpty(name),
+        tool_type: trimOrEmpty(toolType),
+        description: trimOrEmpty(desc) || undefined,
+        config: parseJsonObjectOrUndefined(configJson),
+      } as any);
+      await refresh();
+    } catch (e: any) {
+      setErr(e?.message ? String(e.message) : "create tool failed");
+    }
+  }
+
+  async function patchDesc(it: any) {
+    setErr(null);
+    const id = it?.tool_id || it?.id;
+    if (!id) {
+      setErr("cannot update: missing tool_id");
+      return;
+    }
+    try {
+      await updateTool(String(id), { description: String(it?.description || "") } as any);
+      await refresh();
+    } catch (e: any) {
+      setErr(e?.message ? String(e.message) : "update tool failed");
+    }
+  }
+
+  useEffect(() => {
+    refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return (
+    <Panel title="Tools" subtitle="M07: tool is pluggable config asset; used later by runner/pipeline.">
+      <div style={{ border: "1px solid #eee", borderRadius: 14, padding: 12, marginBottom: 12 }}>
+        <div style={{ fontWeight: 800, marginBottom: 10 }}>Create Tool</div>
+
+        <FieldRow label="project_id *">
+          <input value={projectId} onChange={(e) => setProjectId(e.target.value)} style={{ width: "100%", padding: 8 }} />
+        </FieldRow>
+
+        <FieldRow label="name *">
+          <input value={name} onChange={(e) => setName(e.target.value)} style={{ width: "100%", padding: 8 }} />
+        </FieldRow>
+
+        <FieldRow label="tool_type * (e.g. postprocess)">
+          <input value={toolType} onChange={(e) => setToolType(e.target.value)} style={{ width: "100%", padding: 8 }} />
+        </FieldRow>
+
+        <FieldRow label="description (optional)">
+          <input value={desc} onChange={(e) => setDesc(e.target.value)} style={{ width: "100%", padding: 8 }} />
+        </FieldRow>
+
+        <FieldRow label="config (json object; optional)">
+          <textarea value={configJson} onChange={(e) => setConfigJson(e.target.value)} style={{ width: "100%", padding: 8, minHeight: 60 }} />
+        </FieldRow>
+
+        <div style={{ display: "flex", gap: 10 }}>
+          <SmallBtn text={loading ? "Loading..." : "Refresh"} onClick={refresh} disabled={loading} />
+          <SmallBtn text="Create" onClick={doCreate} disabled={!canCreate} />
+        </div>
+
+        <ErrorBox title="Tool Error" error={err} />
+      </div>
+
+      <div style={{ display: "grid", gap: 10 }}>
+        {items.map((it, idx) => {
+          const id = it?.tool_id || it?.id || idx;
+          return (
+            <div key={String(id)} style={{ border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                <div style={{ fontWeight: 800 }}>{it?.name || "(no name)"}</div>
+                <SmallBtn text="PATCH (noop)" onClick={() => patchDesc(it)} />
+              </div>
+              <pre style={{ marginTop: 8, whiteSpace: "pre-wrap" }}>{JSON.stringify(it, null, 2)}</pre>
+            </div>
+          );
+        })}
+      </div>
+    </Panel>
+  );
+}
+
+export function IntegrationsSettings() {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 24 }}>
+      <ProvidersPanel />
+      <WorkflowsPanel />
+      <ToolsPanel />
+    </div>
+  );
+}

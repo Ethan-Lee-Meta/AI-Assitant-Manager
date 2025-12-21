@@ -1,0 +1,395 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import { Provider, createProvider, listProviders, updateProvider } from "../../lib/api/providers";
+import { Workflow, createWorkflow, listWorkflows, updateWorkflow } from "../../lib/api/workflows";
+import { Tool, createTool, listTools, updateTool } from "../../lib/api/tools";
+
+function FieldRow(props: { label: string; children: React.ReactNode }) {
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <div style={{ fontSize: 12, color: "#666", marginBottom: 6 }}>{props.label}</div>
+      {props.children}
+    </div>
+  );
+}
+
+function parseJsonOrNull(s: string): Record<string, any> | null {
+  const t = (s || "").trim();
+  if (!t) return null;
+  try {
+    return JSON.parse(t);
+  } catch {
+    return null;
+  }
+}
+
+function Panel(props: { title: string; children: React.ReactNode }) {
+  return (
+    <div style={{ border: "1px solid #eee", borderRadius: 12, padding: 16, marginBottom: 16 }}>
+      <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 12 }}>{props.title}</div>
+      {props.children}
+    </div>
+  );
+}
+
+export function IntegrationsSettings() {
+  // Providers
+  const [pItems, setPItems] = useState<Provider[]>([]);
+  const [pTotal, setPTotal] = useState<number>(0);
+  const [pLoading, setPLoading] = useState<boolean>(false);
+  const [pErr, setPErr] = useState<string | null>(null);
+
+  const [pName, setPName] = useState<string>("");
+  const [pType, setPType] = useState<string>("http_api");
+  const [pKinds, setPKinds] = useState<string>("text2image,text2video");
+  const [pBaseUrl, setPBaseUrl] = useState<string>("http://example");
+  const [pApiKeyEnv, setPApiKeyEnv] = useState<string>("");
+  const [pApiKey, setPApiKey] = useState<string>("");
+  const [pEnabled, setPEnabled] = useState<boolean>(true);
+
+  // Workflows
+  const [wItems, setWItems] = useState<Workflow[]>([]);
+  const [wTotal, setWTotal] = useState<number>(0);
+  const [wLoading, setWLoading] = useState<boolean>(false);
+  const [wErr, setWErr] = useState<string | null>(null);
+
+  const [wProjectId, setWProjectId] = useState<string>("p_demo");
+  const [wName, setWName] = useState<string>("WF1");
+  const [wType, setWType] = useState<string>("comfyui_workflow");
+  const [wBlob, setWBlob] = useState<string>("");
+  const [wParams, setWParams] = useState<string>('{"steps":20}');
+
+  // Tools
+  const [tItems, setTItems] = useState<Tool[]>([]);
+  const [tTotal, setTTotal] = useState<number>(0);
+  const [tLoading, setTLoading] = useState<boolean>(false);
+  const [tErr, setTErr] = useState<string | null>(null);
+
+  const [tProjectId, setTProjectId] = useState<string>("p_demo");
+  const [tName, setTName] = useState<string>("Tool1");
+  const [tType, setTType] = useState<string>("postprocess");
+  const [tCfg, setTCfg] = useState<string>('{"strength":0.5}');
+  const [tDesc, setTDesc] = useState<string>("demo");
+
+  async function refreshProviders() {
+    setPLoading(true);
+    setPErr(null);
+    try {
+      const r = await listProviders({ limit: 50, offset: 0, archived: false });
+      setPItems(r.items || []);
+      setPTotal(r.total || 0);
+    } catch (e: any) {
+      setPErr(e?.message || "failed to load providers");
+    } finally {
+      setPLoading(false);
+    }
+  }
+
+  async function refreshWorkflows() {
+    setWLoading(true);
+    setWErr(null);
+    try {
+      const r = await listWorkflows({ limit: 50, offset: 0, archived: false });
+      setWItems(r.items || []);
+      setWTotal(r.total || 0);
+    } catch (e: any) {
+      setWErr(e?.message || "failed to load workflows");
+    } finally {
+      setWLoading(false);
+    }
+  }
+
+  async function refreshTools() {
+    setTLoading(true);
+    setTErr(null);
+    try {
+      const r = await listTools({ limit: 50, offset: 0, archived: false });
+      setTItems(r.items || []);
+      setTTotal(r.total || 0);
+    } catch (e: any) {
+      setTErr(e?.message || "failed to load tools");
+    } finally {
+      setTLoading(false);
+    }
+  }
+
+  const canCreateProvider = (pName || "").trim().length > 0 && (pType || "").trim().length > 0 && (pBaseUrl || "").trim().length > 0;
+  const canCreateWorkflow = (wName || "").trim().length > 0 && (wType || "").trim().length > 0;
+  const canCreateTool = (tName || "").trim().length > 0 && (tType || "").trim().length > 0;
+
+  useEffect(() => {
+    refreshProviders();
+    refreshWorkflows();
+    refreshTools();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function onCreateProvider() {
+    setPErr(null);
+    const kinds = (pKinds || "")
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
+    try {
+      await createProvider({
+        name: pName,
+        provider_type: pType,
+        supported_kinds: kinds.length ? kinds : ["text2image"],
+        endpoint_config: { base_url: pBaseUrl, api_key_env: (pApiKeyEnv || "").trim() || undefined, api_key: (pApiKey || "").trim() || undefined },
+        is_enabled: !!pEnabled,
+      });
+      await refreshProviders();
+    } catch (e: any) {
+      setPErr(e?.message || "create provider failed");
+    }
+  }
+
+  async function onToggleProvider(p: Provider) {
+    setPErr(null);
+    try {
+      await updateProvider(p.id, { is_enabled: !p.is_enabled });
+      await refreshProviders();
+    } catch (e: any) {
+      setPErr(e?.message || "update provider failed");
+    }
+  }
+
+  async function onArchiveProvider(p: Provider) {
+    setPErr(null);
+    try {
+      await updateProvider(p.id, { archived_at: new Date().toISOString() });
+      await refreshProviders();
+    } catch (e: any) {
+      setPErr(e?.message || "archive provider failed");
+    }
+  }
+
+  async function onCreateWorkflow() {
+    setWErr(null);
+    try {
+      await createWorkflow({
+        project_id: wProjectId,
+        name: wName,
+        workflow_type: wType,
+        workflow_blob_asset_id: (wBlob || "").trim() || undefined,
+        default_params: parseJsonOrNull(wParams || "") || undefined,
+      });
+      await refreshWorkflows();
+    } catch (e: any) {
+      setWErr(e?.message || "create workflow failed");
+    }
+  }
+
+  async function onArchiveWorkflow(w: Workflow) {
+    setWErr(null);
+    try {
+      await updateWorkflow(w.id, { archived_at: new Date().toISOString() });
+      await refreshWorkflows();
+    } catch (e: any) {
+      setWErr(e?.message || "archive workflow failed");
+    }
+  }
+
+  async function onCreateTool() {
+    setTErr(null);
+    try {
+      await createTool({
+        project_id: tProjectId,
+        name: tName,
+        tool_type: tType,
+        config: parseJsonOrNull(tCfg || "") || {},
+        description: (tDesc || "").trim() || undefined,
+      });
+      await refreshTools();
+    } catch (e: any) {
+      setTErr(e?.message || "create tool failed");
+    }
+  }
+
+  async function onArchiveTool(t: Tool) {
+    setTErr(null);
+    try {
+      await updateTool(t.id, { archived_at: new Date().toISOString() });
+      await refreshTools();
+    } catch (e: any) {
+      setTErr(e?.message || "archive tool failed");
+    }
+  }
+
+  return (
+    <div>
+      <Panel title="Providers">
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 12 }}>
+          <div>
+            <FieldRow label="name">
+              <input value={pName} onChange={(e) => setPName(e.target.value)} style={{ width: "100%", padding: 8 }} />
+            </FieldRow>
+            <FieldRow label="provider_type">
+              <input value={pType} onChange={(e) => setPType(e.target.value)} style={{ width: "100%", padding: 8 }} />
+            </FieldRow>
+          </div>
+          <div>
+            <FieldRow label="supported_kinds (comma-separated)">
+              <input value={pKinds} onChange={(e) => setPKinds(e.target.value)} style={{ width: "100%", padding: 8 }} />
+            </FieldRow>
+            <FieldRow label="endpoint_config.base_url">
+
+              <input value={pBaseUrl} onChange={(e) => setPBaseUrl(e.target.value)} style={{ width: "100%", padding: 8 }} />
+            </FieldRow>
+            <FieldRow label="endpoint_config.api_key_env (recommended)">
+              <input value={(pApiKeyEnv ?? "")} onChange={(e) => setPApiKeyEnv(e.target.value)} style={{ width: "100%", padding: 8 }} />
+            </FieldRow>
+            <FieldRow label="endpoint_config.api_key (NOT recommended; plaintext)">
+              <input value={(pApiKey ?? "")} onChange={(e) => setPApiKey(e.target.value)} style={{ width: "100%", padding: 8 }} />
+
+          </div>
+        </div>
+
+        <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 12 }}>
+          <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+            <input type="checkbox" checked={pEnabled} onChange={(e) => setPEnabled(e.target.checked)} />
+            enabled
+          </label>
+          <button disabled={!canCreateProvider} onClick={onCreateProvider} style={{ padding: "8px 12px" }}>Create</button>
+          <button onClick={refreshProviders} style={{ padding: "8px 12px" }}>Refresh</button>
+          <span style={{ color: "#666", fontSize: 12 }}>
+            total={pTotal} {pLoading ? "(loading...)" : ""}
+          </span>
+        </div>
+
+        {pErr ? <div style={{ color: "crimson", marginBottom: 10 }}>{pErr}</div> : null}
+
+        <div style={{ borderTop: "1px solid #f0f0f0", marginTop: 8, paddingTop: 8 }}>
+          {pItems.length === 0 ? (
+            <div style={{ color: "#666" }}>No providers.</div>
+          ) : (
+            pItems.map((p) => (
+              <div key={p.id} style={{ display: "flex", gap: 10, alignItems: "center", padding: "6px 0" }}>
+                <code style={{ fontSize: 12, color: "#333" }}>{p.id}</code>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontWeight: 600 }}>{p.name}</div>
+                  <div style={{ fontSize: 12, color: "#666" }}>
+                    type={p.provider_type} enabled={String(p.is_enabled)} kinds={(p.supported_kinds || []).join(",")}
+                  </div>
+                </div>
+                <button onClick={() => onToggleProvider(p)} style={{ padding: "6px 10px" }}>
+                  Toggle Enabled
+                </button>
+                <button onClick={() => onArchiveProvider(p)} style={{ padding: "6px 10px" }}>
+                  Archive
+                </button>
+              </div>
+            ))
+          )}
+        </div>
+      </Panel>
+
+      <Panel title="Workflows">
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 12 }}>
+          <div>
+            <FieldRow label="project_id (optional)">
+              <input value={wProjectId} onChange={(e) => setWProjectId(e.target.value)} style={{ width: "100%", padding: 8 }} />
+            </FieldRow>
+            <FieldRow label="name">
+              <input value={wName} onChange={(e) => setWName(e.target.value)} style={{ width: "100%", padding: 8 }} />
+            </FieldRow>
+            <FieldRow label="workflow_type">
+              <input value={wType} onChange={(e) => setWType(e.target.value)} style={{ width: "100%", padding: 8 }} />
+            </FieldRow>
+          </div>
+          <div>
+            <FieldRow label="workflow_blob_asset_id (optional)">
+              <input value={wBlob} onChange={(e) => setWBlob(e.target.value)} style={{ width: "100%", padding: 8 }} />
+            </FieldRow>
+            <FieldRow label="default_params (JSON, optional)">
+              <textarea value={wParams} onChange={(e) => setWParams(e.target.value)} style={{ width: "100%", padding: 8, minHeight: 80 }} />
+            </FieldRow>
+          </div>
+        </div>
+
+        <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 12 }}>
+          <button disabled={!canCreateWorkflow} onClick={onCreateWorkflow} style={{ padding: "8px 12px" }}>Create</button>
+          <button onClick={refreshWorkflows} style={{ padding: "8px 12px" }}>Refresh</button>
+          <span style={{ color: "#666", fontSize: 12 }}>
+            total={wTotal} {wLoading ? "(loading...)" : ""}
+          </span>
+        </div>
+
+        {wErr ? <div style={{ color: "crimson", marginBottom: 10 }}>{wErr}</div> : null}
+
+        <div style={{ borderTop: "1px solid #f0f0f0", marginTop: 8, paddingTop: 8 }}>
+          {wItems.length === 0 ? (
+            <div style={{ color: "#666" }}>No workflows.</div>
+          ) : (
+            wItems.map((w) => (
+              <div key={w.id} style={{ display: "flex", gap: 10, alignItems: "center", padding: "6px 0" }}>
+                <code style={{ fontSize: 12, color: "#333" }}>{w.id}</code>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontWeight: 600 }}>{w.name}</div>
+                  <div style={{ fontSize: 12, color: "#666" }}>
+                    type={w.workflow_type} project_id={w.project_id || "-"} blob={w.workflow_blob_asset_id || "-"}
+                  </div>
+                </div>
+                <button onClick={() => onArchiveWorkflow(w)} style={{ padding: "6px 10px" }}>Archive</button>
+              </div>
+            ))
+          )}
+        </div>
+      </Panel>
+
+      <Panel title="Tools">
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 12 }}>
+          <div>
+            <FieldRow label="project_id (optional)">
+              <input value={tProjectId} onChange={(e) => setTProjectId(e.target.value)} style={{ width: "100%", padding: 8 }} />
+            </FieldRow>
+            <FieldRow label="name">
+              <input value={tName} onChange={(e) => setTName(e.target.value)} style={{ width: "100%", padding: 8 }} />
+            </FieldRow>
+            <FieldRow label="tool_type">
+              <input value={tType} onChange={(e) => setTType(e.target.value)} style={{ width: "100%", padding: 8 }} />
+            </FieldRow>
+          </div>
+          <div>
+            <FieldRow label="config (JSON)">
+              <textarea value={tCfg} onChange={(e) => setTCfg(e.target.value)} style={{ width: "100%", padding: 8, minHeight: 80 }} />
+            </FieldRow>
+            <FieldRow label="description (optional)">
+              <input value={tDesc} onChange={(e) => setTDesc(e.target.value)} style={{ width: "100%", padding: 8 }} />
+            </FieldRow>
+          </div>
+        </div>
+
+        <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 12 }}>
+          <button disabled={!canCreateTool} onClick={onCreateTool} style={{ padding: "8px 12px" }}>Create</button>
+          <button onClick={refreshTools} style={{ padding: "8px 12px" }}>Refresh</button>
+          <span style={{ color: "#666", fontSize: 12 }}>
+            total={tTotal} {tLoading ? "(loading...)" : ""}
+          </span>
+        </div>
+
+        {tErr ? <div style={{ color: "crimson", marginBottom: 10 }}>{tErr}</div> : null}
+
+        <div style={{ borderTop: "1px solid #f0f0f0", marginTop: 8, paddingTop: 8 }}>
+          {tItems.length === 0 ? (
+            <div style={{ color: "#666" }}>No tools.</div>
+          ) : (
+            tItems.map((t) => (
+              <div key={t.id} style={{ display: "flex", gap: 10, alignItems: "center", padding: "6px 0" }}>
+                <code style={{ fontSize: 12, color: "#333" }}>{t.id}</code>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontWeight: 600 }}>{t.name}</div>
+                  <div style={{ fontSize: 12, color: "#666" }}>
+                    type={t.tool_type} project_id={t.project_id || "-"}
+                  </div>
+                </div>
+                <button onClick={() => onArchiveTool(t)} style={{ padding: "6px 10px" }}>Archive</button>
+              </div>
+            ))
+          )}
+        </div>
+      </Panel>
+    </div>
+  );
+}
