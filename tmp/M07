@@ -1,0 +1,1074 @@
+#!/usr/bin/env bash
+set -u
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+echo "[info] repo_root=$repo_root"
+cd "$repo_root" || exit 1
+
+# -------------------------
+# A) Backend: modules (providers/workflows/tools)
+# -------------------------
+mkdir -p "apps/api/src/app/modules/providers"
+mkdir -p "apps/api/src/app/modules/workflows"
+mkdir -p "apps/api/src/app/modules/tools"
+mkdir -p "apps/api/tests"
+
+# ---- shared tiny helpers (local per module; avoid cross-module coupling) ----
+
+cat > "apps/api/src/app/modules/providers/dto.py" <<'EOF'
+from __future__ import annotations
+from typing import Any, Optional, List, Dict
+from enum import Enum
+from pydantic import BaseModel, ConfigDict, Field
+
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+class ProviderType(str, Enum):
+    http_api = "http_api"
+    local_workflow_runner = "local_workflow_runner"
+    hybrid = "hybrid"
+
+class SupportedKind(str, Enum):
+    text2image = "text2image"
+    image2image = "image2image"
+    text2video = "text2video"
+    image2video = "image2video"
+    general = "general"
+
+class Provider(StrictModel):
+    id: str
+    name: str
+    provider_type: ProviderType
+    supported_kinds: List[SupportedKind]
+    endpoint_config: Optional[Dict[str, Any]] = None
+    is_enabled: bool
+    created_at: str
+    updated_at: Optional[str] = None
+    archived_at: Optional[str] = None
+
+class ProviderCreate(StrictModel):
+    name: str = Field(min_length=1, max_length=200)
+    provider_type: ProviderType
+    supported_kinds: List[SupportedKind]
+    endpoint_config: Optional[Dict[str, Any]] = None
+    is_enabled: bool = True
+
+class ProviderUpdate(StrictModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    supported_kinds: Optional[List[SupportedKind]] = None
+    endpoint_config: Optional[Dict[str, Any]] = None
+    is_enabled: Optional[bool] = None
+    archived_at: Optional[str] = None
+
+class ListResp(StrictModel):
+    items: list
+    total: int
+    limit: int
+    offset: int
+EOF
+
+cat > "apps/api/src/app/modules/providers/store_sqlite.py" <<'EOF'
+from __future__ import annotations
+from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+import json
+import os
+import sqlite3
+from datetime import datetime, timezone
+import uuid
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def _default_db_path() -> str:
+    # best-effort: align with existing env if present; otherwise local file under apps/api
+    return os.getenv("AAM_SQLITE_PATH") or os.getenv("SQLITE_PATH") or str(Path("apps/api/.data/app.sqlite").resolve())
+
+def _connect() -> sqlite3.Connection:
+    path = _default_db_path()
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def _ensure(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS providers (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          provider_type TEXT NOT NULL,
+          supported_kinds TEXT NOT NULL,
+          endpoint_config TEXT,
+          is_enabled INTEGER NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT,
+          archived_at TEXT
+        )
+        """
+    )
+    conn.commit()
+
+def create(payload: Dict[str, Any]) -> Dict[str, Any]:
+    conn = _connect()
+    _ensure(conn)
+    pid = uuid.uuid4().hex
+    now = _now()
+    conn.execute(
+        """
+        INSERT INTO providers(id,name,provider_type,supported_kinds,endpoint_config,is_enabled,created_at,updated_at,archived_at)
+        VALUES(?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            pid,
+            payload["name"],
+            payload["provider_type"],
+            json.dumps(payload["supported_kinds"]),
+            json.dumps(payload.get("endpoint_config")) if payload.get("endpoint_config") is not None else None,
+            1 if payload.get("is_enabled", True) else 0,
+            now,
+            now,
+            None,
+        ),
+    )
+    conn.commit()
+    return get(pid)
+
+def get(provider_id: str) -> Dict[str, Any]:
+    conn = _connect()
+    _ensure(conn)
+    row = conn.execute("SELECT * FROM providers WHERE id=?", (provider_id,)).fetchone()
+    if row is None:
+        raise KeyError("NOT_FOUND")
+    d = dict(row)
+    d["supported_kinds"] = json.loads(d["supported_kinds"]) if d.get("supported_kinds") else []
+    d["endpoint_config"] = json.loads(d["endpoint_config"]) if d.get("endpoint_config") else None
+    d["is_enabled"] = bool(d["is_enabled"])
+    return d
+
+def update(provider_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
+    cur = get(provider_id)  # raises if missing
+    conn = _connect()
+    _ensure(conn)
+
+    merged = {**cur, **patch}
+    merged["updated_at"] = _now()
+
+    conn.execute(
+        """
+        UPDATE providers
+        SET name=?, provider_type=?, supported_kinds=?, endpoint_config=?, is_enabled=?, updated_at=?, archived_at=?
+        WHERE id=?
+        """,
+        (
+            merged["name"],
+            merged["provider_type"],
+            json.dumps(merged["supported_kinds"]),
+            json.dumps(merged.get("endpoint_config")) if merged.get("endpoint_config") is not None else None,
+            1 if merged.get("is_enabled", True) else 0,
+            merged["updated_at"],
+            merged.get("archived_at"),
+            provider_id,
+        ),
+    )
+    conn.commit()
+    return get(provider_id)
+
+def list_items(
+    *,
+    q: Optional[str],
+    provider_type: Optional[str],
+    is_enabled: Optional[bool],
+    archived: bool,
+    limit: int,
+    offset: int,
+) -> Tuple[List[Dict[str, Any]], int]:
+    conn = _connect()
+    _ensure(conn)
+
+    where = []
+    args: list[Any] = []
+
+    if not archived:
+        where.append("archived_at IS NULL")
+
+    if q:
+        where.append("name LIKE ?")
+        args.append(f"%{q}%")
+
+    if provider_type:
+        where.append("provider_type = ?")
+        args.append(provider_type)
+
+    if is_enabled is not None:
+        where.append("is_enabled = ?")
+        args.append(1 if is_enabled else 0)
+
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+    total = conn.execute(f"SELECT COUNT(1) AS c FROM providers{where_sql}", args).fetchone()["c"]
+
+    rows = conn.execute(
+        f"SELECT * FROM providers{where_sql} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        [*args, limit, offset],
+    ).fetchall()
+
+    items: List[Dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        d["supported_kinds"] = json.loads(d["supported_kinds"]) if d.get("supported_kinds") else []
+        d["endpoint_config"] = json.loads(d["endpoint_config"]) if d.get("endpoint_config") else None
+        d["is_enabled"] = bool(d["is_enabled"])
+        items.append(d)
+
+    return items, int(total)
+EOF
+
+cat > "apps/api/src/app/modules/providers/router.py" <<'EOF'
+from __future__ import annotations
+from fastapi import APIRouter, Query, HTTPException
+from .dto import Provider, ProviderCreate, ProviderUpdate, ListResp
+from . import store_sqlite as store
+
+router = APIRouter(prefix="/api/providers", tags=["providers"])
+
+@router.post("", response_model=Provider)
+def create_provider(body: ProviderCreate):
+    item = store.create(body.model_dump())
+    return item
+
+@router.get("/{provider_id}", response_model=Provider)
+def get_provider(provider_id: str):
+    try:
+        return store.get(provider_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Provider not found")
+
+@router.patch("/{provider_id}", response_model=Provider)
+def update_provider(provider_id: str, body: ProviderUpdate):
+    try:
+        return store.update(provider_id, {k: v for k, v in body.model_dump().items() if v is not None})
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Provider not found")
+
+@router.get("", response_model=ListResp)
+def list_providers(
+    q: str | None = Query(default=None),
+    provider_type: str | None = Query(default=None),
+    is_enabled: bool | None = Query(default=None),
+    archived: bool = Query(default=False),
+    limit: int = Query(default=20, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    items, total = store.list_items(
+        q=q,
+        provider_type=provider_type,
+        is_enabled=is_enabled,
+        archived=archived,
+        limit=limit,
+        offset=offset,
+    )
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+EOF
+
+# ---- Workflows ----
+cat > "apps/api/src/app/modules/workflows/dto.py" <<'EOF'
+from __future__ import annotations
+from typing import Any, Optional, Dict
+from enum import Enum
+from pydantic import BaseModel, ConfigDict, Field
+
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+class WorkflowType(str, Enum):
+    provider_http_template = "provider_http_template"
+    comfyui_workflow = "comfyui_workflow"
+
+class Workflow(StrictModel):
+    id: str
+    project_id: Optional[str] = None
+    name: str
+    workflow_type: WorkflowType
+    workflow_blob_asset_id: Optional[str] = None
+    default_params: Optional[Dict[str, Any]] = None
+    created_at: str
+    updated_at: Optional[str] = None
+    archived_at: Optional[str] = None
+
+class WorkflowCreate(StrictModel):
+    project_id: Optional[str] = None
+    name: str = Field(min_length=1, max_length=200)
+    workflow_type: WorkflowType
+    workflow_blob_asset_id: Optional[str] = None
+    default_params: Optional[Dict[str, Any]] = None
+
+class WorkflowUpdate(StrictModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    workflow_blob_asset_id: Optional[str] = None
+    default_params: Optional[Dict[str, Any]] = None
+    archived_at: Optional[str] = None
+
+class ListResp(StrictModel):
+    items: list
+    total: int
+    limit: int
+    offset: int
+EOF
+
+cat > "apps/api/src/app/modules/workflows/store_sqlite.py" <<'EOF'
+from __future__ import annotations
+from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+import json
+import os
+import sqlite3
+from datetime import datetime, timezone
+import uuid
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def _default_db_path() -> str:
+    return os.getenv("AAM_SQLITE_PATH") or os.getenv("SQLITE_PATH") or str(Path("apps/api/.data/app.sqlite").resolve())
+
+def _connect() -> sqlite3.Connection:
+    path = _default_db_path()
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def _ensure(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS workflows (
+          id TEXT PRIMARY KEY,
+          project_id TEXT,
+          name TEXT NOT NULL,
+          workflow_type TEXT NOT NULL,
+          workflow_blob_asset_id TEXT,
+          default_params TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT,
+          archived_at TEXT
+        )
+        """
+    )
+    conn.commit()
+
+def create(payload: Dict[str, Any]) -> Dict[str, Any]:
+    conn = _connect()
+    _ensure(conn)
+    wid = uuid.uuid4().hex
+    now = _now()
+    conn.execute(
+        """
+        INSERT INTO workflows(id,project_id,name,workflow_type,workflow_blob_asset_id,default_params,created_at,updated_at,archived_at)
+        VALUES(?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            wid,
+            payload.get("project_id"),
+            payload["name"],
+            payload["workflow_type"],
+            payload.get("workflow_blob_asset_id"),
+            json.dumps(payload.get("default_params")) if payload.get("default_params") is not None else None,
+            now,
+            now,
+            None,
+        ),
+    )
+    conn.commit()
+    return get(wid)
+
+def get(workflow_id: str) -> Dict[str, Any]:
+    conn = _connect()
+    _ensure(conn)
+    row = conn.execute("SELECT * FROM workflows WHERE id=?", (workflow_id,)).fetchone()
+    if row is None:
+        raise KeyError("NOT_FOUND")
+    d = dict(row)
+    d["default_params"] = json.loads(d["default_params"]) if d.get("default_params") else None
+    return d
+
+def update(workflow_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
+    cur = get(workflow_id)
+    conn = _connect()
+    _ensure(conn)
+    merged = {**cur, **patch}
+    merged["updated_at"] = _now()
+    conn.execute(
+        """
+        UPDATE workflows
+        SET project_id=?, name=?, workflow_type=?, workflow_blob_asset_id=?, default_params=?, updated_at=?, archived_at=?
+        WHERE id=?
+        """,
+        (
+            merged.get("project_id"),
+            merged["name"],
+            merged["workflow_type"],
+            merged.get("workflow_blob_asset_id"),
+            json.dumps(merged.get("default_params")) if merged.get("default_params") is not None else None,
+            merged["updated_at"],
+            merged.get("archived_at"),
+            workflow_id,
+        ),
+    )
+    conn.commit()
+    return get(workflow_id)
+
+def list_items(
+    *,
+    q: Optional[str],
+    workflow_type: Optional[str],
+    project_id: Optional[str],
+    archived: bool,
+    limit: int,
+    offset: int,
+) -> Tuple[List[Dict[str, Any]], int]:
+    conn = _connect()
+    _ensure(conn)
+    where = []
+    args: list[Any] = []
+    if not archived:
+        where.append("archived_at IS NULL")
+    if q:
+        where.append("name LIKE ?")
+        args.append(f"%{q}%")
+    if workflow_type:
+        where.append("workflow_type=?")
+        args.append(workflow_type)
+    if project_id:
+        where.append("project_id=?")
+        args.append(project_id)
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+    total = conn.execute(f"SELECT COUNT(1) AS c FROM workflows{where_sql}", args).fetchone()["c"]
+    rows = conn.execute(
+        f"SELECT * FROM workflows{where_sql} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        [*args, limit, offset],
+    ).fetchall()
+    items: List[Dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        d["default_params"] = json.loads(d["default_params"]) if d.get("default_params") else None
+        items.append(d)
+    return items, int(total)
+EOF
+
+cat > "apps/api/src/app/modules/workflows/router.py" <<'EOF'
+from __future__ import annotations
+from fastapi import APIRouter, Query, HTTPException
+from .dto import Workflow, WorkflowCreate, WorkflowUpdate, ListResp
+from . import store_sqlite as store
+
+router = APIRouter(prefix="/api/workflows", tags=["workflows"])
+
+@router.post("", response_model=Workflow)
+def create_workflow(body: WorkflowCreate):
+    return store.create(body.model_dump())
+
+@router.get("/{workflow_id}", response_model=Workflow)
+def get_workflow(workflow_id: str):
+    try:
+        return store.get(workflow_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+@router.patch("/{workflow_id}", response_model=Workflow)
+def update_workflow(workflow_id: str, body: WorkflowUpdate):
+    try:
+        return store.update(workflow_id, {k: v for k, v in body.model_dump().items() if v is not None})
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+@router.get("", response_model=ListResp)
+def list_workflows(
+    q: str | None = Query(default=None),
+    workflow_type: str | None = Query(default=None),
+    project_id: str | None = Query(default=None),
+    archived: bool = Query(default=False),
+    limit: int = Query(default=20, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    items, total = store.list_items(
+        q=q,
+        workflow_type=workflow_type,
+        project_id=project_id,
+        archived=archived,
+        limit=limit,
+        offset=offset,
+    )
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+EOF
+
+# ---- Tools ----
+cat > "apps/api/src/app/modules/tools/dto.py" <<'EOF'
+from __future__ import annotations
+from typing import Any, Optional, Dict
+from enum import Enum
+from pydantic import BaseModel, ConfigDict, Field
+
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+class ToolType(str, Enum):
+    control = "control"
+    postprocess = "postprocess"
+    subtitle_preset = "subtitle_preset"
+    transition_preset = "transition_preset"
+    other = "other"
+
+class Tool(StrictModel):
+    id: str
+    project_id: Optional[str] = None
+    name: str
+    tool_type: ToolType
+    config: Dict[str, Any]
+    description: Optional[str] = None
+    created_at: str
+    updated_at: Optional[str] = None
+    archived_at: Optional[str] = None
+
+class ToolCreate(StrictModel):
+    project_id: Optional[str] = None
+    name: str = Field(min_length=1, max_length=200)
+    tool_type: ToolType
+    config: Dict[str, Any]
+    description: Optional[str] = None
+
+class ToolUpdate(StrictModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    config: Optional[Dict[str, Any]] = None
+    description: Optional[str] = None
+    archived_at: Optional[str] = None
+
+class ListResp(StrictModel):
+    items: list
+    total: int
+    limit: int
+    offset: int
+EOF
+
+cat > "apps/api/src/app/modules/tools/store_sqlite.py" <<'EOF'
+from __future__ import annotations
+from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+import json
+import os
+import sqlite3
+from datetime import datetime, timezone
+import uuid
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def _default_db_path() -> str:
+    return os.getenv("AAM_SQLITE_PATH") or os.getenv("SQLITE_PATH") or str(Path("apps/api/.data/app.sqlite").resolve())
+
+def _connect() -> sqlite3.Connection:
+    path = _default_db_path()
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def _ensure(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tools (
+          id TEXT PRIMARY KEY,
+          project_id TEXT,
+          name TEXT NOT NULL,
+          tool_type TEXT NOT NULL,
+          config TEXT NOT NULL,
+          description TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT,
+          archived_at TEXT
+        )
+        """
+    )
+    conn.commit()
+
+def create(payload: Dict[str, Any]) -> Dict[str, Any]:
+    conn = _connect()
+    _ensure(conn)
+    tid = uuid.uuid4().hex
+    now = _now()
+    conn.execute(
+        """
+        INSERT INTO tools(id,project_id,name,tool_type,config,description,created_at,updated_at,archived_at)
+        VALUES(?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            tid,
+            payload.get("project_id"),
+            payload["name"],
+            payload["tool_type"],
+            json.dumps(payload["config"]),
+            payload.get("description"),
+            now,
+            now,
+            None,
+        ),
+    )
+    conn.commit()
+    return get(tid)
+
+def get(tool_id: str) -> Dict[str, Any]:
+    conn = _connect()
+    _ensure(conn)
+    row = conn.execute("SELECT * FROM tools WHERE id=?", (tool_id,)).fetchone()
+    if row is None:
+        raise KeyError("NOT_FOUND")
+    d = dict(row)
+    d["config"] = json.loads(d["config"]) if d.get("config") else {}
+    return d
+
+def update(tool_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
+    cur = get(tool_id)
+    conn = _connect()
+    _ensure(conn)
+    merged = {**cur, **patch}
+    merged["updated_at"] = _now()
+    conn.execute(
+        """
+        UPDATE tools
+        SET project_id=?, name=?, tool_type=?, config=?, description=?, updated_at=?, archived_at=?
+        WHERE id=?
+        """,
+        (
+            merged.get("project_id"),
+            merged["name"],
+            merged["tool_type"],
+            json.dumps(merged.get("config") or {}),
+            merged.get("description"),
+            merged["updated_at"],
+            merged.get("archived_at"),
+            tool_id,
+        ),
+    )
+    conn.commit()
+    return get(tool_id)
+
+def list_items(
+    *,
+    q: Optional[str],
+    tool_type: Optional[str],
+    project_id: Optional[str],
+    archived: bool,
+    limit: int,
+    offset: int,
+) -> Tuple[List[Dict[str, Any]], int]:
+    conn = _connect()
+    _ensure(conn)
+    where = []
+    args: list[Any] = []
+    if not archived:
+        where.append("archived_at IS NULL")
+    if q:
+        where.append("name LIKE ?")
+        args.append(f"%{q}%")
+    if tool_type:
+        where.append("tool_type=?")
+        args.append(tool_type)
+    if project_id:
+        where.append("project_id=?")
+        args.append(project_id)
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+    total = conn.execute(f"SELECT COUNT(1) AS c FROM tools{where_sql}", args).fetchone()["c"]
+    rows = conn.execute(
+        f"SELECT * FROM tools{where_sql} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        [*args, limit, offset],
+    ).fetchall()
+    items: List[Dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        d["config"] = json.loads(d["config"]) if d.get("config") else {}
+        items.append(d)
+    return items, int(total)
+EOF
+
+cat > "apps/api/src/app/modules/tools/router.py" <<'EOF'
+from __future__ import annotations
+from fastapi import APIRouter, Query, HTTPException
+from .dto import Tool, ToolCreate, ToolUpdate, ListResp
+from . import store_sqlite as store
+
+router = APIRouter(prefix="/api/tools", tags=["tools"])
+
+@router.post("", response_model=Tool)
+def create_tool(body: ToolCreate):
+    return store.create(body.model_dump())
+
+@router.get("/{tool_id}", response_model=Tool)
+def get_tool(tool_id: str):
+    try:
+        return store.get(tool_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Tool not found")
+
+@router.patch("/{tool_id}", response_model=Tool)
+def update_tool(tool_id: str, body: ToolUpdate):
+    try:
+        return store.update(tool_id, {k: v for k, v in body.model_dump().items() if v is not None})
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Tool not found")
+
+@router.get("", response_model=ListResp)
+def list_tools(
+    q: str | None = Query(default=None),
+    tool_type: str | None = Query(default=None),
+    project_id: str | None = Query(default=None),
+    archived: bool = Query(default=False),
+    limit: int = Query(default=20, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    items, total = store.list_items(
+        q=q,
+        tool_type=tool_type,
+        project_id=project_id,
+        archived=archived,
+        limit=limit,
+        offset=offset,
+    )
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+EOF
+
+# -------------------------
+# B) Register routers into modules/_registry.py
+# -------------------------
+python - <<'PY'
+from __future__ import annotations
+from pathlib import Path
+
+p = Path("apps/api/src/app/modules/_registry.py")
+txt = p.read_text(encoding="utf-8")
+
+marker = "# === M05 Prompts"
+if marker not in txt:
+    raise SystemExit("[fatal] cannot find marker '# === M05 Prompts' in _registry.py; abort")
+
+insert = """
+# === M07 Providers/Workflows/Tools ===
+from app.modules.providers.router import router as providers_router
+from app.modules.workflows.router import router as workflows_router
+from app.modules.tools.router import router as tools_router
+"""
+
+# insert after M05 block (append near end)
+if "providers_router" in txt or "workflows_router" in txt or "tools_router" in txt:
+    print("[ok] M07 routers already registered; skip")
+else:
+    txt = txt + "\n" + insert + "\n"
+    p.write_text(txt, encoding="utf-8")
+    print("[ok] registered M07 routers (appended to _registry.py)")
+PY
+
+# -------------------------
+# C) Tests
+# -------------------------
+cat > "apps/api/tests/test_m07_providers_workflows_tools.py" <<'EOF'
+from __future__ import annotations
+from fastapi.testclient import TestClient
+from app.main import app
+
+def test_m07_providers_crud():
+    c = TestClient(app)
+
+    r = c.post("/api/providers", json={
+        "name": "DemoProvider",
+        "provider_type": "http_api",
+        "supported_kinds": ["text2image", "text2video"],
+        "endpoint_config": {"base_url": "http://example"},
+        "is_enabled": True
+    })
+    assert r.status_code == 200
+    pid = r.json()["id"]
+
+    r = c.get(f"/api/providers/{pid}")
+    assert r.status_code == 200
+    assert r.json()["name"] == "DemoProvider"
+
+    r = c.get("/api/providers?limit=20&offset=0")
+    assert r.status_code == 200
+    assert r.json()["total"] >= 1
+
+    r = c.patch(f"/api/providers/{pid}", json={"is_enabled": False})
+    assert r.status_code == 200
+    assert r.json()["is_enabled"] is False
+
+def test_m07_workflows_crud():
+    c = TestClient(app)
+
+    r = c.post("/api/workflows", json={
+        "project_id": "p_demo",
+        "name": "WF1",
+        "workflow_type": "comfyui_workflow",
+        "workflow_blob_asset_id": "asset_wf_1",
+        "default_params": {"steps": 20}
+    })
+    assert r.status_code == 200
+    wid = r.json()["id"]
+
+    r = c.get(f"/api/workflows/{wid}")
+    assert r.status_code == 200
+
+    r = c.get("/api/workflows?project_id=p_demo&limit=20&offset=0")
+    assert r.status_code == 200
+    assert r.json()["total"] >= 1
+
+def test_m07_tools_crud():
+    c = TestClient(app)
+
+    r = c.post("/api/tools", json={
+        "project_id": "p_demo",
+        "name": "Tool1",
+        "tool_type": "postprocess",
+        "config": {"strength": 0.5},
+        "description": "demo"
+    })
+    assert r.status_code == 200
+    tid = r.json()["id"]
+
+    r = c.get(f"/api/tools/{tid}")
+    assert r.status_code == 200
+
+    r = c.get("/api/tools?tool_type=postprocess&limit=20&offset=0")
+    assert r.status_code == 200
+    assert r.json()["total"] >= 1
+EOF
+
+echo "[info] running backend tests..."
+cd "$repo_root/apps/api" || exit 1
+PYTHONPATH=./src pytest -q
+rc=$?
+echo "[info] pytest rc=$rc"
+if [ "$rc" -ne 0 ]; then
+  exit "$rc"
+fi
+
+cd "$repo_root" || exit 1
+
+# -------------------------
+# D) Export + verify contracts (live, needs api on 7000)
+# -------------------------
+echo "[info] start api server (7000) in background for export..."
+(
+  cd apps/api || exit 1
+  source ../../.venv/Scripts/activate 2>/dev/null || true
+  PYTHONPATH=./src uvicorn app.main:app --host 0.0.0.0 --port 7000 > /tmp/api_7000_m07.log 2>&1 &
+  echo $! > /tmp/api_7000_m07.pid
+  echo "[ok] api started pid=$(cat /tmp/api_7000_m07.pid)"
+)
+curl -sS http://localhost:7000/health >/tmp/h_m07.json && echo "[ok] health: $(cat /tmp/h_m07.json)"
+
+echo "[info] bump contract version (YYYYMMDD-NN)"
+python - <<'PY'
+from __future__ import annotations
+from pathlib import Path
+import re
+from datetime import datetime
+
+p = Path("packages/contracts/contract_version.txt")
+old = p.read_text(encoding="utf-8").strip() if p.exists() else ""
+today = datetime.now().strftime("%Y%m%d")
+
+m = re.fullmatch(r"(\d{8})-(\d{2})", old)
+if m and m.group(1) == today:
+    nn = int(m.group(2)) + 1
+    new = f"{today}-{nn:02d}"
+else:
+    new = f"{today}-01"
+
+p.parent.mkdir(parents=True, exist_ok=True)
+p.write_text(new + "\n", encoding="utf-8")
+print(f"[ok] contract_version: {old!r} -> {new!r}")
+PY
+
+./scripts/export_openapi.sh
+rc=$?
+echo "[info] export_openapi rc=$rc"
+./scripts/verify_contracts.sh
+rc=$?
+echo "[info] verify_contracts rc=$rc"
+
+echo "[info] stop api server..."
+if [ -f /tmp/api_7000_m07.pid ]; then
+  kill "$(cat /tmp/api_7000_m07.pid)" 2>/dev/null || true
+  echo "[ok] killed pid=$(cat /tmp/api_7000_m07.pid)"
+fi
+
+# -------------------------
+# E) Web (minimal settings pages) + build
+# -------------------------
+mkdir -p "apps/web/app/(app)/settings/providers"
+mkdir -p "apps/web/app/(app)/settings/workflows"
+mkdir -p "apps/web/app/(app)/settings/tools"
+
+cat > "apps/web/app/(app)/settings/providers/page.tsx" <<'EOF'
+"use client";
+import { useEffect, useState } from "react";
+import { apiGet, apiPost } from "../../../../src/lib/api/client";
+
+type Provider = { id: string; name: string; provider_type: string; is_enabled: boolean; supported_kinds: string[]; created_at: string; };
+type ListResp<T> = { items: T[]; total: number; limit: number; offset: number };
+
+export default function ProvidersPage() {
+  const [items, setItems] = useState<Provider[]>([]);
+  const [name, setName] = useState("DemoProvider");
+  const [loading, setLoading] = useState(false);
+
+  async function reload() {
+    setLoading(true);
+    try {
+      const r = await apiGet<ListResp<Provider>>("/api/providers?limit=50&offset=0");
+      setItems(r.items || []);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => { void reload(); }, []);
+
+  async function createOne() {
+    await apiPost<Provider>("/api/providers", {
+      name,
+      provider_type: "http_api",
+      supported_kinds: ["text2image"],
+      endpoint_config: { base_url: "http://example" },
+      is_enabled: true
+    });
+    await reload();
+  }
+
+  return (
+    <div style={{ padding: 16, display: "flex", flexDirection: "column", gap: 12 }}>
+      <h1 style={{ fontSize: 18, fontWeight: 600 }}>Settings / Providers</h1>
+      <div style={{ display: "flex", gap: 8 }}>
+        <input value={name} onChange={(e) => setName(e.target.value)} style={{ padding: 8, border: "1px solid #ccc", borderRadius: 6 }} />
+        <button onClick={createOne} style={{ padding: "8px 12px" }}>Create</button>
+        <button onClick={reload} style={{ padding: "8px 12px" }}>{loading ? "Loading..." : "Reload"}</button>
+      </div>
+      <div style={{ border: "1px solid #ddd", borderRadius: 8 }}>
+        {items.map(p => (
+          <div key={p.id} style={{ padding: 10, borderTop: "1px solid #eee" }}>
+            <b>{p.name}</b> — {p.provider_type} — enabled={String(p.is_enabled)}
+          </div>
+        ))}
+        {items.length === 0 ? <div style={{ padding: 10 }}>(empty)</div> : null}
+      </div>
+    </div>
+  );
+}
+EOF
+
+cat > "apps/web/app/(app)/settings/workflows/page.tsx" <<'EOF'
+"use client";
+import { useEffect, useState } from "react";
+import { apiGet, apiPost } from "../../../../src/lib/api/client";
+
+type Workflow = { id: string; name: string; workflow_type: string; workflow_blob_asset_id?: string|null; created_at: string; };
+type ListResp<T> = { items: T[]; total: number; limit: number; offset: number };
+
+export default function WorkflowsPage() {
+  const [items, setItems] = useState<Workflow[]>([]);
+  const [name, setName] = useState("WF1");
+
+  async function reload() {
+    const r = await apiGet<ListResp<Workflow>>("/api/workflows?limit=50&offset=0");
+    setItems(r.items || []);
+  }
+
+  useEffect(() => { void reload(); }, []);
+
+  async function createOne() {
+    await apiPost<Workflow>("/api/workflows", {
+      project_id: "p_demo",
+      name,
+      workflow_type: "comfyui_workflow",
+      workflow_blob_asset_id: "asset_wf_1",
+      default_params: { steps: 20 }
+    });
+    await reload();
+  }
+
+  return (
+    <div style={{ padding: 16, display: "flex", flexDirection: "column", gap: 12 }}>
+      <h1 style={{ fontSize: 18, fontWeight: 600 }}>Settings / Workflows</h1>
+      <div style={{ display: "flex", gap: 8 }}>
+        <input value={name} onChange={(e) => setName(e.target.value)} style={{ padding: 8, border: "1px solid #ccc", borderRadius: 6 }} />
+        <button onClick={createOne} style={{ padding: "8px 12px" }}>Create</button>
+        <button onClick={reload} style={{ padding: "8px 12px" }}>Reload</button>
+      </div>
+      <div style={{ border: "1px solid #ddd", borderRadius: 8 }}>
+        {items.map(w => (
+          <div key={w.id} style={{ padding: 10, borderTop: "1px solid #eee" }}>
+            <b>{w.name}</b> — {w.workflow_type}
+          </div>
+        ))}
+        {items.length === 0 ? <div style={{ padding: 10 }}>(empty)</div> : null}
+      </div>
+    </div>
+  );
+}
+EOF
+
+cat > "apps/web/app/(app)/settings/tools/page.tsx" <<'EOF'
+"use client";
+import { useEffect, useState } from "react";
+import { apiGet, apiPost } from "../../../../src/lib/api/client";
+
+type Tool = { id: string; name: string; tool_type: string; created_at: string; };
+type ListResp<T> = { items: T[]; total: number; limit: number; offset: number };
+
+export default function ToolsPage() {
+  const [items, setItems] = useState<Tool[]>([]);
+  const [name, setName] = useState("Tool1");
+
+  async function reload() {
+    const r = await apiGet<ListResp<Tool>>("/api/tools?limit=50&offset=0");
+    setItems(r.items || []);
+  }
+
+  useEffect(() => { void reload(); }, []);
+
+  async function createOne() {
+    await apiPost<Tool>("/api/tools", {
+      project_id: "p_demo",
+      name,
+      tool_type: "postprocess",
+      config: { strength: 0.5 },
+      description: "demo"
+    });
+    await reload();
+  }
+
+  return (
+    <div style={{ padding: 16, display: "flex", flexDirection: "column", gap: 12 }}>
+      <h1 style={{ fontSize: 18, fontWeight: 600 }}>Settings / Tools</h1>
+      <div style={{ display: "flex", gap: 8 }}>
+        <input value={name} onChange={(e) => setName(e.target.value)} style={{ padding: 8, border: "1px solid #ccc", borderRadius: 6 }} />
+        <button onClick={createOne} style={{ padding: "8px 12px" }}>Create</button>
+        <button onClick={reload} style={{ padding: "8px 12px" }}>Reload</button>
+      </div>
+      <div style={{ border: "1px solid #ddd", borderRadius: 8 }}>
+        {items.map(t => (
+          <div key={t.id} style={{ padding: 10, borderTop: "1px solid #eee" }}>
+            <b>{t.name}</b> — {t.tool_type}
+          </div>
+        ))}
+        {items.length === 0 ? <div style={{ padding: 10 }}>(empty)</div> : null}
+      </div>
+    </div>
+  );
+}
+EOF
+
+echo "[info] running next build..."
+cd "$repo_root/apps/web" || exit 1
+npm run build
+rc=$?
+echo "[info] next build rc=$rc"
+exit $rc

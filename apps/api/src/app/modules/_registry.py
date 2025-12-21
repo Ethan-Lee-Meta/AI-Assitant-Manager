@@ -17,6 +17,21 @@ def get_module_routers() -> List[APIRouter]:
     from .prompts.router import router as prompts_router
     routers.append(prompts_router)
     # --- M05 Prompts end ---
+    # --- M07 Providers begin ---
+    from .providers.router import router as providers_router
+    routers.append(providers_router)
+    # --- M07 Providers end ---
+
+    # --- M07 Workflows begin ---
+    from .workflows.router import router as workflows_router
+    routers.append(workflows_router)
+    # --- M07 Workflows end ---
+
+    # --- M07 Tools begin ---
+    from .tools.router import router as tools_router
+    routers.append(tools_router)
+    # --- M07 Tools end ---
+
 
 
     return routers

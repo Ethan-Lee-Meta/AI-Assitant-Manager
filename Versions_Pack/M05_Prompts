@@ -1,0 +1,51 @@
+Prompts5（M05）总结：能力、契约与不可变约束
+1) 后端能力（已完成并通过 pytest + OpenAPI 锁定）
+
+Prompt 资源（可复用提示词资产）
+
+字段语义与范围：id, project_id(optional: 可允许全局模板库), name, prompt_kind, content_text, composition_blocks(optional), searchable_text 等。 
+
+AI-Assitant-Manager需求
+
+API 契约：/api/prompts 提供 Create/Update/Get/List；List 支持 q 以及 prompt_kind 过滤等统一约定。 
+
+AI-Assitant-Manager需求
+
+PromptVersion 资源（不可变快照）
+
+不可变语义：PromptVersion 作为“可复现快照”，字段包含 resolved_prompt_text / resolved_params / role_bindings / workflow_ref 等。 
+
+AI-Assitant-Manager需求
+
+API 契约：/api/prompt_versions 仅 Create/Get/List；Update=NONE（禁止）。 
+
+AI-Assitant-Manager需求
+
+冻结规则：PromptVersion 不可修改；任何变更必须通过新建版本或 fork（新 id）。 
+
+AI-Assitant-Manager需求
+
+全局 API 规则仍成立：base_path /api，列表响应统一 items/total/limit/offset，分页/排序/q/archived 约定统一。 
+
+AI-Assitant-Manager需求
+
+2) 前端能力（已完成并能 next build）
+
+Sidebar 信息架构中已包含 Prompts（与你的 next build 路由输出 /prompts 一致）。 
+
+AI-Assitant-Manager需求
+
+Prompt Library / Composer 的目标与区块定义：Prompts 列表（q、类型过滤）、Prompt 编辑、组合块引用 Role/Tool/模板片段、生成 PromptVersion。 
+
+AI-Assitant-Manager需求
+
+3) 你当前仓库状态（从你的日志归纳）
+
+后端：pytest 已到 13 passed；合同已 export 并锁定，contract_version 已推进到 20251221-03（你日志中已完成 export+verify）。
+
+前端：Next.js npm run build 已恢复成功（之前 JSX.Element 问题已修复）。
+
+集成门禁：verify_contracts.sh 在 live 模式已 OK（你已跑通“启动 API→export→verify”闭环）。
+
+目前唯一“未完成点”：你在执行 ./tmp/M05_R5 时，因 bash 对括号路径解析导致脚本中断：
+mkdir -p apps/web/app/(app)/prompts/[prompt_id] 需要引号。
