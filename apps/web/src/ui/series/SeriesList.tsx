@@ -1,7 +1,7 @@
 'use client';
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Series, createSeries, listSeries } from "../../lib/api/series";
 
 const LS_PROJECT_ID = "m02.series.project_id";
@@ -50,14 +50,8 @@ export function SeriesList() {
     }
   }, [projectId, q]);
 
-  const canQuery = useMemo(() => true, []);
-
   const refresh = useCallback(async () => {
     setErr(null);
-    if (!canQuery) {
-      setItems([]); setTotal(0);
-      return;
-    }
     setLoading(true);
     try {
       const r = await listSeries({
@@ -73,7 +67,7 @@ export function SeriesList() {
     } finally {
       setLoading(false);
     }
-  }, [canQuery, projectId, q]);
+  }, [projectId, q]);
 
   useEffect(() => { void refresh(); }, [refresh]);
 

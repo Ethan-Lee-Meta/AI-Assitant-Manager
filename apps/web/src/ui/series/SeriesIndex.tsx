@@ -24,14 +24,19 @@ export function SeriesIndex() {
   }, []);
 
   useEffect(() => {
-    if (queryProjectId) localStorage.setItem(LS_KEY, queryProjectId);
+    if (queryProjectId) {
+      localStorage.setItem(LS_KEY, queryProjectId);
+    } else {
+      localStorage.removeItem(LS_KEY);
+    }
   }, [queryProjectId]);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (overrideProjectId?: string) => {
     setErr("");
     try {
+      const effectiveProjectId = (overrideProjectId ?? queryProjectId).trim() || undefined;
       const res = await listSeries({
-        project_id: queryProjectId.trim() || undefined,
+        project_id: effectiveProjectId,
         q: q.trim() || undefined,
         limit: 50,
         offset: 0,
@@ -70,7 +75,7 @@ export function SeriesIndex() {
       });
       // after create, switch listing to that project_id (helps avoid “created but not visible” confusion)
       setQueryProjectId(pid);
-      await refresh();
+      await refresh(pid);
       setName("");
       setStyleText("");
       setContinuityText("");
