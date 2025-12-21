@@ -1,0 +1,409 @@
+"use client";
+
+import React, { useEffect, useMemo, useState } from "react";
+import { apiFetch, apiGet, apiPost } from "../../../src/lib/api/client";
+import { ApiError } from "../../../src/lib/api/errors";
+
+type ListResponse<T> = { items: T[]; total: number; limit: number; offset: number };
+
+// Keep these permissive: backend contract is source-of-truth (OpenAPI).
+type Prompt = {
+  id: string;
+  name: string;
+  description?: string | null;
+  tags?: string[] | null;
+  archived_at?: string | null;
+  created_at?: string;
+  updated_at?: string;
+  [k: string]: unknown;
+};
+
+type PromptVersion = {
+  id: string;
+  prompt_id?: string;
+  created_at?: string;
+  [k: string]: unknown;
+};
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function formatErr(e: unknown): { title: string; requestId?: string; details?: string } {
+  if (e instanceof ApiError) {
+    return {
+      title: `${e.code}: ${e.message}`,
+      requestId: e.requestId,
+      details: e.details ? JSON.stringify(e.details, null, 2) : undefined,
+    };
+  }
+  const msg = e instanceof Error ? e.message : String(e);
+  return { title: msg };
+}
+
+function safeJsonParse(text: string): { ok: true; value: any } | { ok: false; error: string } {
+  try {
+    return { ok: true, value: JSON.parse(text) };
+  } catch (e: any) {
+    return { ok: false, error: e?.message || "Invalid JSON" };
+  }
+}
+
+export default function PromptsPage() {
+  const [loading, setLoading] = useState(false);
+
+  const [prompts, setPrompts] = useState<Prompt[]>([]);
+  const [selectedId, setSelectedId] = useState<string>("");
+
+  const [archived, setArchived] = useState<boolean>(false);
+  const [q, setQ] = useState<string>("");
+
+  const [errTitle, setErrTitle] = useState<string>("");
+  const [errRid, setErrRid] = useState<string>("");
+  const [errDetails, setErrDetails] = useState<string>("");
+
+  const selected = useMemo(() => prompts.find((p) => p.id === selectedId) || null, [prompts, selectedId]);
+
+  const [createPromptJson, setCreatePromptJson] = useState<string>(
+    JSON.stringify(
+      {
+        name: "Demo Prompt",
+        description: "example",
+        tags: ["demo"],
+      },
+      null,
+      2
+    )
+  );
+
+  const [createPvJson, setCreatePvJson] = useState<string>(
+    JSON.stringify(
+      {
+        prompt_id: "",
+        composition_blocks: [],
+        resolved_prompt_text: "Write a short, safe prompt here.",
+        resolved_params: {},
+        workflow_ref: "default",
+      },
+      null,
+      2
+    )
+  );
+
+  const [versions, setVersions] = useState<PromptVersion[]>([]);
+  const [pvLoading, setPvLoading] = useState(false);
+
+  function clearError() {
+    setErrTitle("");
+    setErrRid("");
+    setErrDetails("");
+  }
+
+  async function refreshPrompts() {
+    clearError();
+    setLoading(true);
+    try {
+      const params = new URLSearchParams();
+      params.set("limit", "50");
+      params.set("offset", "0");
+      params.set("archived", archived ? "true" : "false");
+      params.set("sort", "-created_at");
+      if (q.trim()) params.set("q", q.trim());
+
+      const data = await apiGet<ListResponse<Prompt>>(`/api/prompts?${params.toString()}`);
+      setPrompts(data.items || []);
+      // keep selection if still exists
+      if (selectedId && !data.items.find((p) => p.id === selectedId)) {
+        setSelectedId("");
+      }
+    } catch (e) {
+      const f = formatErr(e);
+      setErrTitle(f.title);
+      setErrRid(f.requestId || "");
+      setErrDetails(f.details || "");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function refreshVersions(promptId: string) {
+    clearError();
+    setPvLoading(true);
+    try {
+      const params = new URLSearchParams();
+      params.set("limit", "50");
+      params.set("offset", "0");
+      params.set("sort", "-created_at");
+      // best-effort: many APIs support prompt_id filter
+      params.set("prompt_id", promptId);
+
+      const data = await apiGet<ListResponse<PromptVersion>>(`/api/prompt_versions?${params.toString()}`);
+      setVersions(data.items || []);
+    } catch (e) {
+      const f = formatErr(e);
+      setErrTitle(f.title);
+      setErrRid(f.requestId || "");
+      setErrDetails(f.details || "");
+      setVersions([]);
+    } finally {
+      setPvLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    refreshPrompts();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [archived]);
+
+  useEffect(() => {
+    // When selection changes, prefill prompt_id for PV creation and load versions.
+    const pid = selected?.id || "";
+    const parsed = safeJsonParse(createPvJson);
+    if (parsed.ok) {
+      const next = { ...parsed.value, prompt_id: pid };
+      setCreatePvJson(JSON.stringify(next, null, 2));
+    }
+    if (pid) refreshVersions(pid);
+    else setVersions([]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId]);
+
+  async function onCreatePrompt() {
+    clearError();
+    const parsed = safeJsonParse(createPromptJson);
+    if (!parsed.ok) {
+      setErrTitle("INVALID_JSON");
+      setErrDetails(parsed.error);
+      return;
+    }
+    setLoading(true);
+    try {
+      await apiPost<Prompt>("/api/prompts", parsed.value);
+      await refreshPrompts();
+    } catch (e) {
+      const f = formatErr(e);
+      setErrTitle(f.title);
+      setErrRid(f.requestId || "");
+      setErrDetails(f.details || "");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function onArchivePrompt(id: string) {
+    clearError();
+    setLoading(true);
+    try {
+      await apiFetch<Prompt>(`/api/prompts/${id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ archived_at: nowIso() }),
+      });
+      await refreshPrompts();
+      if (selectedId === id) setSelectedId("");
+    } catch (e) {
+      const f = formatErr(e);
+      setErrTitle(f.title);
+      setErrRid(f.requestId || "");
+      setErrDetails(f.details || "");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function onCreatePromptVersion() {
+    clearError();
+    const parsed = safeJsonParse(createPvJson);
+    if (!parsed.ok) {
+      setErrTitle("INVALID_JSON");
+      setErrDetails(parsed.error);
+      return;
+    }
+    if (!selected?.id) {
+      setErrTitle("NO_PROMPT_SELECTED");
+      setErrDetails("Select a prompt first.");
+      return;
+    }
+    // Force prompt_id = selected.id
+    parsed.value.prompt_id = selected.id;
+
+    setPvLoading(true);
+    try {
+      await apiPost<PromptVersion>("/api/prompt_versions", parsed.value);
+      await refreshVersions(selected.id);
+    } catch (e) {
+      const f = formatErr(e);
+      setErrTitle(f.title);
+      setErrRid(f.requestId || "");
+      setErrDetails(f.details || "");
+    } finally {
+      setPvLoading(false);
+    }
+  }
+
+  return (
+    <div style={{ padding: 16, display: "grid", gap: 16 }}>
+      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 12 }}>
+        <div>
+          <h1 style={{ fontSize: 20, fontWeight: 700, margin: 0 }}>Prompts</h1>
+          <div style={{ opacity: 0.8, fontSize: 12 }}>
+            Prompt Library + PromptVersion (immutable snapshots). API calls via platform api client only.
+          </div>
+        </div>
+
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <label style={{ fontSize: 12, display: "flex", gap: 6, alignItems: "center" }}>
+            <input
+              type="checkbox"
+              checked={archived}
+              onChange={(e) => setArchived(e.target.checked)}
+            />
+            archived
+          </label>
+
+          <input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="q (name contains...)"
+            style={{ padding: 8, minWidth: 220 }}
+          />
+          <button onClick={refreshPrompts} disabled={loading} style={{ padding: "8px 12px" }}>
+            {loading ? "Loading..." : "Refresh"}
+          </button>
+        </div>
+      </div>
+
+      {errTitle ? (
+        <div style={{ border: "1px solid #f2b8b5", background: "#fff5f5", padding: 12, borderRadius: 8 }}>
+          <div style={{ fontWeight: 700 }}>Error</div>
+          <div style={{ whiteSpace: "pre-wrap" }}>{errTitle}</div>
+          {errRid ? <div style={{ marginTop: 6, fontSize: 12, opacity: 0.85 }}>request_id: {errRid}</div> : null}
+          {errDetails ? (
+            <pre style={{ marginTop: 8, padding: 8, background: "#fff", overflow: "auto" }}>{errDetails}</pre>
+          ) : null}
+        </div>
+      ) : null}
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+        {/* Prompts list */}
+        <div style={{ border: "1px solid #eee", borderRadius: 8, padding: 12 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+            <h2 style={{ fontSize: 14, margin: 0 }}>Prompt List</h2>
+            <div style={{ fontSize: 12, opacity: 0.8 }}>count: {prompts.length}</div>
+          </div>
+
+          <div style={{ marginTop: 12, display: "grid", gap: 8 }}>
+            {prompts.map((p) => (
+              <div
+                key={p.id}
+                style={{
+                  border: "1px solid #eee",
+                  borderRadius: 8,
+                  padding: 10,
+                  background: selectedId === p.id ? "#f7fbff" : "white",
+                }}
+              >
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {p.name}
+                    </div>
+                    <div style={{ fontSize: 12, opacity: 0.8, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {p.id}
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                    <button onClick={() => setSelectedId(p.id)} style={{ padding: "6px 10px" }}>
+                      Select
+                    </button>
+                    {!archived ? (
+                      <button onClick={() => onArchivePrompt(p.id)} style={{ padding: "6px 10px" }}>
+                        Archive
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+                {p.description ? (
+                  <div style={{ marginTop: 6, fontSize: 12, opacity: 0.85, whiteSpace: "pre-wrap" }}>
+                    {p.description}
+                  </div>
+                ) : null}
+              </div>
+            ))}
+            {prompts.length === 0 ? <div style={{ fontSize: 12, opacity: 0.7 }}>No items.</div> : null}
+          </div>
+        </div>
+
+        {/* Create prompt */}
+        <div style={{ border: "1px solid #eee", borderRadius: 8, padding: 12 }}>
+          <h2 style={{ fontSize: 14, margin: 0 }}>Create Prompt</h2>
+          <div style={{ marginTop: 8, fontSize: 12, opacity: 0.8 }}>
+            Body is JSON. Fields are validated by backend. If contract differs, edit JSON accordingly.
+          </div>
+          <textarea
+            value={createPromptJson}
+            onChange={(e) => setCreatePromptJson(e.target.value)}
+            style={{ marginTop: 10, width: "100%", minHeight: 220, fontFamily: "ui-monospace, Menlo, monospace" }}
+          />
+          <div style={{ marginTop: 10, display: "flex", justifyContent: "flex-end" }}>
+            <button onClick={onCreatePrompt} disabled={loading} style={{ padding: "8px 12px" }}>
+              Create
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* PromptVersion composer */}
+      <div style={{ border: "1px solid #eee", borderRadius: 8, padding: 12 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 12 }}>
+          <div>
+            <h2 style={{ fontSize: 14, margin: 0 }}>Composer: Create PromptVersion (immutable)</h2>
+            <div style={{ fontSize: 12, opacity: 0.8 }}>
+              Selected prompt: {selected ? `${selected.name} (${selected.id})` : "None"}
+            </div>
+          </div>
+          <button onClick={onCreatePromptVersion} disabled={!selected || pvLoading} style={{ padding: "8px 12px" }}>
+            {pvLoading ? "Working..." : "Create Version"}
+          </button>
+        </div>
+
+        <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+          <div>
+            <div style={{ fontSize: 12, opacity: 0.8 }}>Create PromptVersion body (JSON)</div>
+            <textarea
+              value={createPvJson}
+              onChange={(e) => setCreatePvJson(e.target.value)}
+              style={{ marginTop: 8, width: "100%", minHeight: 220, fontFamily: "ui-monospace, Menlo, monospace" }}
+            />
+          </div>
+          <div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+              <div style={{ fontSize: 12, opacity: 0.8 }}>Versions (best-effort list)</div>
+              {selected ? (
+                <button onClick={() => refreshVersions(selected.id)} disabled={pvLoading} style={{ padding: "6px 10px" }}>
+                  Refresh
+                </button>
+              ) : null}
+            </div>
+            <div style={{ marginTop: 8, display: "grid", gap: 8 }}>
+              {versions.map((v) => (
+                <div key={v.id} style={{ border: "1px solid #eee", borderRadius: 8, padding: 10 }}>
+                  <div style={{ fontWeight: 700, fontSize: 12 }}>{v.id}</div>
+                  <div style={{ fontSize: 12, opacity: 0.8 }}>{v.created_at || ""}</div>
+                </div>
+              ))}
+              {!selected ? <div style={{ fontSize: 12, opacity: 0.7 }}>Select a prompt to list versions.</div> : null}
+              {selected && versions.length === 0 ? (
+                <div style={{ fontSize: 12, opacity: 0.7 }}>No versions (or API list filter differs).</div>
+              ) : null}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div style={{ fontSize: 12, opacity: 0.7 }}>
+        Notes: PromptVersion is immutable by contract. UI does not provide update. Archive is soft-delete via archived_at.
+      </div>
+    </div>
+  );
+}

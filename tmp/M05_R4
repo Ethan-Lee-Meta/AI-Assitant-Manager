@@ -1,0 +1,917 @@
+#!/usr/bin/env bash
+set +e  # safety: do not exit terminal
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+echo "[info] repo_root=$repo_root"
+
+ts="$(date +%Y%m%d_%H%M%S)"
+
+# Best-effort venv activate (ok if already active)
+if [ -f "$repo_root/.venv/Scripts/activate" ]; then
+  # shellcheck disable=SC1090
+  source "$repo_root/.venv/Scripts/activate" 2>/dev/null || true
+fi
+
+backup() {
+  local f="$1"
+  if [ -f "$f" ]; then
+    cp "$f" "$f.bak.$ts"
+    echo "[ok] backup: $f.bak.$ts"
+  fi
+}
+
+# ----------------------------
+# (A) Backend: PromptVersions files
+# ----------------------------
+pv_dir="$repo_root/apps/api/src/app/modules/prompts"
+tests_dir="$repo_root/apps/api/tests"
+mkdir -p "$pv_dir" "$tests_dir"
+
+# 1) DTO
+pv_dto="$pv_dir/prompt_versions_dto.py"
+backup "$pv_dto"
+cat <<'PY' > "$pv_dto"
+from __future__ import annotations
+
+from datetime import datetime
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class PromptKind(str, Enum):
+    text2image = "text2image"
+    image2image = "image2image"
+    text2video = "text2video"
+    image2video = "image2video"
+    general = "general"
+
+
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class WorkflowRef(StrictModel):
+    workflow_id: Optional[str] = None
+    workflow_version: Optional[str] = None
+    workflow_blob_ref: Optional[str] = None
+
+
+class RoleBinding(StrictModel):
+    role_id: str
+    weight: Optional[float] = None
+    notes: Optional[str] = None
+
+
+class PromptVersion(StrictModel):
+    id: str
+    project_id: str
+    prompt_id: Optional[str] = None
+
+    version_label: str
+    prompt_kind: PromptKind
+
+    resolved_prompt_text: str
+    resolved_params: Optional[Dict[str, Any]] = None
+    role_bindings: Optional[List[RoleBinding]] = None
+    workflow_ref: Optional[WorkflowRef] = None
+
+    created_at: datetime
+
+
+class PromptVersionCreate(StrictModel):
+    project_id: str = Field(min_length=1)
+    prompt_id: Optional[str] = None
+
+    version_label: str = Field(min_length=1)
+    prompt_kind: PromptKind
+
+    resolved_prompt_text: str = Field(min_length=1)
+    resolved_params: Optional[Dict[str, Any]] = None
+    role_bindings: Optional[List[RoleBinding]] = None
+    workflow_ref: Optional[WorkflowRef] = None
+
+
+class PromptVersionListResponse(StrictModel):
+    items: List[PromptVersion]
+    total: int
+    offset: int
+    limit: int
+PY
+echo "[ok] wrote: $pv_dto"
+
+# 2) Store (sqlite)
+pv_store="$pv_dir/prompt_versions_store_sqlite.py"
+backup "$pv_store"
+cat <<'PY' > "$pv_store"
+from __future__ import annotations
+
+import json
+import sqlite3
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+
+def _repo_api_root_from_here() -> Path:
+    # .../apps/api/src/app/modules/prompts/<this_file>
+    p = Path(__file__).resolve()
+    # parents: prompts(0)->modules(1)->app(2)->src(3)->api(4)->apps(5)-><repo>(6)
+    # We want .../apps/api
+    return p.parents[4]
+
+
+def _db_path() -> Path:
+    api_root = _repo_api_root_from_here()  # .../apps/api
+    data_dir = api_root / ".data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir / "app.db"
+
+
+def connect() -> sqlite3.Connection:
+    db = str(_db_path())
+    conn = sqlite3.connect(db, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def ensure_tables(conn: sqlite3.Connection) -> None:
+    # Create prompt_versions table only; it can coexist with existing prompts table created elsewhere.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS prompt_versions (
+          id TEXT PRIMARY KEY,
+          project_id TEXT NOT NULL,
+          prompt_id TEXT NULL,
+          version_label TEXT NOT NULL,
+          prompt_kind TEXT NOT NULL,
+          resolved_prompt_text TEXT NOT NULL,
+          resolved_params TEXT NULL,
+          role_bindings TEXT NULL,
+          workflow_ref TEXT NULL,
+          created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_prompt_versions_project_id ON prompt_versions(project_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_prompt_versions_prompt_id ON prompt_versions(prompt_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_prompt_versions_kind ON prompt_versions(prompt_kind)")
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_prompt_versions_created_at ON prompt_versions(created_at)")
+
+
+def _jdump(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+
+
+def _jload(s: Optional[str]) -> Any:
+    if s is None:
+        return None
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+
+
+def insert_prompt_version(conn: sqlite3.Connection, row: Dict[str, Any]) -> None:
+    ensure_tables(conn)
+    conn.execute(
+        """
+        INSERT INTO prompt_versions (
+          id, project_id, prompt_id, version_label, prompt_kind,
+          resolved_prompt_text, resolved_params, role_bindings, workflow_ref, created_at
+        ) VALUES (
+          :id, :project_id, :prompt_id, :version_label, :prompt_kind,
+          :resolved_prompt_text, :resolved_params, :role_bindings, :workflow_ref, :created_at
+        )
+        """,
+        {
+            **row,
+            "resolved_params": _jdump(row.get("resolved_params")),
+            "role_bindings": _jdump(row.get("role_bindings")),
+            "workflow_ref": _jdump(row.get("workflow_ref")),
+        },
+    )
+
+
+def get_prompt_version(conn: sqlite3.Connection, pv_id: str) -> Optional[Dict[str, Any]]:
+    ensure_tables(conn)
+    cur = conn.execute("SELECT * FROM prompt_versions WHERE id = ?", (pv_id,))
+    r = cur.fetchone()
+    if not r:
+        return None
+    d = dict(r)
+    d["resolved_params"] = _jload(d.get("resolved_params"))
+    d["role_bindings"] = _jload(d.get("role_bindings"))
+    d["workflow_ref"] = _jload(d.get("workflow_ref"))
+    return d
+
+
+def list_prompt_versions(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    prompt_id: Optional[str],
+    prompt_kind: Optional[str],
+    q: Optional[str],
+    offset: int,
+    limit: int,
+    order_by_sql: str,
+) -> Tuple[List[Dict[str, Any]], int]:
+    ensure_tables(conn)
+
+    where = ["project_id = ?"]
+    args: List[Any] = [project_id]
+
+    if prompt_id:
+        where.append("prompt_id = ?")
+        args.append(prompt_id)
+    if prompt_kind:
+        where.append("prompt_kind = ?")
+        args.append(prompt_kind)
+    if q:
+        where.append("resolved_prompt_text LIKE ?")
+        args.append(f"%{q}%")
+
+    where_sql = " AND ".join(where)
+
+    cur = conn.execute(f"SELECT COUNT(1) AS c FROM prompt_versions WHERE {where_sql}", args)
+    total = int(cur.fetchone()["c"])
+
+    cur = conn.execute(
+        f"""
+        SELECT * FROM prompt_versions
+        WHERE {where_sql}
+        ORDER BY {order_by_sql}
+        LIMIT ? OFFSET ?
+        """,
+        args + [int(limit), int(offset)],
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    for d in rows:
+        d["resolved_params"] = _jload(d.get("resolved_params"))
+        d["role_bindings"] = _jload(d.get("role_bindings"))
+        d["workflow_ref"] = _jload(d.get("workflow_ref"))
+    return rows, total
+PY
+echo "[ok] wrote: $pv_store"
+
+# 3) Service
+pv_service="$pv_dir/prompt_versions_service.py"
+backup "$pv_service"
+cat <<'PY' > "$pv_service"
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional, Tuple, List
+from uuid import uuid4
+
+from app.core.errors import AppError
+
+from .prompt_versions_store_sqlite import connect, insert_prompt_version, get_prompt_version, list_prompt_versions
+
+
+_ALLOWED_SORT_FIELDS = {"created_at", "version_label"}
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_sort(sort: Optional[str]) -> str:
+    """
+    Accept:
+      - "created_at:desc" / "created_at:asc"
+      - "version_label:asc"
+      - "-created_at"
+    Default: created_at DESC
+    """
+    if not sort:
+        return "created_at DESC"
+
+    s = sort.strip()
+    direction = "ASC"
+
+    if s.startswith("-"):
+        field = s[1:]
+        direction = "DESC"
+    else:
+        if ":" in s:
+            field, dir_ = s.split(":", 1)
+            field = field.strip()
+            dir_ = dir_.strip().lower()
+            direction = "ASC" if dir_ == "asc" else "DESC" if dir_ == "desc" else ""
+            if not direction:
+                raise AppError(
+                    code="VALIDATION_ERROR",
+                    message="Invalid sort direction",
+                    status_code=422,
+                    details={"sort": sort},
+                )
+        else:
+            field = s
+            direction = "ASC"
+
+    if field not in _ALLOWED_SORT_FIELDS:
+        raise AppError(
+            code="VALIDATION_ERROR",
+            message="Invalid sort field",
+            status_code=422,
+            details={"sort": sort, "allowed": sorted(_ALLOWED_SORT_FIELDS)},
+        )
+
+    return f"{field} {direction}"
+
+
+def create_prompt_version(payload: Dict[str, Any]) -> Dict[str, Any]:
+    pv_id = str(uuid4())
+    row = {
+        "id": pv_id,
+        "project_id": payload["project_id"],
+        "prompt_id": payload.get("prompt_id"),
+        "version_label": payload["version_label"],
+        "prompt_kind": payload["prompt_kind"],
+        "resolved_prompt_text": payload["resolved_prompt_text"],
+        "resolved_params": payload.get("resolved_params"),
+        "role_bindings": payload.get("role_bindings"),
+        "workflow_ref": payload.get("workflow_ref"),
+        "created_at": _now().isoformat(),
+    }
+
+    with connect() as conn:
+        insert_prompt_version(conn, row)
+        conn.commit()
+
+        got = get_prompt_version(conn, pv_id)
+        assert got is not None
+        return got
+
+
+def get_prompt_version_or_404(pv_id: str) -> Dict[str, Any]:
+    with connect() as conn:
+        got = get_prompt_version(conn, pv_id)
+        if not got:
+            raise AppError(code="NOT_FOUND", message="PromptVersion not found", status_code=404, details={"id": pv_id})
+        return got
+
+
+def list_prompt_versions_service(
+    *,
+    project_id: str,
+    prompt_id: Optional[str],
+    prompt_kind: Optional[str],
+    q: Optional[str],
+    offset: int,
+    limit: int,
+    sort: Optional[str],
+) -> Tuple[List[Dict[str, Any]], int]:
+    if offset < 0:
+        raise AppError(code="VALIDATION_ERROR", message="offset must be >= 0", status_code=422, details={"offset": offset})
+    if limit <= 0 or limit > 200:
+        raise AppError(code="VALIDATION_ERROR", message="limit must be 1..200", status_code=422, details={"limit": limit})
+
+    order_by = _parse_sort(sort)
+
+    with connect() as conn:
+        rows, total = list_prompt_versions(
+            conn,
+            project_id=project_id,
+            prompt_id=prompt_id,
+            prompt_kind=prompt_kind,
+            q=q,
+            offset=offset,
+            limit=limit,
+            order_by_sql=order_by,
+        )
+        return rows, total
+PY
+echo "[ok] wrote: $pv_service"
+
+# 4) Router
+pv_router="$pv_dir/prompt_versions_router.py"
+backup "$pv_router"
+cat <<'PY' > "$pv_router"
+from __future__ import annotations
+
+from typing import Optional
+
+from fastapi import APIRouter, Query
+
+from .prompt_versions_dto import PromptKind, PromptVersion, PromptVersionCreate, PromptVersionListResponse
+from .prompt_versions_service import create_prompt_version, get_prompt_version_or_404, list_prompt_versions_service
+
+router = APIRouter(prefix="/api", tags=["prompt_versions"])
+
+
+@router.post("/prompt_versions", response_model=PromptVersion)
+def create_prompt_version_api(body: PromptVersionCreate) -> PromptVersion:
+    got = create_prompt_version(body.model_dump())
+    return PromptVersion.model_validate(got)
+
+
+@router.get("/prompt_versions/{prompt_version_id}", response_model=PromptVersion)
+def get_prompt_version_api(prompt_version_id: str) -> PromptVersion:
+    got = get_prompt_version_or_404(prompt_version_id)
+    return PromptVersion.model_validate(got)
+
+
+@router.get("/prompt_versions", response_model=PromptVersionListResponse)
+def list_prompt_versions_api(
+    project_id: str = Query(..., min_length=1),
+    prompt_id: Optional[str] = None,
+    prompt_kind: Optional[PromptKind] = None,
+    q: Optional[str] = None,
+    offset: int = 0,
+    limit: int = 50,
+    sort: Optional[str] = None,
+) -> PromptVersionListResponse:
+    rows, total = list_prompt_versions_service(
+        project_id=project_id,
+        prompt_id=prompt_id,
+        prompt_kind=prompt_kind.value if prompt_kind else None,
+        q=q,
+        offset=offset,
+        limit=limit,
+        sort=sort,
+    )
+    items = [PromptVersion.model_validate(r) for r in rows]
+    return PromptVersionListResponse(items=items, total=total, offset=offset, limit=limit)
+PY
+echo "[ok] wrote: $pv_router"
+
+# 5) Patch prompts/router.py to include prompt_versions_router (no registry change needed)
+prompts_router="$pv_dir/router.py"
+if [ ! -f "$prompts_router" ]; then
+  echo "[fail] missing prompts router: $prompts_router"
+else
+  backup "$prompts_router"
+  python - <<'PY'
+from __future__ import annotations
+from pathlib import Path
+
+p = Path("apps/api/src/app/modules/prompts/router.py")
+s = p.read_text(encoding="utf-8")
+
+marker = "# --- M05 PromptVersions router include ---"
+if marker in s:
+    print("[ok] prompts/router.py already includes prompt_versions router; skip")
+else:
+    # append at end; keep simple and explicit (fail fast if import wrong)
+    s2 = s.rstrip() + "\n\n" + marker + "\n" + \
+         "from .prompt_versions_router import router as prompt_versions_router\n" + \
+         "router.include_router(prompt_versions_router)\n"
+    p.write_text(s2 + "\n", encoding="utf-8")
+    print("[ok] patched prompts/router.py: included prompt_versions_router")
+PY
+fi
+
+# ----------------------------
+# (B) Pytest
+# ----------------------------
+pv_test="$tests_dir/test_prompt_versions_crud.py"
+backup "$pv_test"
+cat <<'PY' > "$pv_test"
+from fastapi.testclient import TestClient
+
+from app.main import app
+
+
+def test_prompt_versions_create_get_list_and_immutable():
+    c = TestClient(app)
+
+    # prompt_id is optional by contract, but we still create a Prompt to simulate typical flow
+    pr = c.post(
+        "/api/prompts",
+        json={
+            "project_id": "proj_demo",
+            "name": "Demo Prompt",
+            "prompt_kind": "text2image",
+            "content_text": "A cat, studio lighting",
+            "searchable_text": "cat studio",
+        },
+    )
+    assert pr.status_code == 200, pr.text
+    prompt_id = pr.json()["id"]
+
+    vr = c.post(
+        "/api/prompt_versions",
+        json={
+            "project_id": "proj_demo",
+            "prompt_id": prompt_id,
+            "version_label": "v1",
+            "prompt_kind": "text2image",
+            "resolved_prompt_text": "A cat, studio lighting",
+            "resolved_params": {"width": 512, "height": 512},
+        },
+    )
+    assert vr.status_code == 200, vr.text
+    vid = vr.json()["id"]
+    assert "created_at" in vr.json()
+    assert "updated_at" not in vr.json()
+
+    gr = c.get(f"/api/prompt_versions/{vid}")
+    assert gr.status_code == 200, gr.text
+    assert gr.json()["id"] == vid
+
+    lr = c.get(f"/api/prompt_versions?project_id=proj_demo&prompt_id={prompt_id}&limit=10&offset=0")
+    assert lr.status_code == 200, lr.text
+    body = lr.json()
+    assert body["total"] >= 1
+    assert any(x["id"] == vid for x in body["items"])
+
+    # immutable: no update endpoint
+    ur = c.patch(f"/api/prompt_versions/{vid}", json={"version_label": "v2"})
+    assert ur.status_code in (404, 405)
+
+    # project_id required for list
+    bad = c.get("/api/prompt_versions")
+    assert bad.status_code == 422
+PY
+echo "[ok] wrote: $pv_test"
+
+echo "[info] running backend tests..."
+(
+  cd "$repo_root/apps/api" || exit 1
+  PYTHONPATH=./src pytest -q
+)
+rc=$?
+echo "[info] pytest rc=$rc"
+if [ $rc -ne 0 ]; then
+  echo "[warn] backend tests failed; stop before contract export"
+  exit 0
+fi
+
+# ----------------------------
+# (C) Contract export: bump + export + verify (requires server)
+# ----------------------------
+echo "[info] starting api server (7000) in background for contract export..."
+(
+  cd "$repo_root/apps/api" || exit 1
+  PYTHONPATH=./src uvicorn app.main:app --host 0.0.0.0 --port 7000 > /tmp/api_7000.log 2>&1 &
+  echo $! > /tmp/api_7000.pid
+  echo "[ok] api started pid=$(cat /tmp/api_7000.pid)"
+)
+
+sleep 1
+curl -sS http://localhost:7000/health -o /tmp/h.json
+echo "[info] api /health:"
+cat /tmp/h.json; echo
+
+echo "[info] bump contract version (YYYYMMDD-NN)"
+cd "$repo_root" || exit 1
+python - <<'PY'
+from __future__ import annotations
+from pathlib import Path
+import re
+from datetime import datetime
+
+p = Path("packages/contracts/contract_version.txt")
+old = p.read_text(encoding="utf-8").strip() if p.exists() else ""
+today = datetime.now().strftime("%Y%m%d")
+
+m = re.fullmatch(r"(\d{8})-(\d{2})", old)
+if m and m.group(1) == today:
+    nn = int(m.group(2)) + 1
+    new = f"{today}-{nn:02d}"
+else:
+    new = f"{today}-01"
+
+p.parent.mkdir(parents=True, exist_ok=True)
+p.write_text(new + "\n", encoding="utf-8")
+print(f"[ok] contract_version: {old!r} -> {new!r}")
+PY
+
+./scripts/export_openapi.sh
+rc=$?
+echo "[info] export_openapi rc=$rc"
+
+./scripts/verify_contracts.sh
+rc=$?
+echo "[info] verify_contracts rc=$rc"
+
+echo "[info] stopping api server..."
+if [ -f /tmp/api_7000.pid ]; then
+  kill "$(cat /tmp/api_7000.pid)" 2>/dev/null || true
+  echo "[ok] killed pid=$(cat /tmp/api_7000.pid)"
+fi
+
+# ----------------------------
+# (D) Web: Minimal PromptVersion panel on /prompts
+# ----------------------------
+web_api="$repo_root/apps/web/src/lib/api"
+web_ui="$repo_root/apps/web/src/ui/prompts"
+mkdir -p "$web_api" "$web_ui"
+
+pv_ts="$web_api/prompt_versions.ts"
+backup "$pv_ts"
+cat <<'TS' > "$pv_ts"
+import { apiGet, apiPost } from "./client";
+
+export type PromptKind = "text2image" | "image2image" | "text2video" | "image2video" | "general";
+
+export type PromptVersion = {
+  id: string;
+  project_id: string;
+  prompt_id?: string | null;
+  version_label: string;
+  prompt_kind: PromptKind;
+  resolved_prompt_text: string;
+  resolved_params?: Record<string, unknown> | null;
+  role_bindings?: Array<{ role_id: string; weight?: number | null; notes?: string | null }> | null;
+  workflow_ref?: { workflow_id?: string | null; workflow_version?: string | null; workflow_blob_ref?: string | null } | null;
+  created_at: string;
+};
+
+export type PromptVersionListResponse = {
+  items: PromptVersion[];
+  total: number;
+  offset: number;
+  limit: number;
+};
+
+export async function listPromptVersions(params: {
+  project_id: string;
+  prompt_id?: string;
+  prompt_kind?: PromptKind;
+  q?: string;
+  offset?: number;
+  limit?: number;
+  sort?: string;
+}): Promise<PromptVersionListResponse> {
+  const q = new URLSearchParams();
+  q.set("project_id", params.project_id);
+  if (params.prompt_id) q.set("prompt_id", params.prompt_id);
+  if (params.prompt_kind) q.set("prompt_kind", params.prompt_kind);
+  if (params.q) q.set("q", params.q);
+  q.set("offset", String(params.offset ?? 0));
+  q.set("limit", String(params.limit ?? 50));
+  if (params.sort) q.set("sort", params.sort);
+
+  return apiGet<PromptVersionListResponse>(`/api/prompt_versions?${q.toString()}`);
+}
+
+export async function createPromptVersion(body: {
+  project_id: string;
+  prompt_id?: string | null;
+  version_label: string;
+  prompt_kind: PromptKind;
+  resolved_prompt_text: string;
+  resolved_params?: Record<string, unknown> | null;
+}): Promise<PromptVersion> {
+  return apiPost<PromptVersion>("/api/prompt_versions", body);
+}
+TS
+echo "[ok] wrote: $pv_ts"
+
+# Overwrite PromptList to avoid JSX namespace typing pitfalls; keep minimal but working.
+prompt_list="$web_ui/PromptList.tsx"
+backup "$prompt_list"
+cat <<'TSX' > "$prompt_list"
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import { apiGet, apiPost } from "../../lib/api/client";
+import { createPromptVersion, listPromptVersions, type PromptVersion, type PromptKind } from "../../lib/api/prompt_versions";
+
+type Prompt = {
+  id: string;
+  project_id?: string | null;
+  name: string;
+  prompt_kind: PromptKind;
+  content_text: string;
+  searchable_text?: string | null;
+  archived_at?: string | null;
+  created_at?: string;
+  updated_at?: string;
+};
+
+type PromptListResponse = {
+  items: Prompt[];
+  total: number;
+  offset: number;
+  limit: number;
+};
+
+async function listPrompts(params: { q?: string; prompt_kind?: PromptKind; offset?: number; limit?: number }): Promise<PromptListResponse> {
+  const qs = new URLSearchParams();
+  if (params.q) qs.set("q", params.q);
+  if (params.prompt_kind) qs.set("prompt_kind", params.prompt_kind);
+  qs.set("offset", String(params.offset ?? 0));
+  qs.set("limit", String(params.limit ?? 50));
+  return apiGet<PromptListResponse>(`/api/prompts?${qs.toString()}`);
+}
+
+async function createPrompt(body: { project_id?: string | null; name: string; prompt_kind: PromptKind; content_text: string; searchable_text?: string | null }): Promise<Prompt> {
+  return apiPost<Prompt>("/api/prompts", body);
+}
+
+export function PromptList() {
+  const [q, setQ] = useState("");
+  const [kind, setKind] = useState<PromptKind | "">("");
+  const [items, setItems] = useState<Prompt[]>([]);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(false);
+
+  // prompt_version requires project_id by contract; MVP uses a manual input (no global project selector yet)
+  const [projectId, setProjectId] = useState("default");
+
+  const [newName, setNewName] = useState("New Prompt");
+  const [newKind, setNewKind] = useState<PromptKind>("text2image");
+  const [newText, setNewText] = useState("Describe what you want to generate...");
+
+  const [selectedPromptId, setSelectedPromptId] = useState<string | null>(null);
+  const [versions, setVersions] = useState<PromptVersion[]>([]);
+  const [versionsLoading, setVersionsLoading] = useState(false);
+
+  const selectedPrompt = useMemo(() => items.find((x) => x.id === selectedPromptId) || null, [items, selectedPromptId]);
+
+  async function refresh() {
+    setLoading(true);
+    try {
+      const resp = await listPrompts({
+        q: q || undefined,
+        prompt_kind: kind || undefined,
+        offset: 0,
+        limit: 50,
+      });
+      setItems(resp.items);
+      setTotal(resp.total);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function refreshVersions(promptId: string) {
+    setVersionsLoading(true);
+    try {
+      const resp = await listPromptVersions({ project_id: projectId, prompt_id: promptId, limit: 50, offset: 0, sort: "created_at:desc" });
+      setVersions(resp.items);
+    } finally {
+      setVersionsLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function onCreatePrompt() {
+    await createPrompt({
+      project_id: projectId || undefined,
+      name: newName,
+      prompt_kind: newKind,
+      content_text: newText,
+      searchable_text: (newName + " " + newText).slice(0, 200),
+    });
+    await refresh();
+  }
+
+  async function onCreateVersionFromSelected() {
+    if (!selectedPrompt) return;
+    const label = `v${Math.max(1, versions.length + 1)}`;
+
+    await createPromptVersion({
+      project_id: projectId,
+      prompt_id: selectedPrompt.id,
+      version_label: label,
+      prompt_kind: selectedPrompt.prompt_kind,
+      resolved_prompt_text: selectedPrompt.content_text,
+      resolved_params: null,
+    });
+
+    await refreshVersions(selectedPrompt.id);
+  }
+
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+      <div style={{ border: "1px solid #e5e7eb", borderRadius: 12, padding: 12 }}>
+        <h2 style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>Prompt Library</h2>
+
+        <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+          <input
+            value={projectId}
+            onChange={(e) => setProjectId(e.target.value)}
+            placeholder="project_id (required for PromptVersion)"
+            style={{ flex: 1, padding: 8, borderRadius: 8, border: "1px solid #e5e7eb" }}
+          />
+        </div>
+
+        <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+          <input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="search q"
+            style={{ flex: 1, padding: 8, borderRadius: 8, border: "1px solid #e5e7eb" }}
+          />
+          <select value={kind} onChange={(e) => setKind(e.target.value as any)} style={{ padding: 8, borderRadius: 8, border: "1px solid #e5e7eb" }}>
+            <option value="">all kinds</option>
+            <option value="text2image">text2image</option>
+            <option value="image2image">image2image</option>
+            <option value="text2video">text2video</option>
+            <option value="image2video">image2video</option>
+            <option value="general">general</option>
+          </select>
+          <button onClick={() => void refresh()} style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #e5e7eb" }}>
+            {loading ? "Loading..." : "Refresh"}
+          </button>
+        </div>
+
+        <div style={{ borderTop: "1px solid #f3f4f6", paddingTop: 10, marginTop: 10 }}>
+          <h3 style={{ fontSize: 14, fontWeight: 600, marginBottom: 8 }}>Create Prompt</h3>
+          <div style={{ display: "grid", gap: 8 }}>
+            <input value={newName} onChange={(e) => setNewName(e.target.value)} style={{ padding: 8, borderRadius: 8, border: "1px solid #e5e7eb" }} />
+            <select value={newKind} onChange={(e) => setNewKind(e.target.value as PromptKind)} style={{ padding: 8, borderRadius: 8, border: "1px solid #e5e7eb" }}>
+              <option value="text2image">text2image</option>
+              <option value="image2image">image2image</option>
+              <option value="text2video">text2video</option>
+              <option value="image2video">image2video</option>
+              <option value="general">general</option>
+            </select>
+            <textarea value={newText} onChange={(e) => setNewText(e.target.value)} rows={4} style={{ padding: 8, borderRadius: 8, border: "1px solid #e5e7eb" }} />
+            <button onClick={() => void onCreatePrompt()} style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #e5e7eb" }}>
+              Create Prompt
+            </button>
+          </div>
+        </div>
+
+        <div style={{ marginTop: 12 }}>
+          <div style={{ fontSize: 12, color: "#6b7280", marginBottom: 6 }}>Total: {total}</div>
+          <div style={{ display: "grid", gap: 6 }}>
+            {items.map((p) => (
+              <button
+                key={p.id}
+                onClick={() => {
+                  setSelectedPromptId(p.id);
+                  void refreshVersions(p.id);
+                }}
+                style={{
+                  textAlign: "left",
+                  padding: 10,
+                  borderRadius: 10,
+                  border: selectedPromptId === p.id ? "2px solid #111827" : "1px solid #e5e7eb",
+                  background: "white",
+                }}
+              >
+                <div style={{ fontWeight: 600 }}>{p.name}</div>
+                <div style={{ fontSize: 12, color: "#6b7280" }}>{p.prompt_kind}</div>
+              </button>
+            ))}
+            {items.length === 0 ? <div style={{ fontSize: 12, color: "#6b7280" }}>No prompts yet.</div> : null}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ border: "1px solid #e5e7eb", borderRadius: 12, padding: 12 }}>
+        <h2 style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>PromptVersion (Immutable Snapshot)</h2>
+
+        {!selectedPrompt ? (
+          <div style={{ fontSize: 12, color: "#6b7280" }}>Select a prompt to view/create versions.</div>
+        ) : (
+          <div>
+            <div style={{ marginBottom: 10 }}>
+              <div style={{ fontWeight: 600 }}>{selectedPrompt.name}</div>
+              <div style={{ fontSize: 12, color: "#6b7280" }}>
+                prompt_id={selectedPrompt.id} · kind={selectedPrompt.prompt_kind}
+              </div>
+            </div>
+
+            <button onClick={() => void onCreateVersionFromSelected()} style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #e5e7eb", marginBottom: 10 }}>
+              Create PromptVersion from content_text
+            </button>
+
+            <div style={{ fontSize: 12, color: "#6b7280", marginBottom: 6 }}>
+              {versionsLoading ? "Loading versions..." : `Versions: ${versions.length}`}
+            </div>
+
+            <div style={{ display: "grid", gap: 8 }}>
+              {versions.map((v) => (
+                <div key={v.id} style={{ padding: 10, borderRadius: 10, border: "1px solid #e5e7eb" }}>
+                  <div style={{ fontWeight: 600 }}>{v.version_label}</div>
+                  <div style={{ fontSize: 12, color: "#6b7280" }}>{new Date(v.created_at).toISOString()}</div>
+                  <pre style={{ marginTop: 8, whiteSpace: "pre-wrap", fontSize: 12, background: "#f9fafb", padding: 8, borderRadius: 8 }}>
+                    {v.resolved_prompt_text}
+                  </pre>
+                </div>
+              ))}
+              {versions.length === 0 ? <div style={{ fontSize: 12, color: "#6b7280" }}>No versions yet.</div> : null}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+TSX
+echo "[ok] wrote: $prompt_list"
+
+echo "[info] running next build (won't exit terminal)..."
+(
+  cd "$repo_root/apps/web" || exit 1
+  npm run build
+)
+rc=$?
+echo "[info] next build rc=$rc"
+
+echo "[done] M05_R4 completed."

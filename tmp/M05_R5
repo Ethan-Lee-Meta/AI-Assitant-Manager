@@ -1,0 +1,561 @@
+#!/usr/bin/env bash
+set +e
+
+echo "[info] M05_WEB_R5 starting..."
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$repo_root" || exit 1
+
+# -----------------------------
+# A) Backend: immutability test (PromptVersion update must be NONE)
+# -----------------------------
+mkdir -p apps/api/tests
+
+cat <<'PY' > apps/api/tests/test_prompt_versions_immutability.py
+from fastapi.testclient import TestClient
+
+from app.main import app
+
+
+def test_prompt_version_update_is_disallowed():
+    c = TestClient(app)
+
+    # If GET /api/prompt_versions/{id} exists, PUT/PATCH should be 405 (method not allowed).
+    # This test enforces "Update: NONE" behavior.
+    rid = "00000000-0000-0000-0000-000000000000"
+
+    r = c.put(f"/api/prompt_versions/{rid}", json={"version_label": "hacked"})
+    assert r.status_code == 405
+
+    r = c.patch(f"/api/prompt_versions/{rid}", json={"version_label": "hacked"})
+    assert r.status_code == 405
+PY
+
+echo "[info] running backend tests..."
+(
+  cd apps/api || exit 1
+  source ../../.venv/Scripts/activate 2>/dev/null || true
+  PYTHONPATH=./src pytest -q
+  rc=$?
+  echo "[info] pytest rc=$rc"
+)
+
+# -----------------------------
+# B) Web: API helpers
+# -----------------------------
+mkdir -p apps/web/src/lib/api
+mkdir -p apps/web/src/ui/prompts
+mkdir -p apps/web/app/(app)/prompts/[prompt_id]
+
+# prompts api
+if [ -f apps/web/src/lib/api/prompts.ts ]; then
+  cp -f apps/web/src/lib/api/prompts.ts "apps/web/src/lib/api/prompts.ts.bak.$(date +%Y%m%d_%H%M%S)"
+  echo "[ok] backup: apps/web/src/lib/api/prompts.ts"
+fi
+
+cat <<'TS' > apps/web/src/lib/api/prompts.ts
+import { apiFetch, apiGet, apiPost } from "./client";
+
+export type PromptKind = "text2image" | "image2image" | "text2video" | "image2video" | "general";
+
+export interface Prompt {
+  id: string;
+  project_id?: string | null;
+  name: string;
+  prompt_kind: PromptKind;
+  content_text: string;
+  composition_blocks?: unknown[] | null;
+  searchable_text?: string | null;
+  created_at: string;
+  updated_at?: string | null;
+  archived_at?: string | null;
+}
+
+export interface PromptCreate {
+  project_id?: string | null;
+  name: string;
+  prompt_kind: PromptKind;
+  content_text: string;
+  composition_blocks?: unknown[] | null;
+  searchable_text?: string | null;
+}
+
+export interface PromptPatch {
+  name?: string | null;
+  content_text?: string | null;
+  composition_blocks?: unknown[] | null;
+  searchable_text?: string | null;
+  archived_at?: string | null;
+}
+
+export interface PromptListResponse {
+  items: Prompt[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+function buildQuery(params: Record<string, string | number | boolean | undefined | null>): string {
+  const q = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined || v === null) continue;
+    q.set(k, String(v));
+  }
+  const s = q.toString();
+  return s ? `?${s}` : "";
+}
+
+export async function listPrompts(params: {
+  q?: string;
+  prompt_kind?: PromptKind;
+  project_id?: string;
+  archived?: boolean;
+  limit?: number;
+  offset?: number;
+  sort?: string;
+} = {}): Promise<PromptListResponse> {
+  const qs = buildQuery(params as any);
+  return apiGet<PromptListResponse>(`/api/prompts${qs}`);
+}
+
+export async function getPrompt(id: string): Promise<Prompt> {
+  return apiGet<Prompt>(`/api/prompts/${encodeURIComponent(id)}`);
+}
+
+export async function createPrompt(body: PromptCreate): Promise<Prompt> {
+  return apiPost<Prompt>("/api/prompts", body);
+}
+
+export async function patchPrompt(id: string, body: PromptPatch): Promise<Prompt> {
+  return apiFetch<Prompt>(`/api/prompts/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+    headers: { "Content-Type": "application/json" },
+  });
+}
+TS
+
+echo "[ok] wrote: apps/web/src/lib/api/prompts.ts"
+
+# prompt_versions api
+if [ -f apps/web/src/lib/api/prompt_versions.ts ]; then
+  cp -f apps/web/src/lib/api/prompt_versions.ts "apps/web/src/lib/api/prompt_versions.ts.bak.$(date +%Y%m%d_%H%M%S)"
+  echo "[ok] backup: apps/web/src/lib/api/prompt_versions.ts"
+fi
+
+cat <<'TS' > apps/web/src/lib/api/prompt_versions.ts
+import { apiGet, apiPost } from "./client";
+import type { PromptKind } from "./prompts";
+
+export interface PromptVersion {
+  id: string;
+  project_id: string;
+  prompt_id?: string | null;
+  version_label: string;
+  prompt_kind: PromptKind;
+  resolved_prompt_text: string;
+  resolved_params?: Record<string, unknown> | null;
+  role_bindings?: unknown[] | null;
+  workflow_ref?: Record<string, unknown> | null;
+  created_at: string;
+}
+
+export interface PromptVersionCreate {
+  project_id: string;
+  prompt_id?: string | null;
+  version_label: string;
+  prompt_kind: PromptKind;
+  resolved_prompt_text: string;
+  resolved_params?: Record<string, unknown> | null;
+  role_bindings?: unknown[] | null;
+  workflow_ref?: Record<string, unknown> | null;
+}
+
+export interface PromptVersionListResponse {
+  items: PromptVersion[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+function buildQuery(params: Record<string, string | number | boolean | undefined | null>): string {
+  const q = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined || v === null) continue;
+    q.set(k, String(v));
+  }
+  const s = q.toString();
+  return s ? `?${s}` : "";
+}
+
+export async function listPromptVersions(params: {
+  project_id: string;
+  prompt_id?: string;
+  prompt_kind?: PromptKind;
+  q?: string;
+  archived?: boolean;
+  limit?: number;
+  offset?: number;
+  sort?: string;
+}): Promise<PromptVersionListResponse> {
+  const qs = buildQuery(params as any);
+  return apiGet<PromptVersionListResponse>(`/api/prompt_versions${qs}`);
+}
+
+export async function createPromptVersion(body: PromptVersionCreate): Promise<PromptVersion> {
+  return apiPost<PromptVersion>("/api/prompt_versions", body);
+}
+
+export async function getPromptVersion(id: string): Promise<PromptVersion> {
+  return apiGet<PromptVersion>(`/api/prompt_versions/${encodeURIComponent(id)}`);
+}
+TS
+
+echo "[ok] wrote: apps/web/src/lib/api/prompt_versions.ts"
+
+# -----------------------------
+# C) Web UI: Prompt detail + create version
+# -----------------------------
+cat <<'TSX' > apps/web/src/ui/prompts/PromptDetail.tsx
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import { getPrompt, type Prompt } from "../../lib/api/prompts";
+import { createPromptVersion, listPromptVersions, type PromptVersion } from "../../lib/api/prompt_versions";
+
+function safeJsonParse(text: string, fallback: any, onError: (msg: string) => void): any {
+  const trimmed = text.trim();
+  if (!trimmed) return fallback;
+  try {
+    return JSON.parse(trimmed);
+  } catch (e: any) {
+    onError(e?.message ? `JSON parse error: ${e.message}` : "JSON parse error");
+    return null;
+  }
+}
+
+export function PromptDetail(props: { promptId: string }) {
+  const promptId = props.promptId;
+
+  const [prompt, setPrompt] = useState<Prompt | null>(null);
+  const [versions, setVersions] = useState<PromptVersion[]>([]);
+  const [loading, setLoading] = useState<boolean>(true);
+  const [err, setErr] = useState<string>("");
+
+  const [projectId, setProjectId] = useState<string>("");
+  const [versionLabel, setVersionLabel] = useState<string>("v1");
+  const [resolvedText, setResolvedText] = useState<string>("");
+  const [resolvedParamsText, setResolvedParamsText] = useState<string>("{}");
+  const [workflowRefText, setWorkflowRefText] = useState<string>("{}");
+  const [roleBindingsText, setRoleBindingsText] = useState<string>("[]");
+
+  const effectiveProjectId = useMemo(() => {
+    return projectId || prompt?.project_id || "";
+  }, [projectId, prompt]);
+
+  async function reloadAll() {
+    setLoading(true);
+    setErr("");
+    try {
+      const p = await getPrompt(promptId);
+      setPrompt(p);
+      if (!resolvedText) setResolvedText(p.content_text || "");
+      if (!projectId && p.project_id) setProjectId(p.project_id);
+
+      if (p.project_id) {
+        const vr = await listPromptVersions({ project_id: p.project_id, prompt_id: p.id, limit: 50, offset: 0 });
+        setVersions(vr.items || []);
+      } else {
+        setVersions([]);
+      }
+    } catch (e: any) {
+      setErr(e?.message || "Failed to load prompt");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void reloadAll();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [promptId]);
+
+  async function onCreateVersion() {
+    setErr("");
+    if (!prompt) return;
+
+    const pid = effectiveProjectId;
+    if (!pid) {
+      setErr("project_id is required to create PromptVersion (fill Project Id).");
+      return;
+    }
+
+    let localErr = "";
+    const resolved_params = safeJsonParse(resolvedParamsText, {}, (m) => (localErr = m));
+    if (localErr) {
+      setErr(localErr);
+      return;
+    }
+    const workflow_ref = safeJsonParse(workflowRefText, {}, (m) => (localErr = m));
+    if (localErr) {
+      setErr(localErr);
+      return;
+    }
+    const role_bindings = safeJsonParse(roleBindingsText, [], (m) => (localErr = m));
+    if (localErr) {
+      setErr(localErr);
+      return;
+    }
+
+    try {
+      await createPromptVersion({
+        project_id: pid,
+        prompt_id: prompt.id,
+        version_label: versionLabel || "v1",
+        prompt_kind: prompt.prompt_kind,
+        resolved_prompt_text: resolvedText || prompt.content_text,
+        resolved_params: resolved_params || {},
+        workflow_ref: workflow_ref || {},
+        role_bindings: role_bindings || [],
+      });
+      await reloadAll();
+    } catch (e: any) {
+      setErr(e?.message || "Create PromptVersion failed");
+    }
+  }
+
+  if (loading) return <div>Loading...</div>;
+
+  if (!prompt) {
+    return (
+      <div className="space-y-4">
+        <div className="text-sm text-red-600">{err || "Prompt not found"}</div>
+        <Link className="underline" href="/prompts">
+          Back
+        </Link>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <div className="space-y-1">
+          <div className="text-xl font-semibold">{prompt.name}</div>
+          <div className="text-sm opacity-70">
+            id: {prompt.id} · kind: {prompt.prompt_kind} · project_id: {prompt.project_id || "(null)"}
+          </div>
+        </div>
+        <Link className="underline" href="/prompts">
+          Back
+        </Link>
+      </div>
+
+      {err ? <div className="text-sm text-red-600">{err}</div> : null}
+
+      <div className="rounded-lg border p-4 space-y-3">
+        <div className="font-semibold">Create PromptVersion</div>
+
+        <div className="grid gap-3 md:grid-cols-2">
+          <label className="space-y-1">
+            <div className="text-sm">Project Id (required)</div>
+            <input
+              className="w-full rounded border px-2 py-1"
+              value={effectiveProjectId}
+              onChange={(e) => setProjectId(e.target.value)}
+              placeholder="project_id"
+            />
+          </label>
+
+          <label className="space-y-1">
+            <div className="text-sm">Version Label</div>
+            <input
+              className="w-full rounded border px-2 py-1"
+              value={versionLabel}
+              onChange={(e) => setVersionLabel(e.target.value)}
+              placeholder="v1"
+            />
+          </label>
+        </div>
+
+        <label className="space-y-1 block">
+          <div className="text-sm">Resolved Prompt Text</div>
+          <textarea
+            className="w-full rounded border px-2 py-1 font-mono text-sm"
+            rows={6}
+            value={resolvedText}
+            onChange={(e) => setResolvedText(e.target.value)}
+          />
+        </label>
+
+        <div className="grid gap-3 md:grid-cols-2">
+          <label className="space-y-1 block">
+            <div className="text-sm">resolved_params (JSON)</div>
+            <textarea
+              className="w-full rounded border px-2 py-1 font-mono text-sm"
+              rows={6}
+              value={resolvedParamsText}
+              onChange={(e) => setResolvedParamsText(e.target.value)}
+            />
+          </label>
+
+          <label className="space-y-1 block">
+            <div className="text-sm">workflow_ref (JSON)</div>
+            <textarea
+              className="w-full rounded border px-2 py-1 font-mono text-sm"
+              rows={6}
+              value={workflowRefText}
+              onChange={(e) => setWorkflowRefText(e.target.value)}
+            />
+          </label>
+        </div>
+
+        <label className="space-y-1 block">
+          <div className="text-sm">role_bindings (JSON array)</div>
+          <textarea
+            className="w-full rounded border px-2 py-1 font-mono text-sm"
+            rows={4}
+            value={roleBindingsText}
+            onChange={(e) => setRoleBindingsText(e.target.value)}
+          />
+        </label>
+
+        <button className="rounded bg-black px-3 py-2 text-white" onClick={() => void onCreateVersion()}>
+          Create PromptVersion
+        </button>
+      </div>
+
+      <div className="rounded-lg border p-4 space-y-3">
+        <div className="font-semibold">PromptVersions ({versions.length})</div>
+        {versions.length === 0 ? (
+          <div className="text-sm opacity-70">No versions yet.</div>
+        ) : (
+          <div className="space-y-2">
+            {versions.map((v) => (
+              <div key={v.id} className="rounded border p-2">
+                <div className="text-sm">
+                  <span className="font-semibold">{v.version_label}</span> · {v.id}
+                </div>
+                <div className="text-xs opacity-70">{v.created_at}</div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+TSX
+
+echo "[ok] wrote: apps/web/src/ui/prompts/PromptDetail.tsx"
+
+cat <<'TSX' > apps/web/app/(app)/prompts/[prompt_id]/page.tsx
+import { PromptDetail } from "../../../../src/ui/prompts/PromptDetail";
+
+export default function PromptDetailPage({ params }: { params: { prompt_id: string } }) {
+  return <PromptDetail promptId={params.prompt_id} />;
+}
+TSX
+echo "[ok] wrote: apps/web/app/(app)/prompts/[prompt_id]/page.tsx"
+
+# Patch PromptList to link to detail (overwrite with safe minimal)
+if [ -f apps/web/src/ui/prompts/PromptList.tsx ]; then
+  cp -f apps/web/src/ui/prompts/PromptList.tsx "apps/web/src/ui/prompts/PromptList.tsx.bak.$(date +%Y%m%d_%H%M%S)"
+  echo "[ok] backup: apps/web/src/ui/prompts/PromptList.tsx"
+fi
+
+cat <<'TSX' > apps/web/src/ui/prompts/PromptList.tsx
+"use client";
+
+import Link from "next/link";
+import { useEffect, useState } from "react";
+import { listPrompts, type Prompt, type PromptKind } from "../../lib/api/prompts";
+
+export function PromptList() {
+  const [items, setItems] = useState<Prompt[]>([]);
+  const [total, setTotal] = useState<number>(0);
+  const [loading, setLoading] = useState<boolean>(false);
+  const [err, setErr] = useState<string>("");
+
+  const [q, setQ] = useState<string>("");
+  const [kind, setKind] = useState<PromptKind | "">("");
+
+  async function reload() {
+    setLoading(true);
+    setErr("");
+    try {
+      const resp = await listPrompts({ q: q || undefined, prompt_kind: (kind || undefined) as any, limit: 50, offset: 0 });
+      setItems(resp.items || []);
+      setTotal(resp.total || 0);
+    } catch (e: any) {
+      setErr(e?.message || "Failed to load prompts");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-end gap-3">
+        <label className="space-y-1">
+          <div className="text-sm">Search (q)</div>
+          <input className="rounded border px-2 py-1" value={q} onChange={(e) => setQ(e.target.value)} />
+        </label>
+
+        <label className="space-y-1">
+          <div className="text-sm">Kind</div>
+          <select className="rounded border px-2 py-1" value={kind} onChange={(e) => setKind(e.target.value as any)}>
+            <option value="">(all)</option>
+            <option value="text2image">text2image</option>
+            <option value="image2image">image2image</option>
+            <option value="text2video">text2video</option>
+            <option value="image2video">image2video</option>
+            <option value="general">general</option>
+          </select>
+        </label>
+
+        <button className="rounded bg-black px-3 py-2 text-white" onClick={() => void reload()} disabled={loading}>
+          {loading ? "Loading..." : "Reload"}
+        </button>
+      </div>
+
+      {err ? <div className="text-sm text-red-600">{err}</div> : null}
+
+      <div className="text-sm opacity-70">Total: {total}</div>
+
+      <div className="space-y-2">
+        {items.map((p) => (
+          <div key={p.id} className="rounded border p-3">
+            <div className="flex items-center justify-between">
+              <Link className="font-semibold underline" href={`/prompts/${p.id}`}>
+                {p.name}
+              </Link>
+              <div className="text-sm opacity-70">{p.prompt_kind}</div>
+            </div>
+            <div className="text-xs opacity-70">id: {p.id}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+TSX
+echo "[ok] wrote: apps/web/src/ui/prompts/PromptList.tsx"
+
+# -----------------------------
+# D) Web build
+# -----------------------------
+echo "[info] running next build..."
+(
+  cd apps/web || exit 1
+  npm run build
+  rc=$?
+  echo "[info] next build rc=$rc"
+)
+
+echo "[done] M05_WEB_R5 completed."

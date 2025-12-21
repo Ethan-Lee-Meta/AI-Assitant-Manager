@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+# M05_WEB_R3: prompts page runtime integration + robust smoke (no set -e)
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+echo "[info] repo_root=$repo_root"
+cd "$repo_root" || exit 1
+
+ts="$(date +%Y%m%d_%H%M%S)"
+
+backup() {
+  local f="$1"
+  if [ -f "$f" ]; then
+    cp "$f" "$f.bak.$ts"
+    echo "[ok] backup: $f.bak.$ts"
+  fi
+}
+
+# ----------------------------
+# 1) Web: API typings + client
+# ----------------------------
+mkdir -p apps/web/src/lib/api apps/web/src/ui/prompts apps/web/app/'(app)'/prompts
+
+cat > apps/web/src/lib/api/prompts.ts <<'TS'
+import { apiGet, apiPost } from "./client";
+
+export type PromptKind = "text2image" | "image2image" | "text2video" | "image2video" | "general";
+
+export interface Prompt {
+  id: string;
+  project_id?: string | null;
+  name: string;
+  prompt_kind: PromptKind;
+  content_text: string;
+  composition_blocks?: any[] | null;
+  searchable_text: string;
+  archived_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PromptCreate {
+  project_id?: string | null;
+  name: string;
+  prompt_kind: PromptKind;
+  content_text: string;
+  composition_blocks?: any[] | null;
+  searchable_text?: string | null;
+}
+
+export interface PromptListResponse {
+  items: Prompt[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export async function listPrompts(params?: {
+  q?: string;
+  prompt_kind?: PromptKind;
+  archived?: boolean;
+  limit?: number;
+  offset?: number;
+  sort?: string;
+}): Promise<PromptListResponse> {
+  const q = new URLSearchParams();
+  if (params?.q) q.set("q", params.q);
+  if (params?.prompt_kind) q.set("prompt_kind", params.prompt_kind);
+  if (typeof params?.archived === "boolean") q.set("archived", String(params.archived));
+  q.set("limit", String(params?.limit ?? 50));
+  q.set("offset", String(params?.offset ?? 0));
+  if (params?.sort) q.set("sort", params.sort);
+
+  const qs = q.toString();
+  return apiGet<PromptListResponse>(`/api/prompts${qs ? `?${qs}` : ""}`);
+}
+
+export async function createPrompt(body: PromptCreate): Promise<Prompt> {
+  return apiPost<Prompt>("/api/prompts", body);
+}
+TS
+echo "[ok] wrote: apps/web/src/lib/api/prompts.ts"
+
+cat > apps/web/src/ui/prompts/PromptList.tsx <<'TSX'
+"use client";
+
+import React, { useEffect, useMemo, useState } from "react";
+import type { Prompt, PromptCreate, PromptKind } from "../../lib/api/prompts";
+import { createPrompt, listPrompts } from "../../lib/api/prompts";
+import { ApiError } from "../../lib/api/errors";
+
+function kindLabel(k: PromptKind): string {
+  return k;
+}
+
+function normalizeSearchableText(name: string, content: string): string {
+  const s = `${name}\n${content}`.trim();
+  // keep it reasonably short for MVP
+  return s.length > 500 ? s.slice(0, 500) : s;
+}
+
+export function PromptList(): JSX.Element {
+  const [items, setItems] = useState<Prompt[]>([]);
+  const [total, setTotal] = useState<number>(0);
+  const [loading, setLoading] = useState<boolean>(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const [name, setName] = useState<string>("");
+  const [promptKind, setPromptKind] = useState<PromptKind>("general");
+  const [contentText, setContentText] = useState<string>("");
+  const [creating, setCreating] = useState<boolean>(false);
+
+  const canCreate = useMemo(() => {
+    return name.trim().length > 0 && contentText.trim().length > 0;
+  }, [name, contentText]);
+
+  async function refresh(): Promise<void> {
+    setLoading(true);
+    setErr(null);
+    try {
+      const r = await listPrompts({ limit: 50, offset: 0 });
+      setItems(r.items);
+      setTotal(r.total);
+    } catch (e: any) {
+      const msg =
+        e instanceof ApiError
+          ? `${e.code}: ${e.message} (rid=${e.requestId ?? "n/a"})`
+          : (e?.message ?? "Unknown error");
+      setErr(msg);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void refresh();
+  }, []);
+
+  async function onCreate(): Promise<void> {
+    if (!canCreate) return;
+    setCreating(true);
+    setErr(null);
+    try {
+      const body: PromptCreate = {
+        name: name.trim(),
+        prompt_kind: promptKind,
+        content_text: contentText,
+        searchable_text: normalizeSearchableText(name.trim(), contentText),
+      };
+      await createPrompt(body);
+      setName("");
+      setContentText("");
+      await refresh();
+    } catch (e: any) {
+      const msg =
+        e instanceof ApiError
+          ? `${e.code}: ${e.message} (rid=${e.requestId ?? "n/a"})`
+          : (e?.message ?? "Unknown error");
+      setErr(msg);
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  return (
+    <div style={{ padding: 16 }}>
+      <h1 style={{ fontSize: 18, fontWeight: 700, marginBottom: 12 }}>Prompts</h1>
+
+      <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 12, marginBottom: 16 }}>
+        <div style={{ fontWeight: 600, marginBottom: 8 }}>Create Prompt</div>
+        <div style={{ display: "grid", gap: 8, maxWidth: 720 }}>
+          <label style={{ display: "grid", gap: 4 }}>
+            <span style={{ fontSize: 12, opacity: 0.8 }}>Name</span>
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="e.g. Demo prompt"
+              style={{ padding: 8, borderRadius: 6, border: "1px solid #ccc" }}
+            />
+          </label>
+
+          <label style={{ display: "grid", gap: 4 }}>
+            <span style={{ fontSize: 12, opacity: 0.8 }}>Kind</span>
+            <select
+              value={promptKind}
+              onChange={(e) => setPromptKind(e.target.value as PromptKind)}
+              style={{ padding: 8, borderRadius: 6, border: "1px solid #ccc" }}
+            >
+              <option value="general">{kindLabel("general")}</option>
+              <option value="text2image">{kindLabel("text2image")}</option>
+              <option value="image2image">{kindLabel("image2image")}</option>
+              <option value="text2video">{kindLabel("text2video")}</option>
+              <option value="image2video">{kindLabel("image2video")}</option>
+            </select>
+          </label>
+
+          <label style={{ display: "grid", gap: 4 }}>
+            <span style={{ fontSize: 12, opacity: 0.8 }}>Content</span>
+            <textarea
+              value={contentText}
+              onChange={(e) => setContentText(e.target.value)}
+              placeholder="Write prompt content_text..."
+              rows={6}
+              style={{ padding: 8, borderRadius: 6, border: "1px solid #ccc", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}
+            />
+          </label>
+
+          <div style={{ display: "flex", gap: 8 }}>
+            <button
+              onClick={() => void onCreate()}
+              disabled={!canCreate || creating}
+              style={{
+                padding: "8px 12px",
+                borderRadius: 6,
+                border: "1px solid #ccc",
+                background: !canCreate || creating ? "#f5f5f5" : "white",
+                cursor: !canCreate || creating ? "not-allowed" : "pointer",
+              }}
+            >
+              {creating ? "Creating..." : "Create"}
+            </button>
+
+            <button
+              onClick={() => void refresh()}
+              disabled={loading}
+              style={{
+                padding: "8px 12px",
+                borderRadius: 6,
+                border: "1px solid #ccc",
+                background: loading ? "#f5f5f5" : "white",
+                cursor: loading ? "not-allowed" : "pointer",
+              }}
+            >
+              {loading ? "Loading..." : "Refresh"}
+            </button>
+          </div>
+
+          {err ? (
+            <div style={{ color: "#b00020", fontSize: 12, whiteSpace: "pre-wrap" }}>
+              {err}
+            </div>
+          ) : null}
+        </div>
+      </div>
+
+      <div style={{ marginBottom: 8, fontSize: 12, opacity: 0.8 }}>
+        total={total} (showing up to 50)
+      </div>
+
+      <div style={{ display: "grid", gap: 8 }}>
+        {items.map((p) => (
+          <div key={p.id} style={{ border: "1px solid #eee", borderRadius: 8, padding: 12 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+              <div style={{ fontWeight: 700 }}>{p.name}</div>
+              <div style={{ fontSize: 12, opacity: 0.8 }}>{p.prompt_kind}</div>
+            </div>
+            <div style={{ fontSize: 12, opacity: 0.8, marginTop: 4 }}>{p.id}</div>
+            <pre style={{ marginTop: 8, padding: 8, background: "#fafafa", borderRadius: 6, overflowX: "auto" }}>
+{p.content_text}
+            </pre>
+          </div>
+        ))}
+        {items.length === 0 && !loading ? (
+          <div style={{ fontSize: 12, opacity: 0.8 }}>No prompts yet.</div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+TSX
+echo "[ok] wrote: apps/web/src/ui/prompts/PromptList.tsx"
+
+# ----------------------------
+# 2) Web: /prompts page rewrite
+# ----------------------------
+TARGET_PAGE="apps/web/app/(app)/prompts/page.tsx"
+backup "$TARGET_PAGE"
+
+cat > "$TARGET_PAGE" <<'TSX'
+import { PromptList } from "../../../src/ui/prompts/PromptList";
+
+export default function PromptsPage() {
+  return <PromptList />;
+}
+TSX
+echo "[ok] wrote: $TARGET_PAGE"
+
+# ----------------------------
+# 3) Web build (won't exit terminal)
+# ----------------------------
+echo "[info] running next build..."
+(
+  cd "$repo_root/apps/web" || exit 1
+  npm ci 2>/dev/null || npm install
+  npm run build
+)
+rc=$?
+echo "[info] next build rc=$rc"
+
+# ----------------------------
+# 4) Robust smoke: start api+web, wait, curl without pipe masking rc
+# ----------------------------
+echo "[info] smoke: start api(7000) + web(2000) and curl /prompts"
+
+# stop old if exists
+if [ -f /tmp/api_7000.pid ]; then
+  kill "$(cat /tmp/api_7000.pid)" 2>/dev/null || true
+  rm -f /tmp/api_7000.pid
+fi
+if [ -f /tmp/web_2000.pid ]; then
+  kill "$(cat /tmp/web_2000.pid)" 2>/dev/null || true
+  rm -f /tmp/web_2000.pid
+fi
+
+# start api
+(
+  cd "$repo_root/apps/api" || exit 1
+  source "$repo_root/.venv/Scripts/activate" 2>/dev/null || true
+  PYTHONPATH=./src uvicorn app.main:app --host 0.0.0.0 --port 7000 > /tmp/api_7000.log 2>&1 &
+  echo $! > /tmp/api_7000.pid
+  echo "[ok] api pid=$(cat /tmp/api_7000.pid)"
+)
+
+# wait api health
+api_ok=0
+for i in $(seq 1 30); do
+  curl -sS http://localhost:7000/health -o /tmp/health.json
+  if [ $? -eq 0 ]; then api_ok=1; break; fi
+  sleep 0.3
+done
+if [ $api_ok -eq 1 ]; then
+  echo "[ok] api health:"
+  cat /tmp/health.json; echo
+else
+  echo "[fail] api not ready; tail log:"
+  tail -n 120 /tmp/api_7000.log 2>/dev/null || true
+fi
+
+# start web (dev)
+(
+  cd "$repo_root/apps/web" || exit 1
+  npm run dev -- -p 2000 > /tmp/web_2000.log 2>&1 &
+  echo $! > /tmp/web_2000.pid
+  echo "[ok] web pid=$(cat /tmp/web_2000.pid)"
+)
+
+# wait web /prompts
+web_ok=0
+for i in $(seq 1 50); do
+  curl -sS http://localhost:2000/prompts -o /tmp/web_prompts.html
+  if [ $? -eq 0 ]; then web_ok=1; break; fi
+  sleep 0.3
+done
+
+if [ $web_ok -eq 1 ]; then
+  echo "[ok] web /prompts fetched (first 200 bytes):"
+  head -c 200 /tmp/web_prompts.html; echo
+else
+  echo "[fail] web not reachable on :2000"
+  echo "[info] tail /tmp/web_2000.log:"
+  tail -n 160 /tmp/web_2000.log 2>/dev/null || true
+fi
+
+# cleanup
+if [ -f /tmp/web_2000.pid ]; then
+  kill "$(cat /tmp/web_2000.pid)" 2>/dev/null || true
+  echo "[ok] killed web pid=$(cat /tmp/web_2000.pid)"
+  rm -f /tmp/web_2000.pid
+fi
+if [ -f /tmp/api_7000.pid ]; then
+  kill "$(cat /tmp/api_7000.pid)" 2>/dev/null || true
+  echo "[ok] killed api pid=$(cat /tmp/api_7000.pid)"
+  rm -f /tmp/api_7000.pid
+fi
+
+echo "[done] M05_WEB_R3 completed."
+exit 0

@@ -13,5 +13,10 @@ def get_module_routers() -> List[APIRouter]:
     from .projects.router import router as projects_router
     routers.append(projects_router)
     # --- M01 Projects end ---
+    # --- M05 Prompts begin ---
+    from .prompts.router import router as prompts_router
+    routers.append(prompts_router)
+    # --- M05 Prompts end ---
+
 
     return routers

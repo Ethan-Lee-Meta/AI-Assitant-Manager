@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Fix: "Cannot find namespace 'JSX'" in Next build
+# No set -e: keep terminal alive
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$repo_root" || exit 1
+ts="$(date +%Y%m%d_%H%M%S)"
+
+TARGET="apps/web/src/ui/prompts/PromptList.tsx"
+if [ ! -f "$TARGET" ]; then
+  echo "[fail] missing file: $TARGET"
+  exit 0
+fi
+
+cp "$TARGET" "$TARGET.bak.$ts"
+echo "[ok] backup: $TARGET.bak.$ts"
+
+python - <<'PY'
+from pathlib import Path
+import re
+
+p = Path("apps/web/src/ui/prompts/PromptList.tsx")
+s = p.read_text(encoding="utf-8")
+
+# Replace explicit JSX.Element return type to avoid requiring global JSX namespace
+# export function PromptList(): JSX.Element {  -> export function PromptList() {
+s2, n = re.subn(r"export\s+function\s+PromptList\(\)\s*:\s*JSX\.Element\s*\{", "export function PromptList() {", s)
+if n == 0:
+    # maybe slightly different spacing
+    s2, n = re.subn(r"export\s+function\s+PromptList\(\)\s*:\s*JSX\.Element\s*\{", "export function PromptList() {", s)
+if n == 0:
+    print("[fail] pattern not found: export function PromptList(): JSX.Element {")
+    raise SystemExit(1)
+
+p.write_text(s2, encoding="utf-8")
+print("[ok] patched PromptList return type (removed JSX.Element).")
+PY
+
+echo "[info] re-run next build (won't exit terminal on failure)"
+(
+  cd apps/web || exit 1
+  npm ci 2>/dev/null || npm install
+  npm run build
+)
+rc=$?
+echo "[info] next build rc=$rc"
+
+exit 0
