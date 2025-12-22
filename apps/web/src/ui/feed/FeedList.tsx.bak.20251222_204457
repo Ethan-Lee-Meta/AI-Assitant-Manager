@@ -1,0 +1,191 @@
+"use client";
+
+import React, { useEffect, useMemo, useState } from "react";
+import { FeedItem, listFeed } from "../../lib/api/feed";
+
+type KindFilter = "all" | "episode" | "video";
+
+function isoToLocal(s: string): string {
+  try {
+    const d = new Date(s);
+    if (Number.isNaN(d.getTime())) return s;
+    return d.toLocaleString();
+  } catch {
+    return s;
+  }
+}
+
+export function FeedList() {
+  const [projectId, setProjectId] = useState<string>("");
+  const [seriesId, setSeriesId] = useState<string>("");
+  const [kind, setKind] = useState<KindFilter>("all");
+  const [q, setQ] = useState<string>("");
+  const [archived, setArchived] = useState<boolean>(false);
+
+  const [sort, setSort] = useState<string>("-created_at");
+  const [limit, setLimit] = useState<number>(50);
+  const [offset, setOffset] = useState<number>(0);
+
+  const [items, setItems] = useState<FeedItem[]>([]);
+  const [total, setTotal] = useState<number>(0);
+  const [loading, setLoading] = useState<boolean>(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const canPrev = useMemo(() => offset > 0, [offset]);
+  const canNext = useMemo(() => offset + limit < total, [offset, limit, total]);
+
+  async function refresh() {
+    setLoading(true);
+    setErr(null);
+    try {
+      const resp = await listFeed({
+        project_id: projectId.trim() || undefined,
+        series_id: seriesId.trim() || undefined,
+        kind: kind === "all" ? undefined : (kind as any),
+        q: q.trim() || undefined,
+        archived,
+        sort,
+        limit,
+        offset,
+      });
+      setItems(resp.items || []);
+      setTotal(resp.total || 0);
+    } catch (e: any) {
+      setErr(e?.message || "failed to load feed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, seriesId, kind, q, archived, sort, limit, offset]);
+
+  function resetPaging() {
+    setOffset(0);
+  }
+
+  return (
+    <div style={{ display: "grid", gap: 12 }}>
+      <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 12 }}>
+        <h1 style={{ margin: "0 0 8px 0" }}>Feed</h1>
+        <div style={{ color: "#666", fontSize: 12 }}>
+          Read-only aggregate of Episodes/Videos. Click through to Series or item workspace.
+        </div>
+
+        {err ? <div style={{ marginTop: 10, color: "crimson" }}>Error: {err}</div> : null}
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginTop: 12 }}>
+          <label style={{ display: "grid", gap: 6, fontSize: 12 }}>
+            project_id (optional)
+            <input value={projectId} onChange={(e) => { setProjectId(e.target.value); resetPaging(); }} style={{ padding: 8 }} />
+          </label>
+
+          <label style={{ display: "grid", gap: 6, fontSize: 12 }}>
+            series_id (optional)
+            <input value={seriesId} onChange={(e) => { setSeriesId(e.target.value); resetPaging(); }} style={{ padding: 8 }} />
+          </label>
+
+          <label style={{ display: "grid", gap: 6, fontSize: 12 }}>
+            search (q)
+            <input value={q} onChange={(e) => { setQ(e.target.value); resetPaging(); }} style={{ padding: 8 }} />
+          </label>
+        </div>
+
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 12, alignItems: "center" }}>
+          <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 12 }}>
+            kind
+            <select value={kind} onChange={(e) => { setKind(e.target.value as any); resetPaging(); }} style={{ padding: 8 }}>
+              <option value="all">all</option>
+              <option value="episode">episode</option>
+              <option value="video">video</option>
+            </select>
+          </label>
+
+          <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 12 }}>
+            archived
+            <input type="checkbox" checked={archived} onChange={(e) => { setArchived(e.target.checked); resetPaging(); }} />
+          </label>
+
+          <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 12 }}>
+            sort
+            <select value={sort} onChange={(e) => { setSort(e.target.value); resetPaging(); }} style={{ padding: 8 }}>
+              <option value="-created_at">-created_at (newest first)</option>
+              <option value="created_at">created_at (oldest first)</option>
+              <option value="-order_index">-order_index</option>
+              <option value="order_index">order_index</option>
+              <option value="title">title</option>
+            </select>
+          </label>
+
+          <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 12 }}>
+            limit
+            <select value={String(limit)} onChange={(e) => { setLimit(parseInt(e.target.value, 10)); resetPaging(); }} style={{ padding: 8 }}>
+              <option value="20">20</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+            </select>
+          </label>
+
+          <button onClick={refresh} disabled={loading} style={{ padding: "8px 12px" }}>
+            {loading ? "Loading..." : "Refresh"}
+          </button>
+        </div>
+      </div>
+
+      <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 12 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+          <div style={{ fontWeight: 700 }}>Items</div>
+          <div style={{ fontSize: 12, color: "#666" }}>
+            total={total} • offset={offset} • limit={limit}
+          </div>
+        </div>
+
+        <div style={{ display: "flex", gap: 10, marginTop: 10 }}>
+          <button disabled={!canPrev || loading} onClick={() => setOffset(Math.max(0, offset - limit))} style={{ padding: "6px 10px" }}>
+            Prev
+          </button>
+          <button disabled={!canNext || loading} onClick={() => setOffset(offset + limit)} style={{ padding: "6px 10px" }}>
+            Next
+          </button>
+          <a href="/projects" style={{ marginLeft: "auto", textDecoration: "none", color: "#444" }}>Projects</a>
+          <a href="/series" style={{ textDecoration: "none", color: "#444" }}>Series</a>
+          <a href="/episodes_or_videos" style={{ textDecoration: "none", color: "#444" }}>Episodes/Videos</a>
+        </div>
+
+        <div style={{ marginTop: 12, display: "grid", gap: 8 }}>
+          {items.length === 0 ? <div style={{ color: "#666" }}>No items.</div> : null}
+
+          {items.map((it) => (
+            <div key={it.id} style={{ border: "1px solid #eee", borderRadius: 12, padding: 10, display: "grid", gap: 6 }}>
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "baseline" }}>
+                <div style={{ fontWeight: 700 }}>{it.title}</div>
+                <div style={{ fontSize: 12, color: "#666" }}>
+                  {it.kind} • {isoToLocal(it.created_at)} • project_id={it.project_id} • series_id={it.series_id}
+                </div>
+              </div>
+
+              {it.synopsis_text ? <div style={{ color: "#444", fontSize: 13 }}>{it.synopsis_text}</div> : null}
+
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                <a href={`/episodes_or_videos/${it.id}`} style={{ textDecoration: "none", border: "1px solid #ddd", borderRadius: 10, padding: "6px 10px" }}>
+                  Open Item
+                </a>
+                <a href={`/series/${it.series_id}`} style={{ textDecoration: "none", border: "1px solid #ddd", borderRadius: 10, padding: "6px 10px" }}>
+                  Open Series
+                </a>
+                <a
+                  href={`/series?project_id=${encodeURIComponent(it.project_id)}`}
+                  style={{ textDecoration: "none", border: "1px solid #ddd", borderRadius: 10, padding: "6px 10px" }}
+                >
+                  Series in Project
+                </a>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}

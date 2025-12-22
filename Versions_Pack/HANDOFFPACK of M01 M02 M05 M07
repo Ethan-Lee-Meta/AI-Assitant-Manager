@@ -1,0 +1,175 @@
+handoff_pack:
+  meta:
+    repo: "AI-Assitant-Manager"
+    branch: "main"
+    timezone: "America/Los_Angeles"
+    generated_at: "2025-12-21"
+    contract_lock:
+      files:
+        - "packages/contracts/openapi.json"
+        - "packages/contracts/openapi.sha256"
+        - "packages/contracts/contract_version.txt"
+      rule: "任何 API 字段/路径变动必须同步更新合约锁并通过 verify_contracts"
+
+  global_guards:
+    - "后端端口 7000；前端端口 2000（不得改）"
+    - "ErrorEnvelope + X-Request-Id 已落地（不得破坏）"
+    - "所有模块的 List/Query 参数以 openapi.json 为准：limit/offset 优先"
+    - "SQLite 存储：路径与环境变量必须一致，避免‘写入成功但刷新看不见’的错觉"
+    - "严禁‘根据 UI/感觉猜代码’，必须通过 repo 文件与合约验证"
+
+  smoke_commands:
+    # 新窗口接手第一步：跑这三条确认当前状态
+    - name: "backend tests"
+      cmd: |
+        cd "$(git rev-parse --show-toplevel)"
+        cd apps/api
+        PYTHONPATH=./src pytest -q
+        cd - >/dev/null
+    - name: "contracts verify"
+      cmd: |
+        cd "$(git rev-parse --show-toplevel)"
+        VERIFY_LIVE=0 ./scripts/verify_contracts.sh
+    - name: "frontend build"
+      cmd: |
+        cd "$(git rev-parse --show-toplevel)"
+        cd apps/web
+        npm run build
+        cd - >/dev/null
+
+  modules:
+    - id: "M01"
+      name: "Projects"
+      scope:
+        backend: "/api/projects CRUD + list"
+        frontend: "/projects 页面 + project_id 在后续模块作为隔离键"
+      status:
+        tests: "已通过（以你最新 pytest 全量通过为准）"
+        build: "已通过"
+        contract: "已锁定（以 openapi.json 为准）"
+      key_artifacts:
+        contract_paths_hint:
+          - "/api/projects"
+        frontend_routes:
+          - "/projects"
+      known_issues:
+        - "无明确未解决阻塞；后续模块依赖 project_id 流转方式需确认（全局/页面内输入）"
+      next_steps_suggested:
+        - "确认 project_id 的 UI 选择/输入方式是否要全局化（但不要在未要求时扩展）"
+
+    - id: "M05"
+      name: "Prompts + PromptVersions"
+      scope:
+        backend:
+          - "prompts 基础 CRUD"
+          - "prompt_versions: immutable snapshot CRUD/lookup（按当前实现）"
+        frontend:
+          - "/prompts 列表"
+          - "prompt detail / prompt versions 相关调用（按当前实现）"
+      status:
+        tests: "已通过（曾出现 12/13 passed，后续合并后整体仍通过）"
+        build: "已通过（Next build rc=0）"
+        contract: "已锁定并 verify 通过"
+      key_artifacts:
+        backend_files:
+          - "apps/api/src/app/modules/prompts/prompt_versions_dto.py"
+          - "apps/api/src/app/modules/prompts/prompt_versions_store_sqlite.py"
+          - "apps/api/src/app/modules/prompts/prompt_versions_service.py"
+          - "apps/api/src/app/modules/prompts/prompt_versions_router.py"
+          - "apps/api/src/app/modules/prompts/router.py  (已 include prompt_versions_router)"
+        tests:
+          - "apps/api/tests/test_prompt_versions_crud.py"
+        frontend_files_hint:
+          - "apps/web/src/ui/prompts/PromptList.tsx (曾修 return type)"
+          - "apps/web/src/lib/api/prompt_versions.ts"
+      known_issues:
+        - "无明确阻塞；后续若改动字段/路径需同步合约锁"
+      invariants:
+        - "PromptVersion/Run 语义：倾向不可变快照（遵守你总方案红线）"
+
+    - id: "M07"
+      name: "Providers / Workflows / Tools (pluggable directory)"
+      scope:
+        backend:
+          - "/api/providers CRUD + list(q,type,enabled...)"
+          - "/api/workflows CRUD + list(...) (workflow_blob_asset_id 可引用上传资产)"
+          - "/api/tools CRUD + list(...)"
+          - "routers 已注册进 modules/_registry.py"
+        frontend:
+          - "Settings 页面渲染三块 Panel：Providers / Workflows / Tools"
+          - "支持 Create/Refresh/（以及 archive/restore 若在 UI 中暴露）"
+      status:
+        tests: "已通过（你最新显示 apps/api pytest 全量通过 19 passed 或更高）"
+        build: "已通过（Next build rc=0）"
+        contract: "已导出并锁定，verify_contracts 通过"
+      key_artifacts:
+        backend_dirs:
+          - "apps/api/src/app/modules/providers/"
+          - "apps/api/src/app/modules/workflows/"
+          - "apps/api/src/app/modules/tools/"
+        registry:
+          - "apps/api/src/app/modules/_registry.py (含 M07 routers append)"
+        tests:
+          - "apps/api/tests/test_m07_providers_workflows_tools.py"
+          - "apps/api/tests/test_m07_archive_patch.py (曾调整 archived/archived_at 行为)"
+        frontend_files_hint:
+          - "apps/web/src/ui/settings/IntegrationsSettings.tsx"
+          - "apps/web/app/(app)/settings/page.tsx"
+          - "apps/web/src/lib/api/providers.ts / workflows.ts / tools.ts"
+      known_issues:
+        - "历史上出现过 archived 字段 422、archived_at restore null 行为不一致；虽已通过测试，但如 UI 仍异常需对照 openapi.json 与 DTO 白名单排查。"
+      do_not_repeat:
+        - "不要再讨论“API 没开是什么意思/为什么要 API key”——此窗口已反复回答过。"
+
+    - id: "M02"
+      name: "Series (style/continuity + associations + workspace)"
+      scope:
+        backend:
+          - "/api/series CRUD"
+          - "Series 字段：project_id, name, style_text, continuity_text, prompt_ids, role_ids, archived_at"
+          - "List 过滤规则：历史要求是必须 project_id 过滤；后续你提出希望 project_id 为空时也能列全量（当前未达成）"
+        frontend:
+          - "/series 列表"
+          - "/series/[series_id] workspace（风格/连续性文本）"
+          - "关联 Prompts/Roles（通过 prompt_ids/role_ids 字段体现）"
+          - "创建 Episode/Video 入口页面：/series/[series_id]/episodes/new 与 /videos/new"
+      status:
+        tests: "已通过（你最后显示 22 passed）"
+        build: "已通过（Next build rc=0，路由包含 /series 与 detail/new pages）"
+        contract: "存在并应已锁定（以 openapi.json 为准）"
+      key_artifacts:
+        backend_files_hint:
+          - "apps/api/src/app/modules/series/dto.py"
+          - "apps/api/src/app/modules/series/store_sqlite.py"
+          - "apps/api/src/app/modules/series/service.py"
+          - "apps/api/src/app/modules/series/router.py"
+        tests:
+          - "apps/api/tests/test_series_crud.py"
+        frontend_files_hint:
+          - "apps/web/src/lib/api/series.ts"
+          - "apps/web/src/ui/series/SeriesIndex.tsx"
+          - "apps/web/src/ui/series/SeriesDetail.tsx"
+          - "apps/web/app/(app)/series/page.tsx"
+          - "apps/web/app/(app)/series/[series_id]/page.tsx"
+          - "apps/web/app/(app)/series/[series_id]/episodes/new/page.tsx"
+          - "apps/web/app/(app)/series/[series_id]/videos/new/page.tsx"
+      known_issues_blocking:
+        - id: "M02-LIST-ALL"
+          title: "project_id 为空时无法 Refresh 列出所有 Series"
+          symptom: "UI 中 project_id 为空 Refresh 不显示全量 series（你明确反馈：仍未实现）"
+          expected: "允许 project_id 为空时列出全部 series（或提供明确的“列全量”方式）"
+          current: "后端 tests 通过，但实际 UX 未达到要求；需要对照 openapi.json 与前端请求参数，确认是否前端仍强制传 project_id / 后端 router 仍要求 project_id"
+        - id: "M02-CLEAR"
+          title: "Clear 会清空 project_id 与 q"
+          expected: "Clear 只清 q(optional)；project_id 保留"
+          current: "你反馈 Clear 会把 project_id 和 q 一起清空"
+      acceptance_criteria:
+        - "Series workspace 页面：能编辑 style_text/continuity_text 并保存"
+        - "Series 具备 prompt_ids/role_ids 字段（即使 Roles 还未完全实现，也不能破坏字段与保存）"
+        - "Episodes/Videos new 页面：作为入口存在（可先 placeholder，但必须可访问）"
+        - "解决 M02-LIST-ALL 与 M02-CLEAR 两个 UX 级问题后，才算 M02 完成"
+
+  working_agreement_for_next_window:
+    - "任何要改的文件：必须先用 rg/ls/路径确认存在再改，不允许凭空假设文件结构"
+    - "优先读 openapi.json 与当前实现源码再下结论"
+    - "修复必须带：复现命令 + 修改点 + 验收命令 + 回滚点"

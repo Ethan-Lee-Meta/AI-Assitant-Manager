@@ -1,0 +1,8 @@
+"use client";
+
+import EpisodeOrVideoWorkspace from "../../../../src/ui/episodes_or_videos/EpisodeOrVideoWorkspace";
+
+export default function Page(props: { params: { episode_or_video_id: string } }) {
+  const id = props?.params?.episode_or_video_id;
+  return <EpisodeOrVideoWorkspace id={id} />;
+}

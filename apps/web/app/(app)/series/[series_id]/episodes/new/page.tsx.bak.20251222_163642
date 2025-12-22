@@ -1,0 +1,7 @@
+import EpisodeOrVideoNew from "../../../../../../src/ui/episodes_or_videos/EpisodeOrVideoNew";
+
+export default async function Page(props: { params: any }) {
+  const p = await props?.params;
+  const seriesId = p?.series_id;
+  return <EpisodeOrVideoNew seriesId={seriesId} kind="episode" />;
+}

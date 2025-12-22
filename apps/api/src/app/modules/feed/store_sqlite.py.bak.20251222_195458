@@ -1,0 +1,125 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+import os
+import sqlite3
+
+
+def _default_db_path() -> str:
+    return (
+        os.getenv("AAM_SQLITE_PATH")
+        or os.getenv("SQLITE_PATH")
+        or str(Path("apps/api/.data/app.sqlite").resolve())
+    )
+
+
+def _connect() -> sqlite3.Connection:
+    path = _default_db_path()
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _parse_sort(sort: Optional[str]) -> Tuple[str, str]:
+    """
+    Accepts:
+      - "-created_at" / "created_at"
+      - "created_at:desc" / "created_at:asc"
+    """
+    s = (sort or "-created_at").strip()
+
+    field = "created_at"
+    direction = "desc"
+
+    if ":" in s:
+        f, _, d = s.partition(":")
+        field = (f or "").strip()
+        direction = (d or "desc").strip().lower()
+    else:
+        if s.startswith("-"):
+            field = s[1:].strip()
+            direction = "desc"
+        else:
+            field = s.strip()
+            direction = "asc"
+
+    allowed = {"created_at", "updated_at", "order_index", "title"}
+    if field not in allowed:
+        field = "created_at"
+    if direction not in {"asc", "desc"}:
+        direction = "desc"
+    return field, direction
+
+
+def list_feed(
+    *,
+    project_id: Optional[str],
+    series_id: Optional[str],
+    kind: Optional[str],
+    q: Optional[str],
+    archived: bool,
+    limit: int,
+    offset: int,
+    sort: Optional[str],
+) -> Tuple[List[Dict[str, Any]], int]:
+    conn = _connect()
+
+    where: List[str] = []
+    args: List[Any] = []
+
+    if project_id:
+        where.append("project_id = ?")
+        args.append(project_id)
+
+    if series_id:
+        where.append("series_id = ?")
+        args.append(series_id)
+
+    if kind:
+        where.append("kind = ?")
+        args.append(kind)
+
+    if not archived:
+        where.append("archived_at IS NULL")
+
+    if q:
+        where.append("(title LIKE ? OR synopsis_text LIKE ? OR script_text LIKE ?)")
+        like = f"%{q}%"
+        args.extend([like, like, like])
+
+    where_sql = ""
+    if where:
+        where_sql = " WHERE " + " AND ".join(where)
+
+    field, direction = _parse_sort(sort)
+
+    try:
+        total_row = conn.execute(
+            f"SELECT COUNT(1) AS c FROM episodes_or_videos{where_sql}",
+            args,
+        ).fetchone()
+        total = int(total_row["c"]) if total_row else 0
+
+        rows = conn.execute(
+            f"""
+            SELECT
+              'episode_or_video' AS item_type,
+              id, project_id, series_id, kind, title, synopsis_text,
+              created_at, updated_at, archived_at
+            FROM episodes_or_videos
+            {where_sql}
+            ORDER BY {field} {direction}
+            LIMIT ? OFFSET ?
+            """,
+            [*args, limit, offset],
+        ).fetchall()
+
+        return [dict(r) for r in rows], total
+    except sqlite3.OperationalError as e:
+        # If the table doesn't exist yet, treat as empty feed (read-only).
+        msg = str(e).lower()
+        if "no such table" in msg and "episodes_or_videos" in msg:
+            return [], 0
+        raise

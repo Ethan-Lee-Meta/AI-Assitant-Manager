@@ -1,0 +1,132 @@
+set +e
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$repo_root" || exit 0
+ts="$(date +%Y%m%d_%H%M%S)"
+
+echo "[info] repo_root=$repo_root"
+
+# ---------- 1) Patch series new pages: await params ----------
+ep_new="apps/web/app/(app)/series/[series_id]/episodes/new/page.tsx"
+vi_new="apps/web/app/(app)/series/[series_id]/videos/new/page.tsx"
+
+for f in "$ep_new" "$vi_new"; do
+  if [ -f "$f" ]; then
+    cp "$f" "$f.bak.$ts"
+    echo "[ok] backup -> $f.bak.$ts"
+  else
+    echo "[warn] missing: $f"
+  fi
+done
+
+cat > "$ep_new" <<'TSX'
+import EpisodeOrVideoNew from "../../../../../../src/ui/episodes_or_videos/EpisodeOrVideoNew";
+
+export default async function Page(props: { params: any }) {
+  const p = await props?.params;
+  const seriesId = p?.series_id;
+  return <EpisodeOrVideoNew seriesId={seriesId} kind="episode" />;
+}
+TSX
+echo "[ok] wrote: $ep_new"
+
+cat > "$vi_new" <<'TSX'
+import EpisodeOrVideoNew from "../../../../../../src/ui/episodes_or_videos/EpisodeOrVideoNew";
+
+export default async function Page(props: { params: any }) {
+  const p = await props?.params;
+  const seriesId = p?.series_id;
+  return <EpisodeOrVideoNew seriesId={seriesId} kind="video" />;
+}
+TSX
+echo "[ok] wrote: $vi_new"
+
+# ---------- 2) Patch episodes_or_videos pages: await params ----------
+eov_page="apps/web/app/(app)/episodes_or_videos/[episode_or_video_id]/page.tsx"
+shots_page="apps/web/app/(app)/episodes_or_videos/[episode_or_video_id]/shots/page.tsx"
+
+for f in "$eov_page" "$shots_page"; do
+  if [ -f "$f" ]; then
+    cp "$f" "$f.bak.$ts"
+    echo "[ok] backup -> $f.bak.$ts"
+  else
+    echo "[warn] missing: $f"
+  fi
+done
+
+cat > "$eov_page" <<'TSX'
+import EpisodeOrVideoWorkspace from "../../../../src/ui/episodes_or_videos/EpisodeOrVideoWorkspace";
+
+export default async function Page(props: { params: any }) {
+  const p = await props?.params;
+  const id = p?.episode_or_video_id;
+  return <EpisodeOrVideoWorkspace id={id} />;
+}
+TSX
+echo "[ok] wrote: $eov_page"
+
+cat > "$shots_page" <<'TSX'
+import Link from "next/link";
+
+export default async function Page(props: { params: any }) {
+  const p = await props?.params;
+  const id = p?.episode_or_video_id;
+
+  return (
+    <div style={{ padding: 16 }}>
+      <h2 style={{ fontSize: 18, fontWeight: 800 }}>Shots (placeholder)</h2>
+      <div style={{ marginTop: 8, fontSize: 12, opacity: 0.8 }}>episode_or_video_id={id}</div>
+      <div style={{ marginTop: 12 }}>
+        <Link href={`/episodes_or_videos/${id}`}>Back to Episode/Video Workspace</Link>
+      </div>
+      <div style={{ marginTop: 12, opacity: 0.75 }}>
+        Shot 模块后续接入；当前仅作为入口占位，避免 404。
+      </div>
+    </div>
+  );
+}
+TSX
+echo "[ok] wrote: $shots_page"
+
+# ---------- 3) Harden EpisodeOrVideoNew: guard missing seriesId + fix import path ----------
+f_new="apps/web/src/ui/episodes_or_videos/EpisodeOrVideoNew.tsx"
+if [ -f "$f_new" ]; then
+  cp "$f_new" "$f_new.bak.$ts"
+  echo "[ok] backup -> $f_new.bak.$ts"
+else
+  echo "[warn] missing: $f_new (skip)"
+fi
+
+python - <<'PY'
+from pathlib import Path
+p = Path("apps/web/src/ui/episodes_or_videos/EpisodeOrVideoNew.tsx")
+if not p.exists():
+    raise SystemExit(0)
+
+s = p.read_text(encoding="utf-8")
+
+# normalize series import path (remove accidental double slash)
+s = s.replace('../..//lib/api/series', '../../lib/api/series')
+
+# inject guard: if seriesId missing, don't call getSeries(undefined)
+needle = "useEffect(() => {"
+if needle in s and "series_id missing in route params" not in s:
+    s = s.replace(
+        needle,
+        """useEffect(() => {
+    if (!seriesId || String(seriesId).trim() === "") {
+      setErr("series_id missing in route params");
+      return;
+    }""",
+        1,
+    )
+
+# make Back to Series robust: avoid /series/undefined (optional, keep simple)
+# (we keep your existing link, but it's now safe since seriesId will exist; still, prevent render crash)
+p.write_text(s, encoding="utf-8")
+print("[ok] patched EpisodeOrVideoNew guard/import")
+PY
+
+# ---------- 4) Build ----------
+cd "$repo_root/apps/web" || exit 0
+npm run build
+echo "[rc] next_build=$?"

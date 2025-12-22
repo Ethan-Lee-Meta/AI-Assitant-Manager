@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+set +e
+
+ts="$(date +%Y%m%d_%H%M%S)"
+root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+echo "[info] repo_root=$root"
+cd "$root" || exit 1
+
+# Resolve venv python (convert backslashes for Git Bash)
+PY_WIN="$(python -c 'import sys; print(sys.executable)')"
+PY="$(printf '%s' "$PY_WIN" | sed 's|\\|/|g')"
+echo "[info] python=$PY"
+"$PY" -c "import sys; print('[info] sys.executable=', sys.executable)" 2>/dev/null
+echo "[rc] py_exec=$?"
+
+###############################################################################
+# [A] Backend: fix /api/feed kind filter (Enum -> string)
+###############################################################################
+FEED_STORE="apps/api/src/app/modules/feed/store_sqlite.py"
+FEED_SERVICE="apps/api/src/app/modules/feed/service.py"
+FEED_ROUTER="apps/api/src/app/modules/feed/router.py"
+
+if [ ! -f "$FEED_STORE" ]; then
+  echo "[err] missing: $FEED_STORE"
+  exit 2
+fi
+
+echo "==[A1] backup feed files =="
+cp -a "$FEED_STORE" "$FEED_STORE.bak.$ts"
+[ -f "$FEED_SERVICE" ] && cp -a "$FEED_SERVICE" "$FEED_SERVICE.bak.$ts"
+[ -f "$FEED_ROUTER" ] && cp -a "$FEED_ROUTER" "$FEED_ROUTER.bak.$ts"
+echo "[rc] backup=$?"
+
+echo "==[A2] patch kind normalization (service/router/store best-effort) =="
+"$PY" - <<'PY'
+from pathlib import Path
+import re, sys
+
+targets = [
+    Path("apps/api/src/app/modules/feed/router.py"),
+    Path("apps/api/src/app/modules/feed/service.py"),
+    Path("apps/api/src/app/modules/feed/store_sqlite.py"),
+]
+
+def patch_text(txt: str) -> tuple[str, int]:
+    n = 0
+    orig = txt
+
+    # 1) Normalize passing kind=kind into lower layers
+    #    kind=(kind.value if hasattr(kind,"value") else kind)
+    def repl_kind_arg(m):
+        nonlocal n
+        n += 1
+        tail = m.group(1)
+        return f'kind=(kind.value if hasattr(kind, "value") else kind){tail}'
+
+    txt = re.sub(r'kind\s*=\s*kind(\s*[,)\n])', repl_kind_arg, txt)
+
+    # 2) Normalize sqlite bind appends like params.append(kind) / params.append(str(kind))
+    #    This catches store implementations that bind kind directly.
+    def repl_append_str(m):
+        nonlocal n
+        n += 1
+        var = m.group(1)
+        return f'{var}.append(kind.value if hasattr(kind, "value") else str(kind))'
+
+    def repl_append_raw(m):
+        nonlocal n
+        n += 1
+        var = m.group(1)
+        return f'{var}.append(kind.value if hasattr(kind, "value") else kind)'
+
+    txt = re.sub(r'\b(params|args|binds|values)\.append\(\s*str\(\s*kind\s*\)\s*\)', repl_append_str, txt)
+    txt = re.sub(r'\b(params|args|binds|values)\.append\(\s*kind\s*\)', repl_append_raw, txt)
+
+    if txt == orig:
+        return txt, 0
+    return txt, n
+
+changed_any = False
+total_edits = 0
+
+for p in targets:
+    if not p.exists():
+        continue
+    txt = p.read_text(encoding="utf-8")
+    new_txt, edits = patch_text(txt)
+    if edits > 0:
+        p.write_text(new_txt, encoding="utf-8", newline="\n")
+        print(f"[ok] patched: {p} edits={edits}")
+        changed_any = True
+        total_edits += edits
+    else:
+        print(f"[skip] no change: {p}")
+
+if not changed_any:
+    print("[err] No patch applied. Cannot safely fix kind filter without seeing current feed code.")
+    print("      Please paste these files:")
+    print("      - apps/api/src/app/modules/feed/router.py")
+    print("      - apps/api/src/app/modules/feed/service.py")
+    print("      - apps/api/src/app/modules/feed/store_sqlite.py")
+    sys.exit(3)
+
+print(f"[ok] total_edits={total_edits}")
+PY
+rc_patch_feed=$?
+echo "[rc] patch_feed=$rc_patch_feed"
+if [ $rc_patch_feed -ne 0 ]; then
+  echo "[err] feed patch failed; abort before tests/build"
+  exit 3
+fi
+
+echo "==[A3] compile + pytest backend =="
+cd "$root/apps/api" || exit 1
+PYTHONPATH=./src "$PY" -m py_compile \
+  src/app/modules/feed/router.py \
+  src/app/modules/feed/service.py \
+  src/app/modules/feed/store_sqlite.py
+echo "[rc] py_compile_backend=$?"
+
+PYTHONPATH=./src "$PY" -m pytest -q tests/test_feed_readonly.py
+echo "[rc] test_feed=$?"
+
+PYTHONPATH=./src "$PY" -m pytest -q
+rc_pytest_all=$?
+echo "[rc] pytest_all=$rc_pytest_all"
+if [ $rc_pytest_all -ne 0 ]; then
+  echo "[err] backend tests failed; abort before web build"
+  exit 4
+fi
+
+###############################################################################
+# [B] Web: add Feed to sidebar nav (nav_items.ts)
+###############################################################################
+echo "==[B1] patch nav_items.ts add /feed =="
+cd "$root" || exit 1
+NAV="apps/web/src/ui/nav/nav_items.ts"
+if [ ! -f "$NAV" ]; then
+  echo "[warn] missing $NAV; skip nav patch"
+else
+  cp -a "$NAV" "$NAV.bak.$ts"
+  "$PY" - <<'PY'
+from pathlib import Path
+import re, sys
+
+p = Path("apps/web/src/ui/nav/nav_items.ts")
+txt = p.read_text(encoding="utf-8")
+
+if 'href: "/feed"' in txt or "href: '/feed'" in txt:
+    print("[skip] nav already contains /feed")
+    sys.exit(0)
+
+# Insert after Home if present; otherwise insert near start of array
+m = re.search(r'\{\s*label:\s*"Home"\s*,\s*href:\s*"/"\s*\}\s*,', txt)
+if m:
+    ins = m.group(0) + '\n  { label: "Feed", href: "/feed" },'
+    txt = txt[:m.start()] + ins + txt[m.end():]
+else:
+    txt = re.sub(r'(export\s+const\s+NAV_ITEMS\s*=\s*\[\s*)', r'\1\n  { label: "Feed", href: "/feed" },', txt, count=1)
+
+p.write_text(txt, encoding="utf-8", newline="\n")
+print("[ok] inserted Feed nav item")
+PY
+  echo "[rc] patch_nav=$?"
+fi
+
+###############################################################################
+# [C] Build web
+###############################################################################
+echo "==[C1] next build =="
+cd "$root/apps/web" || exit 1
+npm run build
+rc_next_build=$?
+echo "[rc] next_build=$rc_next_build"
+if [ $rc_next_build -ne 0 ]; then
+  exit 5
+fi
+
+###############################################################################
+# [D] Live OpenAPI sanity check (optional)
+###############################################################################
+echo "==[D1] live openapi contains /api/feed? (optional) =="
+cd "$root" || exit 1
+curl -sf http://localhost:7000/openapi.json | grep -q '"/api/feed"' >/dev/null 2>&1
+rc_live_openapi=$?
+if [ $rc_live_openapi -ne 0 ]; then
+  echo "[warn] /api/feed NOT found in live openapi.json."
+  echo "       Your API server may be an old process that didn't reload code."
+  echo "       Restart the API server, then run:"
+  echo "         ./scripts/export_openapi.sh"
+  echo "         ./scripts/verify_contracts.sh"
+else
+  echo "[ok] live openapi includes /api/feed"
+fi
+
+echo "==[DONE] feed kind filter fixed + nav updated =="
+exit 0

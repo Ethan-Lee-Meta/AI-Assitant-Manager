@@ -1,0 +1,134 @@
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Tuple
+
+from app.modules.episodes_or_videos.dto import EpisodeOrVideoKind
+
+# IMPORTANT:
+# We reuse episodes_or_videos store's connection+schema init to guarantee same DB path and table existence.
+from app.modules.episodes_or_videos import store_sqlite as eov_store
+
+
+ALLOWED_SORT_FIELDS = {"created_at", "updated_at", "order_index", "title"}
+
+
+def _parse_sort(sort: Optional[str]) -> tuple[str, str]:
+    """
+    Supports:
+      - "-created_at" (desc)
+      - "created_at"  (asc)
+      - "created_at:desc" / "order_index:asc"
+    Falls back to created_at desc on invalid input.
+    """
+    s = (sort or "").strip()
+    if not s:
+        return ("created_at", "DESC")
+
+    field: str
+    direction: str
+
+    if ":" in s:
+        field, d = s.split(":", 1)
+        field = field.strip()
+        d = d.strip().lower()
+        direction = "ASC" if d == "asc" else "DESC"
+    elif s.startswith("-"):
+        field = s[1:].strip()
+        direction = "DESC"
+    else:
+        field = s.strip()
+        direction = "ASC"
+
+    if field not in ALLOWED_SORT_FIELDS:
+        return ("created_at", "DESC")
+
+    return (field, direction)
+
+
+def list_feed_items(
+    *,
+    project_id: Optional[str],
+    series_id: Optional[str],
+    kind: Optional[EpisodeOrVideoKind],
+    q: Optional[str],
+    archived: bool,
+    limit: int,
+    offset: int,
+    sort: Optional[str],
+) -> Tuple[List[Dict[str, Any]], int]:
+    # Connection + schema init (same DB and table as episodes_or_videos)
+    if not hasattr(eov_store, "_connect") or not hasattr(eov_store, "_ensure"):
+        raise RuntimeError("episodes_or_videos.store_sqlite missing _connect/_ensure; cannot build feed safely")
+
+    conn = eov_store._connect()
+    eov_store._ensure(conn)
+
+    where: List[str] = []
+    params: List[Any] = []
+
+    # archived semantics alignment: archived=false => only active; archived=true => only archived
+    if archived:
+        where.append("archived_at IS NOT NULL")
+    else:
+        where.append("archived_at IS NULL")
+
+    pid = (project_id or "").strip()
+    if pid:
+        where.append("project_id = ?")
+        params.append(pid)
+
+    sid = (series_id or "").strip()
+    if sid:
+        where.append("series_id = ?")
+        params.append(sid)
+
+    if kind is not None:
+        where.append("kind = ?")
+        params.append(str(kind))
+
+    qq = (q or "").strip()
+    if qq:
+        where.append("(title LIKE ? OR synopsis_text LIKE ? OR script_text LIKE ?)")
+        like = f"%{qq}%"
+        params.extend([like, like, like])
+
+    where_sql = " AND ".join(where) if where else "1=1"
+    field, direction = _parse_sort(sort)
+
+    # total
+    cur = conn.execute(f"SELECT COUNT(1) FROM episodes_or_videos WHERE {where_sql}", params)
+    total = int(cur.fetchone()[0] or 0)
+
+    # page
+    sql = f"""
+    SELECT
+      id, project_id, series_id, kind, title, synopsis_text, order_index,
+      created_at, updated_at, archived_at
+    FROM episodes_or_videos
+    WHERE {where_sql}
+    ORDER BY {field} {direction}
+    LIMIT ? OFFSET ?
+    """.strip()
+
+    cur = conn.execute(sql, [*params, int(limit), int(offset)])
+    rows = cur.fetchall()
+
+    items: List[Dict[str, Any]] = []
+    for r in rows:
+        items.append(
+            {
+                "item_type": "episode_or_video",
+                "id": r[0],
+                "project_id": r[1],
+                "series_id": r[2],
+                "kind": r[3],
+                "title": r[4],
+                "synopsis_text": r[5],
+                "order_index": r[6],
+                "created_at": r[7],
+                "updated_at": r[8],
+                "archived_at": r[9],
+            }
+        )
+
+    return items, total

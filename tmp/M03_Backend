@@ -1,0 +1,576 @@
+# =========================
+# Step1: M03 Backend scaffold + CRUD/List
+# (safe mode: no set -e)
+# =========================
+
+# 0) 进入 repo 根目录（容错）
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+if [ -z "$REPO_ROOT" ]; then
+  echo "[warn] not a git repo? stay in current dir: $(pwd)"
+  REPO_ROOT="$(pwd)"
+fi
+cd "$REPO_ROOT" || { echo "[warn] cd repo root failed"; }
+
+echo "[info] repo_root=$REPO_ROOT"
+echo "[info] commit=$(git rev-parse HEAD 2>/dev/null)"
+
+fail=0
+run () {
+  echo
+  echo ">>> $*"
+  "$@"
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    echo "[warn] rc=$rc: $*"
+    fail=1
+  fi
+  return 0
+}
+
+ts="$(date +%Y%m%d_%H%M%S)"
+
+# 1) 基线快速检查（可跳过；这里也不会因失败退出）
+run bash -lc 'cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" && cd apps/api && PYTHONPATH=./src pytest -q'
+
+# 2) 创建模块目录
+MOD_DIR="apps/api/src/app/modules/episodes_or_videos"
+run mkdir -p "$MOD_DIR"
+
+# 3) 写 DTO（episodes_or_videos/dto.py）
+cat > "$MOD_DIR/dto.py" <<'EOF'
+from __future__ import annotations
+
+from datetime import datetime
+from enum import Enum
+from typing import List, Optional
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class EpisodeOrVideoKind(str, Enum):
+    episode = "episode"
+    video = "video"
+
+
+class EpisodeOrVideoCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str = Field(..., min_length=1)
+    series_id: str = Field(..., min_length=1)
+    title: str = Field(..., min_length=1)
+    kind: EpisodeOrVideoKind
+
+    synopsis_text: Optional[str] = None
+    order_index: Optional[int] = None
+    script_text: Optional[str] = None
+    assembly_preset_id: Optional[str] = None
+
+
+class EpisodeOrVideoPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: Optional[str] = None
+    synopsis_text: Optional[str] = None
+    order_index: Optional[int] = None
+    script_text: Optional[str] = None
+    assembly_preset_id: Optional[str] = None
+
+    archived_at: Optional[datetime] = None
+
+
+class EpisodeOrVideo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    project_id: str
+    series_id: str
+    title: str
+    kind: EpisodeOrVideoKind
+
+    synopsis_text: Optional[str] = None
+    order_index: Optional[int] = None
+    script_text: Optional[str] = None
+    assembly_preset_id: Optional[str] = None
+
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+    archived_at: Optional[datetime] = None
+
+
+class EpisodeOrVideoListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: List[EpisodeOrVideo]
+    total: int
+    limit: int
+    offset: int
+EOF
+
+# 4) 写 SQLite Store（episodes_or_videos/store_sqlite.py）
+cat > "$MOD_DIR/store_sqlite.py" <<'EOF'
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+import os
+import sqlite3
+import uuid
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _default_db_path() -> str:
+    # Align with other sqlite-based modules (best-effort)
+    # Use env if present; otherwise local file under apps/api/.data
+    return (
+        os.getenv("AAM_SQLITE_PATH")
+        or os.getenv("SQLITE_PATH")
+        or str(Path("apps/api/.data/app.sqlite").resolve())
+    )
+
+
+def _connect() -> sqlite3.Connection:
+    path = _default_db_path()
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _ensure(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS episodes_or_videos (
+          id TEXT PRIMARY KEY,
+          project_id TEXT NOT NULL,
+          series_id TEXT NOT NULL,
+          title TEXT NOT NULL,
+          synopsis_text TEXT,
+          kind TEXT NOT NULL,
+          order_index INTEGER,
+          script_text TEXT,
+          assembly_preset_id TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT,
+          archived_at TEXT
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_eov_project ON episodes_or_videos(project_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_eov_series ON episodes_or_videos(series_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_eov_kind ON episodes_or_videos(kind)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_eov_archived ON episodes_or_videos(archived_at)")
+    conn.commit()
+
+
+def create(payload: Dict[str, Any]) -> Dict[str, Any]:
+    conn = _connect()
+    _ensure(conn)
+    eid = uuid.uuid4().hex
+    now = _now_iso()
+
+    conn.execute(
+        """
+        INSERT INTO episodes_or_videos(
+          id, project_id, series_id, title, synopsis_text, kind,
+          order_index, script_text, assembly_preset_id,
+          created_at, updated_at, archived_at
+        )
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            eid,
+            payload["project_id"],
+            payload["series_id"],
+            payload["title"],
+            payload.get("synopsis_text"),
+            payload["kind"],
+            payload.get("order_index"),
+            payload.get("script_text"),
+            payload.get("assembly_preset_id"),
+            now,
+            now,
+            None,
+        ),
+    )
+    conn.commit()
+    return get(eid)
+
+
+def get(episode_or_video_id: str) -> Dict[str, Any]:
+    conn = _connect()
+    _ensure(conn)
+    row = conn.execute(
+        "SELECT * FROM episodes_or_videos WHERE id=?",
+        (episode_or_video_id,),
+    ).fetchone()
+    if row is None:
+        raise KeyError("NOT_FOUND")
+    return dict(row)
+
+
+def update(episode_or_video_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
+    cur = get(episode_or_video_id)  # raises if missing
+    conn = _connect()
+    _ensure(conn)
+
+    merged = {**cur, **patch}
+    merged["updated_at"] = _now_iso()
+
+    conn.execute(
+        """
+        UPDATE episodes_or_videos
+        SET
+          title=?,
+          synopsis_text=?,
+          order_index=?,
+          script_text=?,
+          assembly_preset_id=?,
+          kind=?,
+          series_id=?,
+          project_id=?,
+          updated_at=?,
+          archived_at=?
+        WHERE id=?
+        """,
+        (
+            merged["title"],
+            merged.get("synopsis_text"),
+            merged.get("order_index"),
+            merged.get("script_text"),
+            merged.get("assembly_preset_id"),
+            merged["kind"],
+            merged["series_id"],
+            merged["project_id"],
+            merged["updated_at"],
+            merged.get("archived_at"),
+            episode_or_video_id,
+        ),
+    )
+    conn.commit()
+    return get(episode_or_video_id)
+
+
+def list_items(
+    *,
+    project_id: str,
+    series_id: Optional[str],
+    kind: Optional[str],
+    q: Optional[str],
+    archived: bool,
+    limit: int,
+    offset: int,
+    sort: str,
+) -> Tuple[List[Dict[str, Any]], int]:
+    conn = _connect()
+    _ensure(conn)
+
+    where: List[str] = []
+    args: List[Any] = []
+
+    where.append("project_id = ?")
+    args.append(project_id)
+
+    if not archived:
+        where.append("archived_at IS NULL")
+
+    if series_id:
+        where.append("series_id = ?")
+        args.append(series_id)
+
+    if kind:
+        where.append("kind = ?")
+        args.append(kind)
+
+    if q:
+        # best-effort "quick search"
+        where.append("(title LIKE ? OR synopsis_text LIKE ? OR script_text LIKE ?)")
+        like = f"%{q}%"
+        args.extend([like, like, like])
+
+    where_sql = " WHERE " + " AND ".join(where)
+
+    # sort: field:asc|desc ; default created_at:desc
+    sort = (sort or "created_at:desc").strip()
+    field, _, direction = sort.partition(":")
+    field = field.strip()
+    direction = (direction or "desc").strip().lower()
+
+    allowed = {"created_at", "updated_at", "order_index", "title"}
+    if field not in allowed:
+        field = "created_at"
+    if direction not in {"asc", "desc"}:
+        direction = "desc"
+
+    total_row = conn.execute(
+        f"SELECT COUNT(1) AS c FROM episodes_or_videos{where_sql}",
+        args,
+    ).fetchone()
+    total = int(total_row["c"]) if total_row else 0
+
+    rows = conn.execute(
+        f"""
+        SELECT * FROM episodes_or_videos
+        {where_sql}
+        ORDER BY {field} {direction}
+        LIMIT ? OFFSET ?
+        """,
+        [*args, limit, offset],
+    ).fetchall()
+
+    return [dict(r) for r in rows], total
+EOF
+
+# 5) 写 Service（episodes_or_videos/service.py）
+cat > "$MOD_DIR/service.py" <<'EOF'
+from __future__ import annotations
+
+from typing import Optional
+
+from app.core.errors import AppError
+from . import store_sqlite
+from .dto import EpisodeOrVideoCreate, EpisodeOrVideoPatch, EpisodeOrVideoKind
+
+
+def create_episode_or_video(payload: EpisodeOrVideoCreate):
+    d = payload.model_dump()
+    d["kind"] = d["kind"].value if isinstance(d.get("kind"), EpisodeOrVideoKind) else d.get("kind")
+    return store_sqlite.create(d)
+
+
+def get_episode_or_video(episode_or_video_id: str):
+    try:
+        return store_sqlite.get(episode_or_video_id)
+    except KeyError:
+        raise AppError("NOT_FOUND", "EpisodeOrVideo not found", status_code=404)
+
+
+def patch_episode_or_video(episode_or_video_id: str, patch: EpisodeOrVideoPatch):
+    try:
+        d = patch.model_dump(exclude_unset=True)
+        if "archived_at" in d and d["archived_at"] is not None:
+            d["archived_at"] = d["archived_at"].isoformat()
+        if "kind" in d and isinstance(d.get("kind"), EpisodeOrVideoKind):
+            d["kind"] = d["kind"].value
+        return store_sqlite.update(episode_or_video_id, d)
+    except KeyError:
+        raise AppError("NOT_FOUND", "EpisodeOrVideo not found", status_code=404)
+
+
+def list_episodes_or_videos(
+    *,
+    project_id: str,
+    series_id: Optional[str],
+    kind: Optional[EpisodeOrVideoKind],
+    q: Optional[str],
+    archived: bool,
+    limit: int,
+    offset: int,
+    sort: str,
+):
+    kind_s = kind.value if kind is not None else None
+    items, total = store_sqlite.list_items(
+        project_id=project_id,
+        series_id=series_id,
+        kind=kind_s,
+        q=q,
+        archived=archived,
+        limit=limit,
+        offset=offset,
+        sort=sort,
+    )
+    return items, total
+EOF
+
+# 6) 写 Router（episodes_or_videos/router.py）
+cat > "$MOD_DIR/router.py" <<'EOF'
+from __future__ import annotations
+
+from typing import Optional
+
+from fastapi import APIRouter, Query
+
+from .dto import (
+    EpisodeOrVideo,
+    EpisodeOrVideoCreate,
+    EpisodeOrVideoKind,
+    EpisodeOrVideoListResponse,
+    EpisodeOrVideoPatch,
+)
+from .service import (
+    create_episode_or_video,
+    get_episode_or_video,
+    list_episodes_or_videos,
+    patch_episode_or_video,
+)
+
+router = APIRouter(prefix="/api/episodes_or_videos", tags=["episodes_or_videos"])
+
+
+@router.post("", response_model=EpisodeOrVideo)
+def create(payload: EpisodeOrVideoCreate):
+    return create_episode_or_video(payload)
+
+
+@router.get("/{episode_or_video_id}", response_model=EpisodeOrVideo)
+def get_one(episode_or_video_id: str):
+    return get_episode_or_video(episode_or_video_id)
+
+
+@router.patch("/{episode_or_video_id}", response_model=EpisodeOrVideo)
+def patch_one(episode_or_video_id: str, patch: EpisodeOrVideoPatch):
+    return patch_episode_or_video(episode_or_video_id, patch)
+
+
+@router.get("", response_model=EpisodeOrVideoListResponse)
+def list_all(
+    project_id: str = Query(..., min_length=1),
+    series_id: Optional[str] = None,
+    kind: Optional[EpisodeOrVideoKind] = None,
+    q: Optional[str] = None,
+    archived: bool = False,
+    limit: int = Query(20, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    sort: str = "created_at:desc",
+):
+    items, total = list_episodes_or_videos(
+        project_id=project_id,
+        series_id=series_id,
+        kind=kind,
+        q=q,
+        archived=archived,
+        limit=limit,
+        offset=offset,
+        sort=sort,
+    )
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+EOF
+
+# 7) 修改 modules/_registry.py：追加 episodes_or_videos 的 include（自动补丁；失败也不退出）
+REG="apps/api/src/app/modules/_registry.py"
+if [ -f "$REG" ]; then
+  run cp "$REG" "${REG}.bak.${ts}"
+  run python - <<'PY'
+from pathlib import Path
+
+p = Path("apps/api/src/app/modules/_registry.py")
+s = p.read_text(encoding="utf-8")
+
+needle_import = "from .episodes_or_videos.router import router as episodes_or_videos_router"
+needle_include = "app.include_router(episodes_or_videos_router)"
+
+if needle_import in s and needle_include in s:
+    print("[ok] registry already has episodes_or_videos")
+    raise SystemExit(0)
+
+# best-effort insert after series import/include if present
+series_import = "from .series.router import router as series_router"
+series_include = "app.include_router(series_router)"
+
+if needle_import not in s:
+    if series_import in s:
+        s = s.replace(series_import, series_import + "\n" + needle_import)
+    else:
+        # fallback: prepend near top
+        s = needle_import + "\n" + s
+
+if needle_include not in s:
+    if series_include in s:
+        s = s.replace(series_include, series_include + "\n    " + needle_include)
+    else:
+        # fallback: append at end of register function if recognizable
+        if "def register_modules" in s:
+            s = s + "\n" + needle_include + "\n"
+        else:
+            s = s + "\n" + needle_include + "\n"
+
+p.write_text(s, encoding="utf-8")
+print("[ok] patched registry for episodes_or_videos")
+PY
+else
+  echo "[warn] registry not found at $REG (skip)"
+  fail=1
+fi
+
+# 8) 新增 pytest（最小 CRUD + filters）
+TEST_FILE="apps/api/tests/test_episodes_or_videos_crud.py"
+cat > "$TEST_FILE" <<'EOF'
+import os
+from fastapi.testclient import TestClient
+
+
+def test_episodes_or_videos_crud(tmp_path):
+    # isolate sqlite for this test (module reads env at call time)
+    db_path = tmp_path / "m03_eov.sqlite"
+    os.environ["AAM_SQLITE_PATH"] = str(db_path)
+
+    from app.main import app  # import after env best-effort
+
+    client = TestClient(app)
+
+    # create
+    payload = {
+        "project_id": "p1",
+        "series_id": "s1",
+        "title": "ep1",
+        "kind": "episode",
+        "synopsis_text": "hello",
+        "order_index": 1,
+        "script_text": "script v1",
+        "assembly_preset_id": "preset-1",
+    }
+    r = client.post("/api/episodes_or_videos", json=payload, headers={"X-Request-Id": "test-m03-1"})
+    assert r.status_code in (200, 201), r.text
+    item = r.json()
+    eid = item["id"]
+    assert item["project_id"] == "p1"
+    assert item["series_id"] == "s1"
+    assert item["kind"] == "episode"
+
+    # get
+    r = client.get(f"/api/episodes_or_videos/{eid}", headers={"X-Request-Id": "test-m03-2"})
+    assert r.status_code == 200, r.text
+    assert r.json()["id"] == eid
+
+    # list (project_id required)
+    r = client.get("/api/episodes_or_videos", params={"project_id": "p1"}, headers={"X-Request-Id": "test-m03-3"})
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["total"] >= 1
+    assert any(x["id"] == eid for x in data["items"])
+
+    # filter by kind
+    r = client.get(
+        "/api/episodes_or_videos",
+        params={"project_id": "p1", "kind": "video"},
+        headers={"X-Request-Id": "test-m03-4"},
+    )
+    assert r.status_code == 200, r.text
+    assert all(x["kind"] == "video" for x in r.json()["items"])
+
+    # patch script_text
+    r = client.patch(
+        f"/api/episodes_or_videos/{eid}",
+        json={"script_text": "script v2"},
+        headers={"X-Request-Id": "test-m03-5"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["script_text"] == "script v2"
+EOF
+
+# 9) 运行后端测试（不退出）
+run bash -lc 'cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" && cd apps/api && PYTHONPATH=./src pytest -q'
+
+# 10) 导出并校验合约锁（必须在 repo 根目录执行）
+run bash -lc 'cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" && ./scripts/export_openapi.sh'
+run bash -lc 'cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" && VERIFY_LIVE=0 ./scripts/verify_contracts.sh'
+
+echo
+if [ $fail -ne 0 ]; then
+  echo "[done] Step1 finished with warnings. Search for [warn] above."
+else
+  echo "[done] Step1 finished OK."
+fi

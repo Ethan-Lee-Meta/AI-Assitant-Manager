@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { EpisodeOrVideoListBySeries } from "../episodes_or_videos/EpisodeOrVideoListBySeries";
 import { Series, getSeries, updateSeries } from "../../lib/api/series";
 
 export function SeriesWorkspace(props: { seriesId: string }) {
@@ -10,8 +11,14 @@ export function SeriesWorkspace(props: { seriesId: string }) {
   const [loading, setLoading] = useState<boolean>(false);
   const [err, setErr] = useState<string | null>(null);
 
+  const backHref = useMemo(() => {
+    const pid = (item as any)?.project_id ? String((item as any).project_id) : "";
+    return pid ? `/series?project_id=${encodeURIComponent(pid)}` : "/series";
+  }, [(item as any)?.project_id]);
+
   const [styleText, setStyleText] = useState<string>("");
   const [continuityText, setContinuityText] = useState<string>("");
+
 
   async function refresh() {
     setLoading(true);
@@ -78,7 +85,8 @@ export function SeriesWorkspace(props: { seriesId: string }) {
   return (
     <div style={{ display: "grid", gap: 16 }}>
       <div>
-        <a href="/series" style={{ color: "#555", textDecoration: "none" }}>← Back to Series</a>
+        {/* preserve project_id filter if available */}
+        <a href={backHref} style={{ color: "#555", textDecoration: "none" }}>← Back to Series</a>
       </div>
 
       <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 12 }}>
@@ -109,10 +117,35 @@ export function SeriesWorkspace(props: { seriesId: string }) {
       </div>
 
       <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 12 }}>
-        <h2 style={{ margin: 0 }}>Associations (placeholder)</h2>
-        <div style={{ color: "#666", marginTop: 8 }}>
-          M02 scope: keep as placeholder. Future steps will link Prompts / Roles and create EpisodeOrVideo entry here.
+        <h2 style={{ margin: 0 }}>Episodes / Videos</h2>
+
+        <div style={{ color: "#666", marginTop: 8, fontSize: 12 }}>
+          series_id={seriesId} • project_id={String((item as any)?.project_id ?? "null")}
         </div>
+
+        <div style={{ display: "flex", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
+          <a
+            href={`/series/${seriesId}/episodes/new`}
+            style={{ border: "1px solid #ddd", borderRadius: 10, padding: "6px 12px", textDecoration: "none" }}
+          >
+            + New Episode
+          </a>
+          <a
+            href={`/series/${seriesId}/videos/new`}
+            style={{ border: "1px solid #ddd", borderRadius: 10, padding: "6px 12px", textDecoration: "none" }}
+          >
+            + New Video
+          </a>
+        </div>
+
+        {(item as any)?.project_id ? (
+          <div style={{ display: "grid", gap: 12, marginTop: 12 }}>
+            <EpisodeOrVideoListBySeries projectId={String((item as any).project_id)} seriesId={seriesId} kind="episode" title="Episodes" />
+            <EpisodeOrVideoListBySeries projectId={String((item as any).project_id)} seriesId={seriesId} kind="video" title="Videos" />
+          </div>
+        ) : (
+          <div style={{ color: "crimson", marginTop: 12 }}>series.project_id missing</div>
+        )}
       </div>
     </div>
   );

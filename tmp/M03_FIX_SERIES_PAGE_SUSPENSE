@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set +e
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$ROOT" || exit 0
+
+F="apps/web/app/(app)/series/page.tsx"
+if [ ! -f "$F" ]; then
+  echo "[err] missing: $F"
+  exit 0
+fi
+
+echo "==[S0] show current series page head =="
+nl -ba "$F" | sed -n '1,120p'
+
+cp -a "$F" "$F.bak.$(date +%Y%m%d_%H%M%S)"
+echo "[ok] backup -> $F.bak.*"
+
+python - <<'PY'
+from pathlib import Path
+import re, sys
+
+p = Path("apps/web/app/(app)/series/page.tsx")
+s = p.read_text(encoding="utf-8")
+
+if "<Suspense" in s:
+    print("[skip] already contains <Suspense>; no change")
+    sys.exit(0)
+
+# Ensure Suspense import exists (from react)
+if re.search(r'from\s+"react"\s*;?', s) and "Suspense" not in s:
+    # add Suspense into existing react import { ... }
+    s2, n = re.subn(
+        r'from\s+"react"\s*;?',
+        'from "react";',
+        s,
+        count=1
+    )
+    s = s2
+
+if not re.search(r'import\s+\{\s*Suspense\s*\}\s+from\s+"react"\s*;', s):
+    # Try to inject a new import line after the first import
+    m = re.search(r'^(import[^\n]*\n)', s, flags=re.M)
+    if not m:
+        print("[err] cannot find any import line; abort")
+        sys.exit(2)
+    insert_pos = m.end()
+    s = s[:insert_pos] + 'import { Suspense } from "react";\n' + s[insert_pos:]
+
+# Patch return patterns:
+# 1) return <Component ... />;
+m1 = re.search(r'\breturn\s+<([A-Za-z0-9_]+)([^>]*)/>\s*;\s*', s)
+if m1:
+    comp = m1.group(1)
+    props = m1.group(2)
+    repl = (
+        "return (\n"
+        "    <Suspense fallback={<div style={{ padding: 16 }}>Loading...</div>}>\n"
+        f"      <{comp}{props}/>\n"
+        "    </Suspense>\n"
+        "  );"
+    )
+    s = s[:m1.start()] + repl + s[m1.end():]
+    p.write_text(s, encoding="utf-8")
+    print(f"[ok] wrapped return <{comp} .../> with Suspense (single-line form)")
+    sys.exit(0)
+
+# 2) return ( <Component .../> );
+m2 = re.search(r'\breturn\s*\(\s*<([A-Za-z0-9_]+)([^>]*)/>\s*\)\s*;\s*', s, flags=re.S)
+if m2:
+    comp = m2.group(1)
+    props = m2.group(2)
+    repl = (
+        "return (\n"
+        "    <Suspense fallback={<div style={{ padding: 16 }}>Loading...</div>}>\n"
+        f"      <{comp}{props}/>\n"
+        "    </Suspense>\n"
+        "  );"
+    )
+    s = s[:m2.start()] + repl + s[m2.end():]
+    p.write_text(s, encoding="utf-8")
+    print(f"[ok] wrapped return (<{comp} .../>) with Suspense (paren form)")
+    sys.exit(0)
+
+print("[err] page.tsx return is not a simple <Component /> form; abort to avoid guessing.")
+sys.exit(3)
+PY
+
+echo "[rc] patch_series_page=$?"
+
+echo "==[S1] build web =="
+cd "$ROOT/apps/web" || exit 0
+npm run build
+echo "[rc] next_build=$?"

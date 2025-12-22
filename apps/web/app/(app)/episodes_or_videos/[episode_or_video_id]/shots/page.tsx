@@ -1,0 +1,19 @@
+import Link from "next/link";
+
+export default async function Page(props: { params: any }) {
+  const p = await props?.params;
+  const id = p?.episode_or_video_id;
+
+  return (
+    <div style={{ padding: 16 }}>
+      <h2 style={{ fontSize: 18, fontWeight: 800 }}>Shots (placeholder)</h2>
+      <div style={{ marginTop: 8, fontSize: 12, opacity: 0.8 }}>episode_or_video_id={id}</div>
+      <div style={{ marginTop: 12 }}>
+        <Link href={`/episodes_or_videos/${id}`}>Back to Episode/Video Workspace</Link>
+      </div>
+      <div style={{ marginTop: 12, opacity: 0.75 }}>
+        Shot 模块后续接入；当前仅作为入口占位，避免 404。
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,33 @@
+from __future__ import annotations
+
+from typing import List, Literal, Optional
+
+from pydantic import BaseModel, Field
+
+from app.modules.episodes_or_videos.dto import EpisodeOrVideoKind
+
+
+FeedItemType = Literal["episode_or_video"]
+
+
+class FeedItem(BaseModel):
+    item_type: FeedItemType = Field(default="episode_or_video")
+    id: str
+
+    project_id: str
+    series_id: str
+    kind: EpisodeOrVideoKind
+
+    title: str
+    synopsis_text: Optional[str] = None
+
+    created_at: str
+    updated_at: Optional[str] = None
+    archived_at: Optional[str] = None
+
+
+class FeedListResponse(BaseModel):
+    items: List[FeedItem]
+    total: int
+    limit: int
+    offset: int

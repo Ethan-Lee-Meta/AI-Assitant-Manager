@@ -1,0 +1,375 @@
+#!/usr/bin/env bash
+set +e
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" || exit 0
+
+ts="$(date +%Y%m%d_%H%M%S)"
+echo "[info] repo_root=$(pwd)"
+rc=0
+
+REG="apps/api/src/app/modules/_registry.py"
+MODDIR="apps/api/src/app/modules/feed"
+TEST="apps/api/tests/test_feed_api.py"
+
+echo "==[S1] backup registry =="
+if [ -f "$REG" ]; then
+  cp "$REG" "$REG.bak.$ts"
+  echo "[ok] backup -> $REG.bak.$ts"
+else
+  echo "[err] missing $REG"
+  exit 2
+fi
+
+echo "==[S2] write feed module files =="
+mkdir -p "$MODDIR" || rc=1
+
+cat > "$MODDIR/dto.py" <<'PY'
+from __future__ import annotations
+
+from typing import List, Literal, Optional
+
+from pydantic import BaseModel, Field
+
+from app.modules.episodes_or_videos.dto import EpisodeOrVideoKind
+
+
+FeedItemType = Literal["episode_or_video"]
+
+
+class FeedItem(BaseModel):
+    item_type: FeedItemType = Field(default="episode_or_video")
+    id: str
+
+    project_id: str
+    series_id: str
+    kind: EpisodeOrVideoKind
+
+    title: str
+    synopsis_text: Optional[str] = None
+
+    created_at: str
+    updated_at: Optional[str] = None
+    archived_at: Optional[str] = None
+
+
+class FeedListResponse(BaseModel):
+    items: List[FeedItem]
+    total: int
+    limit: int
+    offset: int
+PY
+
+cat > "$MODDIR/store_sqlite.py" <<'PY'
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+import os
+import sqlite3
+
+
+def _default_db_path() -> str:
+    return (
+        os.getenv("AAM_SQLITE_PATH")
+        or os.getenv("SQLITE_PATH")
+        or str(Path("apps/api/.data/app.sqlite").resolve())
+    )
+
+
+def _connect() -> sqlite3.Connection:
+    path = _default_db_path()
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _parse_sort(sort: Optional[str]) -> Tuple[str, str]:
+    """
+    Accepts:
+      - "-created_at" / "created_at"
+      - "created_at:desc" / "created_at:asc"
+    """
+    s = (sort or "-created_at").strip()
+
+    field = "created_at"
+    direction = "desc"
+
+    if ":" in s:
+        f, _, d = s.partition(":")
+        field = (f or "").strip()
+        direction = (d or "desc").strip().lower()
+    else:
+        if s.startswith("-"):
+            field = s[1:].strip()
+            direction = "desc"
+        else:
+            field = s.strip()
+            direction = "asc"
+
+    allowed = {"created_at", "updated_at", "order_index", "title"}
+    if field not in allowed:
+        field = "created_at"
+    if direction not in {"asc", "desc"}:
+        direction = "desc"
+    return field, direction
+
+
+def list_feed(
+    *,
+    project_id: Optional[str],
+    series_id: Optional[str],
+    kind: Optional[str],
+    q: Optional[str],
+    archived: bool,
+    limit: int,
+    offset: int,
+    sort: Optional[str],
+) -> Tuple[List[Dict[str, Any]], int]:
+    conn = _connect()
+
+    where: List[str] = []
+    args: List[Any] = []
+
+    if project_id:
+        where.append("project_id = ?")
+        args.append(project_id)
+
+    if series_id:
+        where.append("series_id = ?")
+        args.append(series_id)
+
+    if kind:
+        where.append("kind = ?")
+        args.append(kind)
+
+    if not archived:
+        where.append("archived_at IS NULL")
+
+    if q:
+        where.append("(title LIKE ? OR synopsis_text LIKE ? OR script_text LIKE ?)")
+        like = f"%{q}%"
+        args.extend([like, like, like])
+
+    where_sql = ""
+    if where:
+        where_sql = " WHERE " + " AND ".join(where)
+
+    field, direction = _parse_sort(sort)
+
+    try:
+        total_row = conn.execute(
+            f"SELECT COUNT(1) AS c FROM episodes_or_videos{where_sql}",
+            args,
+        ).fetchone()
+        total = int(total_row["c"]) if total_row else 0
+
+        rows = conn.execute(
+            f"""
+            SELECT
+              'episode_or_video' AS item_type,
+              id, project_id, series_id, kind, title, synopsis_text,
+              created_at, updated_at, archived_at
+            FROM episodes_or_videos
+            {where_sql}
+            ORDER BY {field} {direction}
+            LIMIT ? OFFSET ?
+            """,
+            [*args, limit, offset],
+        ).fetchall()
+
+        return [dict(r) for r in rows], total
+    except sqlite3.OperationalError as e:
+        # If the table doesn't exist yet, treat as empty feed (read-only).
+        msg = str(e).lower()
+        if "no such table" in msg and "episodes_or_videos" in msg:
+            return [], 0
+        raise
+PY
+
+cat > "$MODDIR/service.py" <<'PY'
+from __future__ import annotations
+
+from typing import Optional
+
+from app.modules.feed.dto import FeedListResponse, FeedItem
+from app.modules.feed import store_sqlite
+
+
+def list_feed(
+    *,
+    project_id: Optional[str],
+    series_id: Optional[str],
+    kind: Optional[str],
+    q: Optional[str],
+    archived: bool,
+    limit: int,
+    offset: int,
+    sort: Optional[str],
+) -> FeedListResponse:
+    rows, total = store_sqlite.list_feed(
+        project_id=project_id,
+        series_id=series_id,
+        kind=kind,
+        q=q,
+        archived=archived,
+        limit=limit,
+        offset=offset,
+        sort=sort,
+    )
+    items = [FeedItem(**r) for r in rows]
+    return FeedListResponse(items=items, total=total, limit=limit, offset=offset)
+PY
+
+cat > "$MODDIR/router.py" <<'PY'
+from __future__ import annotations
+
+from typing import Optional
+
+from fastapi import APIRouter, Query
+
+from app.modules.episodes_or_videos.dto import EpisodeOrVideoKind
+from app.modules.feed.dto import FeedListResponse
+from app.modules.feed import service
+
+router = APIRouter(prefix="/api/feed", tags=["feed"])
+
+
+@router.get("", response_model=FeedListResponse)
+def list_feed(
+    project_id: Optional[str] = Query(default=None),
+    series_id: Optional[str] = Query(default=None),
+    kind: Optional[EpisodeOrVideoKind] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    sort: Optional[str] = Query(default="-created_at"),
+    q: Optional[str] = Query(default=None),
+    archived: bool = Query(default=False),
+) -> FeedListResponse:
+    return service.list_feed(
+        project_id=project_id,
+        series_id=series_id,
+        kind=str(kind) if kind is not None else None,
+        q=q,
+        archived=archived,
+        limit=limit,
+        offset=offset,
+        sort=sort,
+    )
+PY
+
+echo "==[S3] patch registry: append feed router =="
+python - <<'PY'
+import re
+from pathlib import Path
+
+p = Path("apps/api/src/app/modules/_registry.py")
+s = p.read_text(encoding="utf-8")
+
+if "modules.feed.router" in s or "feed.router" in s:
+    print("[ok] registry already patched")
+    raise SystemExit(0)
+
+# Insert just before "return routers" inside get_module_routers, minimal risk.
+m = re.search(r"(?m)^\s*return\s+routers\s*$", s)
+if not m:
+    print("[err] cannot find 'return routers' anchor in _registry.py")
+    raise SystemExit(3)
+
+indent = re.match(r"^(\s*)", m.group(0)).group(1)
+block = (
+    f"{indent}# feed (read-only aggregate)\n"
+    f"{indent}from app.modules.feed.router import router as feed_router\n"
+    f"{indent}routers.append(feed_router)\n\n"
+)
+s2 = s[:m.start()] + block + s[m.start():]
+p.write_text(s2, encoding="utf-8")
+print("[ok] patched registry (_registry.py)")
+PY
+rc=$?; echo "[rc] patch_registry=$rc"; [ $rc -ne 0 ] && exit $rc
+
+echo "==[S4] write tests =="
+mkdir -p "apps/api/tests" || true
+cat > "$TEST" <<'PY'
+import os
+import importlib
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+
+def _load_app():
+    # Try common entrypoints; avoids hard-coding your API entry file.
+    candidates = ["app.main", "app.api", "app.server", "app.app"]
+    for name in candidates:
+        try:
+            mod = importlib.import_module(name)
+            app = getattr(mod, "app", None)
+            if app is not None:
+                return app
+        except Exception:
+            continue
+    raise RuntimeError("Cannot locate FastAPI app. Add the real module to candidates in test_feed_api.py")
+
+
+@pytest.fixture()
+def client(tmp_path: Path):
+    db_path = tmp_path / "test.sqlite"
+    os.environ["AAM_SQLITE_PATH"] = str(db_path)
+
+    app = _load_app()
+    return TestClient(app)
+
+
+def test_feed_defaults_and_filters(client: TestClient):
+    # Create sample data via existing episodes_or_videos store.
+    from app.modules.episodes_or_videos import store_sqlite as eov_store
+
+    a = eov_store.create(
+        {"project_id": "p1", "series_id": "s1", "title": "Ep A", "kind": "episode"}
+    )
+    b = eov_store.create(
+        {"project_id": "p2", "series_id": "s2", "title": "Vid B", "kind": "video"}
+    )
+
+    # Default: archived=false, sort=-created_at (desc). We only assert it returns both.
+    r = client.get("/api/feed?limit=50&offset=0")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["total"] >= 2
+    ids = [x["id"] for x in data["items"]]
+    assert a["id"] in ids
+    assert b["id"] in ids
+
+    # Filter by project_id
+    r2 = client.get("/api/feed?project_id=p1")
+    assert r2.status_code == 200
+    data2 = r2.json()
+    assert all(x["project_id"] == "p1" for x in data2["items"])
+
+    # Filter by kind
+    r3 = client.get("/api/feed?kind=video")
+    assert r3.status_code == 200
+    data3 = r3.json()
+    assert all(x["kind"] == "video" for x in data3["items"])
+PY
+
+echo "==[S5] compile python =="
+python -m py_compile \
+  "$MODDIR/dto.py" \
+  "$MODDIR/store_sqlite.py" \
+  "$MODDIR/service.py" \
+  "$MODDIR/router.py" \
+  "$REG"
+rc=$?; echo "[rc] py_compile=$rc"; [ $rc -ne 0 ] && exit $rc
+
+echo "==[S6] run backend tests =="
+pytest -q
+rc=$?; echo "[rc] pytest_all=$rc"; [ $rc -ne 0 ] && exit $rc
+
+echo "==[S7] smoke curl (requires API server running) =="
+curl -s "http://localhost:7000/api/feed?limit=1&offset=0" | head -c 200; echo
+echo "[ok] if you see JSON above, feed is live."
+
+echo "==[done] M04_FEED_API finished."
+exit 0

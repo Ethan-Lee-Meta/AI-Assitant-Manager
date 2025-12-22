@@ -1,0 +1,702 @@
+set +e
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+echo "[info] repo_root=$repo_root"
+cd "$repo_root" || { echo "[warn] cannot cd repo_root"; }
+
+ts="$(date +%Y%m%d_%H%M%S)"
+
+# ---- guards ----
+if [ ! -d "apps/web" ]; then
+  echo "[warn] apps/web not found. abort step2."
+  exit 0
+fi
+
+mkdir -p apps/web/src/lib/api
+mkdir -p apps/web/src/ui/episodes_or_videos
+mkdir -p "apps/web/app/(app)/episodes_or_videos/[episode_or_video_id]"
+mkdir -p "apps/web/app/(app)/episodes_or_videos/[episode_or_video_id]/shots"
+mkdir -p "apps/web/app/(app)/series/[series_id]/episodes/new"
+mkdir -p "apps/web/app/(app)/series/[series_id]/videos/new"
+
+echo "==[W1] write api: episodes_or_videos.ts =="
+cat > apps/web/src/lib/api/episodes_or_videos.ts <<'TS'
+import { apiFetch } from "./client";
+
+export type EpisodeOrVideoKind = "episode" | "video";
+
+export type EpisodeOrVideo = {
+  id: string;
+  project_id: string;
+  series_id: string;
+  title: string;
+  kind: EpisodeOrVideoKind;
+
+  synopsis_text?: string | null;
+  script_text?: string | null;
+  order_index?: number | null;
+  assembly_preset_id?: string | null;
+
+  created_at: string;
+  updated_at?: string | null;
+  archived_at?: string | null;
+};
+
+export type EpisodeOrVideoCreate = {
+  project_id: string;
+  series_id: string;
+  title: string;
+  kind: EpisodeOrVideoKind;
+
+  synopsis_text?: string | null;
+  script_text?: string | null;
+  order_index?: number | null;
+  assembly_preset_id?: string | null;
+};
+
+export type EpisodeOrVideoPatch = {
+  title?: string | null;
+  synopsis_text?: string | null;
+  script_text?: string | null;
+  order_index?: number | null;
+  assembly_preset_id?: string | null;
+  archived_at?: string | null;
+};
+
+export type EpisodeOrVideoListResp = {
+  total: number;
+  items: EpisodeOrVideo[];
+  limit: number;
+  offset: number;
+};
+
+const ALLOWED_SORT_FIELDS = new Set(["created_at", "updated_at", "order_index", "title"]);
+
+/**
+ * Canonical sort format for this frontend:
+ *  - "-field" => desc
+ *  - "field"  => asc
+ * Also accepts "field:desc|asc" and normalizes.
+ */
+export function normalizeSort(input?: string): string {
+  const raw = (input ?? "").trim();
+  if (!raw) return "-created_at";
+
+  // accept "field:desc"
+  if (raw.includes(":")) {
+    const [f, d] = raw.split(":", 2).map((s) => (s ?? "").trim());
+    const field = f.replace(/^\+|^-/, "");
+    if (!ALLOWED_SORT_FIELDS.has(field)) return "-created_at";
+    const dir = (d || "").toLowerCase();
+    if (dir === "desc") return `-${field}`;
+    return field;
+  }
+
+  const isDesc = raw.startsWith("-");
+  const field = raw.replace(/^\+|^-/, "");
+  if (!ALLOWED_SORT_FIELDS.has(field)) return "-created_at";
+  return isDesc ? `-${field}` : field;
+}
+
+function buildQuery(args: {
+  project_id: string;
+  series_id?: string;
+  kind?: EpisodeOrVideoKind;
+  q?: string;
+  archived?: boolean;
+  limit?: number;
+  offset?: number;
+  sort?: string;
+}): string {
+  const params = new URLSearchParams();
+
+  // unified list defaults (match backend ListQuery defaults)
+  params.set("limit", String(args.limit ?? 50));
+  params.set("offset", String(args.offset ?? 0));
+  params.set("archived", (args.archived ?? false) ? "true" : "false");
+  params.set("sort", normalizeSort(args.sort));
+
+  // resource-specific filters
+  const pid = (args.project_id ?? "").trim();
+  if (!pid) throw new Error("project_id is required");
+  params.set("project_id", pid);
+
+  const sid = (args.series_id ?? "").trim();
+  if (sid) params.set("series_id", sid);
+
+  if (args.kind) params.set("kind", args.kind);
+
+  const qq = (args.q ?? "").trim();
+  if (qq) params.set("q", qq);
+
+  const s = params.toString();
+  return s ? `?${s}` : "";
+}
+
+export async function createEpisodeOrVideo(payload: EpisodeOrVideoCreate): Promise<EpisodeOrVideo> {
+  return apiFetch<EpisodeOrVideo>(`/api/episodes_or_videos`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload ?? {}),
+  });
+}
+
+export async function getEpisodeOrVideo(id: string): Promise<EpisodeOrVideo> {
+  return apiFetch<EpisodeOrVideo>(`/api/episodes_or_videos/${id}`);
+}
+
+export async function patchEpisodeOrVideo(id: string, patch: EpisodeOrVideoPatch): Promise<EpisodeOrVideo> {
+  return apiFetch<EpisodeOrVideo>(`/api/episodes_or_videos/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch ?? {}),
+  });
+}
+
+export async function listEpisodesOrVideos(args: {
+  project_id: string;
+  series_id?: string;
+  kind?: EpisodeOrVideoKind;
+  q?: string;
+  archived?: boolean;
+  limit?: number;
+  offset?: number;
+  sort?: string;
+}): Promise<EpisodeOrVideoListResp> {
+  const qs = buildQuery(args);
+  return apiFetch<EpisodeOrVideoListResp>(`/api/episodes_or_videos${qs}`);
+}
+TS
+echo "[ok] wrote: apps/web/src/lib/api/episodes_or_videos.ts"
+echo "[rc] api_file=$?"
+
+echo "==[W2] write ui: EpisodeOrVideoList.tsx =="
+cat > apps/web/src/ui/episodes_or_videos/EpisodeOrVideoList.tsx <<'TSX'
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import { listEpisodesOrVideos, EpisodeOrVideo, EpisodeOrVideoKind } from "../../lib/api/episodes_or_videos";
+
+export default function EpisodeOrVideoList(props: {
+  projectId: string;
+  seriesId: string;
+  kind?: EpisodeOrVideoKind;
+}) {
+  const { projectId, seriesId, kind } = props;
+
+  const [items, setItems] = useState<EpisodeOrVideo[]>([]);
+  const [total, setTotal] = useState<number>(0);
+  const [err, setErr] = useState<string | null>(null);
+  const [loading, setLoading] = useState<boolean>(false);
+
+  const title = useMemo(() => {
+    if (kind === "episode") return "Episodes";
+    if (kind === "video") return "Videos";
+    return "Episodes / Videos";
+  }, [kind]);
+
+  async function refresh() {
+    setLoading(true);
+    setErr(null);
+    try {
+      const resp = await listEpisodesOrVideos({
+        project_id: projectId,
+        series_id: seriesId,
+        kind,
+        limit: 50,
+        offset: 0,
+        sort: "-created_at",
+        archived: false,
+      });
+      setItems(resp.items || []);
+      setTotal(resp.total || 0);
+    } catch (e: any) {
+      setErr(e?.message || String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, seriesId, kind]);
+
+  return (
+    <div style={{ border: "1px solid #ddd", padding: 12, borderRadius: 8, marginTop: 12 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+        <div>
+          <div style={{ fontWeight: 700 }}>{title}</div>
+          <div style={{ fontSize: 12, opacity: 0.7 }}>
+            total: {total} {loading ? "(loading...)" : ""}
+          </div>
+        </div>
+        <button onClick={refresh} style={{ padding: "6px 10px" }}>
+          Refresh
+        </button>
+      </div>
+
+      {err ? (
+        <div style={{ marginTop: 10, color: "crimson", whiteSpace: "pre-wrap" }}>{err}</div>
+      ) : null}
+
+      <div style={{ marginTop: 10, display: "grid", gap: 8 }}>
+        {items.map((it) => (
+          <div key={it.id} style={{ padding: 10, border: "1px solid #eee", borderRadius: 8 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+              <div>
+                <div style={{ fontWeight: 600 }}>{it.title}</div>
+                <div style={{ fontSize: 12, opacity: 0.75 }}>
+                  kind={it.kind} order_index={String(it.order_index ?? "")} archived={it.archived_at ? "true" : "false"}
+                </div>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <Link href={`/episodes_or_videos/${it.id}`}>Open</Link>
+              </div>
+            </div>
+          </div>
+        ))}
+        {items.length === 0 ? <div style={{ opacity: 0.7 }}>No items.</div> : null}
+      </div>
+    </div>
+  );
+}
+TSX
+echo "[ok] wrote: apps/web/src/ui/episodes_or_videos/EpisodeOrVideoList.tsx"
+echo "[rc] ui_list=$?"
+
+echo "==[W3] write ui: EpisodeOrVideoNew.tsx =="
+cat > apps/web/src/ui/episodes_or_videos/EpisodeOrVideoNew.tsx <<'TSX'
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
+import EpisodeOrVideoList from "./EpisodeOrVideoList";
+import { getSeries, Series } from "../..//lib/api/series";
+import { createEpisodeOrVideo, EpisodeOrVideoKind } from "../../lib/api/episodes_or_videos";
+
+export default function EpisodeOrVideoNew(props: { seriesId: string; kind: EpisodeOrVideoKind }) {
+  const { seriesId, kind } = props;
+  const router = useRouter();
+
+  const [series, setSeries] = useState<Series | null>(null);
+  const [loadingSeries, setLoadingSeries] = useState<boolean>(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const [title, setTitle] = useState<string>("");
+  const [synopsis, setSynopsis] = useState<string>("");
+  const [script, setScript] = useState<string>("");
+  const [orderIndex, setOrderIndex] = useState<string>("");
+  const [preset, setPreset] = useState<string>("");
+
+  const header = useMemo(() => {
+    return kind === "episode" ? "New Episode" : "New Video";
+  }, [kind]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      setLoadingSeries(true);
+      setErr(null);
+      try {
+        const s = await getSeries(seriesId);
+        if (cancelled) return;
+        setSeries(s);
+      } catch (e: any) {
+        if (cancelled) return;
+        setErr(e?.message || String(e));
+      } finally {
+        if (!cancelled) setLoadingSeries(false);
+      }
+    }
+    load();
+    return () => {
+      cancelled = true;
+    };
+  }, [seriesId]);
+
+  async function onCreate() {
+    setErr(null);
+    try {
+      if (!series?.project_id) throw new Error("series.project_id missing");
+      const payload = {
+        project_id: series.project_id,
+        series_id: seriesId,
+        title: title.trim() || (kind === "episode" ? "Untitled Episode" : "Untitled Video"),
+        kind,
+        synopsis_text: synopsis.trim() ? synopsis : null,
+        script_text: script.trim() ? script : null,
+        order_index: orderIndex.trim() === "" ? null : Number(orderIndex),
+        assembly_preset_id: preset.trim() ? preset : null,
+      };
+      const created = await createEpisodeOrVideo(payload);
+      router.push(`/episodes_or_videos/${created.id}`);
+    } catch (e: any) {
+      setErr(e?.message || String(e));
+    }
+  }
+
+  return (
+    <div style={{ padding: 16 }}>
+      <h2 style={{ fontSize: 18, fontWeight: 800 }}>{header}</h2>
+
+      <div style={{ marginTop: 8, fontSize: 12, opacity: 0.8 }}>
+        series_id={seriesId} {loadingSeries ? "(loading series...)" : ""}{" "}
+        {series?.project_id ? `project_id=${series.project_id}` : ""}
+      </div>
+
+      {err ? <div style={{ marginTop: 10, color: "crimson", whiteSpace: "pre-wrap" }}>{err}</div> : null}
+
+      <div style={{ marginTop: 12, display: "grid", gap: 10, maxWidth: 900 }}>
+        <label>
+          <div style={{ fontSize: 12, opacity: 0.8 }}>title</div>
+          <input value={title} onChange={(e) => setTitle(e.target.value)} style={{ width: "100%", padding: 8 }} />
+        </label>
+
+        <label>
+          <div style={{ fontSize: 12, opacity: 0.8 }}>order_index (optional)</div>
+          <input
+            value={orderIndex}
+            onChange={(e) => setOrderIndex(e.target.value)}
+            style={{ width: "100%", padding: 8 }}
+            inputMode="numeric"
+          />
+        </label>
+
+        <label>
+          <div style={{ fontSize: 12, opacity: 0.8 }}>assembly_preset_id (string for now)</div>
+          <input value={preset} onChange={(e) => setPreset(e.target.value)} style={{ width: "100%", padding: 8 }} />
+        </label>
+
+        <label>
+          <div style={{ fontSize: 12, opacity: 0.8 }}>synopsis_text</div>
+          <textarea
+            value={synopsis}
+            onChange={(e) => setSynopsis(e.target.value)}
+            style={{ width: "100%", padding: 8, minHeight: 80 }}
+          />
+        </label>
+
+        <label>
+          <div style={{ fontSize: 12, opacity: 0.8 }}>script_text</div>
+          <textarea
+            value={script}
+            onChange={(e) => setScript(e.target.value)}
+            style={{ width: "100%", padding: 8, minHeight: 180 }}
+          />
+        </label>
+
+        <div style={{ display: "flex", gap: 10 }}>
+          <button onClick={onCreate} style={{ padding: "8px 12px", fontWeight: 700 }}>
+            Create
+          </button>
+          <a href={`/series/${seriesId}`} style={{ padding: "8px 0" }}>
+            Back to Series
+          </a>
+        </div>
+      </div>
+
+      {series?.project_id ? (
+        <EpisodeOrVideoList projectId={series.project_id} seriesId={seriesId} kind={kind} />
+      ) : null}
+    </div>
+  );
+}
+TSX
+echo "[ok] wrote: apps/web/src/ui/episodes_or_videos/EpisodeOrVideoNew.tsx"
+echo "[rc] ui_new=$?"
+
+echo "==[W4] write ui: EpisodeOrVideoWorkspace.tsx =="
+cat > apps/web/src/ui/episodes_or_videos/EpisodeOrVideoWorkspace.tsx <<'TSX'
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import {
+  getEpisodeOrVideo,
+  patchEpisodeOrVideo,
+  EpisodeOrVideo,
+  normalizeSort,
+  listEpisodesOrVideos,
+} from "../../lib/api/episodes_or_videos";
+
+export default function EpisodeOrVideoWorkspace(props: { id: string }) {
+  const { id } = props;
+  const router = useRouter();
+
+  const [item, setItem] = useState<EpisodeOrVideo | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [loading, setLoading] = useState<boolean>(false);
+  const [saving, setSaving] = useState<boolean>(false);
+
+  // editable fields
+  const [title, setTitle] = useState<string>("");
+  const [synopsis, setSynopsis] = useState<string>("");
+  const [script, setScript] = useState<string>("");
+  const [orderIndex, setOrderIndex] = useState<string>("");
+  const [preset, setPreset] = useState<string>("");
+
+  const archived = !!item?.archived_at;
+
+  const header = useMemo(() => {
+    if (!item) return "Episode/Video";
+    return `${item.kind.toUpperCase()}: ${item.title}`;
+  }, [item]);
+
+  async function load() {
+    setLoading(true);
+    setErr(null);
+    try {
+      const it = await getEpisodeOrVideo(id);
+      setItem(it);
+
+      setTitle(it.title ?? "");
+      setSynopsis((it.synopsis_text ?? "") as string);
+      setScript((it.script_text ?? "") as string);
+      setOrderIndex(it.order_index == null ? "" : String(it.order_index));
+      setPreset((it.assembly_preset_id ?? "") as string);
+    } catch (e: any) {
+      setErr(e?.message || String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]);
+
+  async function onSave() {
+    if (!item) return;
+    setSaving(true);
+    setErr(null);
+    try {
+      const patch = {
+        title: title.trim() ? title.trim() : null,
+        synopsis_text: synopsis.trim() ? synopsis : null,
+        script_text: script.trim() ? script : null,
+        order_index: orderIndex.trim() === "" ? null : Number(orderIndex),
+        assembly_preset_id: preset.trim() ? preset : null,
+      };
+      const updated = await patchEpisodeOrVideo(id, patch);
+      setItem(updated);
+      // refresh editable echoes
+      setTitle(updated.title ?? "");
+      setSynopsis((updated.synopsis_text ?? "") as string);
+      setScript((updated.script_text ?? "") as string);
+      setOrderIndex(updated.order_index == null ? "" : String(updated.order_index));
+      setPreset((updated.assembly_preset_id ?? "") as string);
+    } catch (e: any) {
+      setErr(e?.message || String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function onArchiveToggle() {
+    if (!item) return;
+    setSaving(true);
+    setErr(null);
+    try {
+      const patch = { archived_at: item.archived_at ? null : new Date().toISOString() };
+      const updated = await patchEpisodeOrVideo(id, patch);
+      setItem(updated);
+    } catch (e: any) {
+      setErr(e?.message || String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function openNewestSibling() {
+    if (!item) return;
+    setErr(null);
+    try {
+      const resp = await listEpisodesOrVideos({
+        project_id: item.project_id,
+        series_id: item.series_id,
+        kind: item.kind,
+        limit: 1,
+        offset: 0,
+        sort: normalizeSort("-created_at"),
+        archived: false,
+      });
+      const first = (resp.items || [])[0];
+      if (first?.id) router.push(`/episodes_or_videos/${first.id}`);
+    } catch (e: any) {
+      setErr(e?.message || String(e));
+    }
+  }
+
+  return (
+    <div style={{ padding: 16 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+        <h2 style={{ fontSize: 18, fontWeight: 800 }}>{header}</h2>
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <button onClick={load} style={{ padding: "6px 10px" }}>
+            Refresh
+          </button>
+          <button onClick={onSave} disabled={saving || loading || !item} style={{ padding: "6px 10px", fontWeight: 700 }}>
+            {saving ? "Saving..." : "Save"}
+          </button>
+          <button onClick={onArchiveToggle} disabled={saving || loading || !item} style={{ padding: "6px 10px" }}>
+            {archived ? "Unarchive" : "Archive"}
+          </button>
+        </div>
+      </div>
+
+      <div style={{ marginTop: 8, fontSize: 12, opacity: 0.8 }}>
+        id={id} {loading ? "(loading...)" : ""} {item ? `project_id=${item.project_id} series_id=${item.series_id}` : ""}
+      </div>
+
+      {err ? <div style={{ marginTop: 10, color: "crimson", whiteSpace: "pre-wrap" }}>{err}</div> : null}
+
+      {item ? (
+        <div style={{ marginTop: 12, display: "grid", gap: 10, maxWidth: 1000 }}>
+          <div style={{ display: "flex", gap: 12, flexWrap: "wrap", fontSize: 12, opacity: 0.9 }}>
+            <Link href={`/series/${item.series_id}`}>Back to Series</Link>
+            <Link href={`/episodes_or_videos/${item.id}/shots`}>Shots (placeholder)</Link>
+            <button onClick={openNewestSibling} style={{ padding: 0, border: "none", background: "transparent", color: "#0366d6", cursor: "pointer" }}>
+              Open newest sibling (same kind)
+            </button>
+          </div>
+
+          <label>
+            <div style={{ fontSize: 12, opacity: 0.8 }}>title</div>
+            <input value={title} onChange={(e) => setTitle(e.target.value)} style={{ width: "100%", padding: 8 }} />
+          </label>
+
+          <label>
+            <div style={{ fontSize: 12, opacity: 0.8 }}>order_index (optional)</div>
+            <input
+              value={orderIndex}
+              onChange={(e) => setOrderIndex(e.target.value)}
+              style={{ width: "100%", padding: 8 }}
+              inputMode="numeric"
+            />
+          </label>
+
+          <label>
+            <div style={{ fontSize: 12, opacity: 0.8 }}>assembly_preset_id (string for now)</div>
+            <input value={preset} onChange={(e) => setPreset(e.target.value)} style={{ width: "100%", padding: 8 }} />
+          </label>
+
+          <label>
+            <div style={{ fontSize: 12, opacity: 0.8 }}>synopsis_text</div>
+            <textarea
+              value={synopsis}
+              onChange={(e) => setSynopsis(e.target.value)}
+              style={{ width: "100%", padding: 8, minHeight: 90 }}
+            />
+          </label>
+
+          <label>
+            <div style={{ fontSize: 12, opacity: 0.8 }}>script_text</div>
+            <textarea
+              value={script}
+              onChange={(e) => setScript(e.target.value)}
+              style={{ width: "100%", padding: 8, minHeight: 240 }}
+            />
+          </label>
+
+          <div style={{ fontSize: 12, opacity: 0.75 }}>
+            archived_at={item.archived_at ?? "null"}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+TSX
+echo "[ok] wrote: apps/web/src/ui/episodes_or_videos/EpisodeOrVideoWorkspace.tsx"
+echo "[rc] ui_workspace=$?"
+
+echo "==[W5] write app route: /episodes_or_videos/[id] =="
+cat > "apps/web/app/(app)/episodes_or_videos/[episode_or_video_id]/page.tsx" <<'TSX'
+"use client";
+
+import EpisodeOrVideoWorkspace from "../../../../src/ui/episodes_or_videos/EpisodeOrVideoWorkspace";
+
+export default function Page(props: { params: { episode_or_video_id: string } }) {
+  const id = props?.params?.episode_or_video_id;
+  return <EpisodeOrVideoWorkspace id={id} />;
+}
+TSX
+echo "[ok] wrote: apps/web/app/(app)/episodes_or_videos/[episode_or_video_id]/page.tsx"
+echo "[rc] route_workspace=$?"
+
+echo "==[W6] write placeholder route: /episodes_or_videos/[id]/shots =="
+cat > "apps/web/app/(app)/episodes_or_videos/[episode_or_video_id]/shots/page.tsx" <<'TSX'
+"use client";
+
+import Link from "next/link";
+
+export default function Page(props: { params: { episode_or_video_id: string } }) {
+  const id = props?.params?.episode_or_video_id;
+  return (
+    <div style={{ padding: 16 }}>
+      <h2 style={{ fontSize: 18, fontWeight: 800 }}>Shots (placeholder)</h2>
+      <div style={{ marginTop: 8, fontSize: 12, opacity: 0.8 }}>episode_or_video_id={id}</div>
+      <div style={{ marginTop: 12 }}>
+        <Link href={`/episodes_or_videos/${id}`}>Back to Episode/Video Workspace</Link>
+      </div>
+      <div style={{ marginTop: 12, opacity: 0.75 }}>
+        Shot 模块后续接入；当前仅作为入口占位，避免 404。
+      </div>
+    </div>
+  );
+}
+TSX
+echo "[ok] wrote: apps/web/app/(app)/episodes_or_videos/[episode_or_video_id]/shots/page.tsx"
+echo "[rc] route_shots=$?"
+
+echo "==[W7] overwrite existing new pages under series (with backup) =="
+
+ep_new="apps/web/app/(app)/series/[series_id]/episodes/new/page.tsx"
+vi_new="apps/web/app/(app)/series/[series_id]/videos/new/page.tsx"
+
+for f in "$ep_new" "$vi_new"; do
+  if [ -f "$f" ]; then
+    cp "$f" "$f.bak.$ts"
+    echo "[ok] backup -> $f.bak.$ts"
+  else
+    echo "[warn] $f not found; will create new"
+  fi
+done
+
+cat > "$ep_new" <<'TSX'
+"use client";
+
+import EpisodeOrVideoNew from "../../../../../../src/ui/episodes_or_videos/EpisodeOrVideoNew";
+
+export default function Page(props: { params: { series_id: string } }) {
+  const seriesId = props?.params?.series_id;
+  return <EpisodeOrVideoNew seriesId={seriesId} kind="episode" />;
+}
+TSX
+echo "[ok] wrote: $ep_new"
+
+cat > "$vi_new" <<'TSX'
+"use client";
+
+import EpisodeOrVideoNew from "../../../../../../src/ui/episodes_or_videos/EpisodeOrVideoNew";
+
+export default function Page(props: { params: { series_id: string } }) {
+  const seriesId = props?.params?.series_id;
+  return <EpisodeOrVideoNew seriesId={seriesId} kind="video" />;
+}
+TSX
+echo "[ok] wrote: $vi_new"
+
+echo "==[W8] build web =="
+cd "$repo_root/apps/web" || { echo "[warn] cannot cd apps/web"; exit 0; }
+
+# 若你习惯 npm ci，这里可以改为 npm ci；我默认不强制重装依赖
+npm run build
+echo "[rc] next_build=$?"
+
+echo "==[W9] summary =="
+echo "[done] M03 Step2 web finished. Check [rc] above."

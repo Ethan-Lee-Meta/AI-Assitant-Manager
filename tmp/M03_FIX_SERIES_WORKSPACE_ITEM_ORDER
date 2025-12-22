@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set +e
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$ROOT" || exit 0
+
+F="apps/web/src/ui/series/SeriesWorkspace.tsx"
+if [ ! -f "$F" ]; then
+  echo "[err] missing: $F"
+  exit 0
+fi
+
+cp -a "$F" "$F.bak.$(date +%Y%m%d_%H%M%S)"
+echo "[ok] backup -> $F.bak.*"
+
+python - <<'PY'
+from pathlib import Path
+import re, sys
+
+p = Path("apps/web/src/ui/series/SeriesWorkspace.tsx")
+s = p.read_text(encoding="utf-8")
+
+# Sentinel: must contain the problematic pattern
+if "const backHref = useMemo" not in s or "const [item, setItem]" not in s:
+    print("[err] sentinel missing; abort to avoid guessing")
+    sys.exit(2)
+
+# Extract the backHref block (from const backHref ... to }, [item]);
+m = re.search(r"\n\s*const backHref = useMemo\(\(\) => \{\n.*?\n\s*\}, \[item\]\);\n", s, flags=re.S)
+if not m:
+    print("[err] cannot locate backHref block using [item]; abort")
+    sys.exit(3)
+
+back_block = m.group(0)
+
+# Remove it from original position
+s2 = s[:m.start()] + "\n" + s[m.end():]
+
+# Find the item state line and insert backHref after it
+m_item = re.search(r"\n\s*const \[item, setItem\] = useState<Series \| null>\(null\);\n", s2)
+if not m_item:
+    print("[err] cannot locate item state line; abort")
+    sys.exit(4)
+
+# Rewrite dependency to [item?.project_id] to avoid unnecessary reruns
+back_block2 = back_block.replace("[item]", "[item?.project_id]")
+
+insert_pos = m_item.end()
+s3 = s2[:insert_pos] + back_block2 + s2[insert_pos:]
+
+p.write_text(s3, encoding="utf-8")
+print("[ok] patched SeriesWorkspace.tsx")
+PY
+
+echo "[rc] patch=$?"
+
+echo "== build web =="
+cd "$ROOT/apps/web" || exit 0
+npm run build
+echo "[rc] next_build=$?"

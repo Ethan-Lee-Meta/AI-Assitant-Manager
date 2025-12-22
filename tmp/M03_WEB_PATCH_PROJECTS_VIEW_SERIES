@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set +e
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$ROOT" || exit 0
+
+F="apps/web/app/(app)/projects/page.tsx"
+if [ ! -f "$F" ]; then
+  echo "[err] missing: $F"
+  exit 0
+fi
+
+cp -a "$F" "$F.bak.$(date +%Y%m%d_%H%M%S)"
+echo "[ok] backup -> $F.bak.*"
+
+python - <<'PY'
+from pathlib import Path
+import re, sys
+
+p = Path("apps/web/app/(app)/projects/page.tsx")
+s = p.read_text(encoding="utf-8")
+
+# Sentinel: locate the action button container in list item
+sent = '<div style={{ display: "flex", gap: 8, alignItems: "center" }}>'
+i = s.find(sent)
+if i < 0:
+    print("[err] cannot find action container sentinel; abort")
+    sys.exit(2)
+
+# Insert link right after the container opens, but only once
+if "View Series" in s:
+    print("[skip] View Series already exists")
+    sys.exit(0)
+
+insert = sent + """
+                <a
+                  href={`/series?project_id=${encodeURIComponent(p.id)}`}
+                  style={{ border: "1px solid #e5e7eb", borderRadius: 8, padding: "6px 10px", textDecoration: "none" }}
+                >
+                  View Series
+                </a>"""
+
+s2 = s.replace(sent, insert, 1)
+p.write_text(s2, encoding="utf-8")
+print("[ok] inserted View Series link")
+PY
+
+echo "[rc] patch=$?"
+
+echo "== build web =="
+cd "$ROOT/apps/web" || exit 0
+npm run build
+echo "[rc] next_build=$?"

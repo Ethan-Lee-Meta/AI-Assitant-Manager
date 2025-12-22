@@ -1,0 +1,139 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
+import EpisodeOrVideoList from "./EpisodeOrVideoList";
+import { getSeries, Series } from "../../lib/api/series";
+import { createEpisodeOrVideo, EpisodeOrVideoKind } from "../../lib/api/episodes_or_videos";
+
+export default function EpisodeOrVideoNew(props: { seriesId: string; kind: EpisodeOrVideoKind }) {
+  const { seriesId, kind } = props;
+  const router = useRouter();
+
+  const [series, setSeries] = useState<Series | null>(null);
+  const [loadingSeries, setLoadingSeries] = useState<boolean>(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const [title, setTitle] = useState<string>("");
+  const [synopsis, setSynopsis] = useState<string>("");
+  const [script, setScript] = useState<string>("");
+  const [orderIndex, setOrderIndex] = useState<string>("");
+  const [preset, setPreset] = useState<string>("");
+
+  const header = useMemo(() => {
+    return kind === "episode" ? "New Episode" : "New Video";
+  }, [kind]);
+
+  useEffect(() => {
+    if (!seriesId || String(seriesId).trim() === "") {
+      setErr("series_id missing in route params");
+      return;
+    }
+    let cancelled = false;
+    async function load() {
+      setLoadingSeries(true);
+      setErr(null);
+      try {
+        const s = await getSeries(seriesId);
+        if (cancelled) return;
+        setSeries(s);
+      } catch (e: any) {
+        if (cancelled) return;
+        setErr(e?.message || String(e));
+      } finally {
+        if (!cancelled) setLoadingSeries(false);
+      }
+    }
+    load();
+    return () => {
+      cancelled = true;
+    };
+  }, [seriesId]);
+
+  async function onCreate() {
+    setErr(null);
+    try {
+      if (!series?.project_id) throw new Error("series.project_id missing");
+      const payload = {
+        project_id: series.project_id,
+        series_id: seriesId,
+        title: title.trim() || (kind === "episode" ? "Untitled Episode" : "Untitled Video"),
+        kind,
+        synopsis_text: synopsis.trim() ? synopsis : null,
+        script_text: script.trim() ? script : null,
+        order_index: orderIndex.trim() === "" ? null : Number(orderIndex),
+        assembly_preset_id: preset.trim() ? preset : null,
+      };
+      const created = await createEpisodeOrVideo(payload);
+      router.push(`/episodes_or_videos/${created.id}`);
+    } catch (e: any) {
+      setErr(e?.message || String(e));
+    }
+  }
+
+  return (
+    <div style={{ padding: 16 }}>
+      <h2 style={{ fontSize: 18, fontWeight: 800 }}>{header}</h2>
+
+      <div style={{ marginTop: 8, fontSize: 12, opacity: 0.8 }}>
+        series_id={seriesId} {loadingSeries ? "(loading series...)" : ""}{" "}
+        {series?.project_id ? `project_id=${series.project_id}` : ""}
+      </div>
+
+      {err ? <div style={{ marginTop: 10, color: "crimson", whiteSpace: "pre-wrap" }}>{err}</div> : null}
+
+      <div style={{ marginTop: 12, display: "grid", gap: 10, maxWidth: 900 }}>
+        <label>
+          <div style={{ fontSize: 12, opacity: 0.8 }}>title</div>
+          <input value={title} onChange={(e) => setTitle(e.target.value)} style={{ width: "100%", padding: 8 }} />
+        </label>
+
+        <label>
+          <div style={{ fontSize: 12, opacity: 0.8 }}>order_index (optional)</div>
+          <input
+            value={orderIndex}
+            onChange={(e) => setOrderIndex(e.target.value)}
+            style={{ width: "100%", padding: 8 }}
+            inputMode="numeric"
+          />
+        </label>
+
+        <label>
+          <div style={{ fontSize: 12, opacity: 0.8 }}>assembly_preset_id (string for now)</div>
+          <input value={preset} onChange={(e) => setPreset(e.target.value)} style={{ width: "100%", padding: 8 }} />
+        </label>
+
+        <label>
+          <div style={{ fontSize: 12, opacity: 0.8 }}>synopsis_text</div>
+          <textarea
+            value={synopsis}
+            onChange={(e) => setSynopsis(e.target.value)}
+            style={{ width: "100%", padding: 8, minHeight: 80 }}
+          />
+        </label>
+
+        <label>
+          <div style={{ fontSize: 12, opacity: 0.8 }}>script_text</div>
+          <textarea
+            value={script}
+            onChange={(e) => setScript(e.target.value)}
+            style={{ width: "100%", padding: 8, minHeight: 180 }}
+          />
+        </label>
+
+        <div style={{ display: "flex", gap: 10 }}>
+          <button onClick={onCreate} style={{ padding: "8px 12px", fontWeight: 700 }}>
+            Create
+          </button>
+          <a href={`/series/${seriesId}`} style={{ padding: "8px 0" }}>
+            Back to Series
+          </a>
+        </div>
+      </div>
+
+      {series?.project_id ? (
+        <EpisodeOrVideoList projectId={series.project_id} seriesId={seriesId} kind={kind} />
+      ) : null}
+    </div>
+  );
+}

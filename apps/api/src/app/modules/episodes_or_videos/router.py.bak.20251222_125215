@@ -1,0 +1,60 @@
+from __future__ import annotations
+
+from typing import Optional
+
+from fastapi import APIRouter, Query
+
+from .dto import (
+    EpisodeOrVideo,
+    EpisodeOrVideoCreate,
+    EpisodeOrVideoKind,
+    EpisodeOrVideoListResponse,
+    EpisodeOrVideoPatch,
+)
+from .service import (
+    create_episode_or_video,
+    get_episode_or_video,
+    list_episodes_or_videos,
+    patch_episode_or_video,
+)
+
+router = APIRouter(prefix="/api/episodes_or_videos", tags=["episodes_or_videos"])
+
+
+@router.post("", response_model=EpisodeOrVideo)
+def create(payload: EpisodeOrVideoCreate):
+    return create_episode_or_video(payload)
+
+
+@router.get("/{episode_or_video_id}", response_model=EpisodeOrVideo)
+def get_one(episode_or_video_id: str):
+    return get_episode_or_video(episode_or_video_id)
+
+
+@router.patch("/{episode_or_video_id}", response_model=EpisodeOrVideo)
+def patch_one(episode_or_video_id: str, patch: EpisodeOrVideoPatch):
+    return patch_episode_or_video(episode_or_video_id, patch)
+
+
+@router.get("", response_model=EpisodeOrVideoListResponse)
+def list_all(
+    project_id: str = Query(..., min_length=1),
+    series_id: Optional[str] = None,
+    kind: Optional[EpisodeOrVideoKind] = None,
+    q: Optional[str] = None,
+    archived: bool = False,
+    limit: int = Query(20, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    sort: str = "created_at:desc",
+):
+    items, total = list_episodes_or_videos(
+        project_id=project_id,
+        series_id=series_id,
+        kind=kind,
+        q=q,
+        archived=archived,
+        limit=limit,
+        offset=offset,
+        sort=sort,
+    )
+    return {"items": items, "total": total, "limit": limit, "offset": offset}

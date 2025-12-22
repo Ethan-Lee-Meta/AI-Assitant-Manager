@@ -1,0 +1,486 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ts() { date +"%Y%m%d_%H%M%S"; }
+say() { echo "$@"; }
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$ROOT"
+
+# prefer repo venv python if exists (works in Git Bash on Windows)
+PY="$ROOT/.venv/Scripts/python.exe"
+if [ -f "$PY" ]; then
+  PY="${PY//\\//}"
+else
+  PY="python"
+fi
+
+backup() {
+  local f="$1"
+  if [ -f "$f" ]; then
+    cp -a "$f" "$f.bak.$(ts)"
+    say "[ok] backup -> $f.bak.$(ts)"
+  fi
+}
+
+need_file() {
+  local f="$1"
+  if [ ! -f "$f" ]; then
+    say "[err] missing file: $f"
+    exit 2
+  fi
+}
+
+# ---------- A) Patch SeriesIndex.tsx (allow project_id empty list) ----------
+SERIES_INDEX="apps/web/src/ui/series/SeriesIndex.tsx"
+need_file "$SERIES_INDEX"
+backup "$SERIES_INDEX"
+
+"$PY" - <<'PY'
+from pathlib import Path
+import re, sys
+
+p = Path("apps/web/src/ui/series/SeriesIndex.tsx")
+s = p.read_text(encoding="utf-8")
+
+# Safety: only patch if expected sentinel text exists
+if "project_id is required for listing (M02)." not in s:
+    print("[skip] SeriesIndex.tsx: sentinel not found; refusing to patch to avoid guessing.")
+    sys.exit(3)
+
+# 1) Add useSearchParams import if not present
+if 'from "next/navigation"' not in s:
+    s = s.replace('import { useCallback, useEffect, useMemo, useState } from "react";',
+                  'import { useCallback, useEffect, useMemo, useState } from "react";\nimport { useSearchParams } from "next/navigation";')
+
+# 2) Create searchParams hook
+if "const searchParams = useSearchParams();" not in s:
+    s = s.replace("export function SeriesIndex() {", "export function SeriesIndex() {\n  const searchParams = useSearchParams();")
+
+# 3) Replace initial localStorage-only effect to: URL param first, then localStorage
+#    We'll replace the whole first useEffect block that reads localStorage
+pattern = re.compile(r"useEffect\(\(\) => \{\s*const v = localStorage\.getItem\(LS_KEY\);\s*if \(v\) setQueryProjectId\(v\);\s*\}, \[\]\);", re.M)
+m = pattern.search(s)
+if not m:
+    print("[err] SeriesIndex.tsx: cannot find initial localStorage useEffect; abort.")
+    sys.exit(4)
+
+replacement = """useEffect(() => {
+    // URL has higher priority: /series?project_id=...
+    const fromUrl = (searchParams?.get("project_id") ?? "").trim();
+    if (fromUrl) {
+      setQueryProjectId(fromUrl);
+      return;
+    }
+    const v = localStorage.getItem(LS_KEY);
+    if (v) setQueryProjectId(v);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);"""
+s = s[:m.start()] + replacement + s[m.end():]
+
+# 4) localStorage sync: set or remove
+pattern2 = re.compile(r"useEffect\(\(\) => \{\s*if \(queryProjectId\) localStorage\.setItem\(LS_KEY, queryProjectId\);\s*\}, \[queryProjectId\]\);", re.M)
+m2 = pattern2.search(s)
+if not m2:
+    print("[err] SeriesIndex.tsx: cannot find localStorage sync useEffect; abort.")
+    sys.exit(5)
+
+replacement2 = """useEffect(() => {
+    const v = queryProjectId.trim();
+    if (v) localStorage.setItem(LS_KEY, v);
+    else localStorage.removeItem(LS_KEY);
+  }, [queryProjectId]);"""
+s = s[:m2.start()] + replacement2 + s[m2.end():]
+
+# 5) refresh(): remove hard stop; pass project_id only if non-empty
+#    Replace the whole guard block that clears items+total+err
+guard_pat = re.compile(r'setErr\(""\);\s*if \(!queryProjectId\.trim\(\)\) \{\s*setItems\(\[\]\);\s*setTotal\(0\);\s*setErr\("project_id is required for listing \(M02\)\."\);\s*return;\s*\}', re.M)
+if not guard_pat.search(s):
+    print("[err] SeriesIndex.tsx: cannot find refresh guard block; abort.")
+    sys.exit(6)
+s = guard_pat.sub('setErr("");\n    const pid = queryProjectId.trim();', s, count=1)
+
+# ensure listSeries call uses pid || undefined
+s = s.replace('await listSeries({ project_id: queryProjectId.trim(), q: q.trim() || undefined, limit: 50, offset: 0 });',
+              'await listSeries({ project_id: pid || undefined, q: q.trim() || undefined, limit: 50, offset: 0 });')
+
+# 6) Update page helper text + empty-state red hint
+s = s.replace('Series list requires <code>project_id</code> filter (M02).',
+              'Series list: <code>project_id</code> is optional. Leave empty to list all.')
+
+s = s.replace('{queryProjectId.trim() ? null : <div style={{ color: "crimson", marginTop: 6 }}>project_id is required for listing (M02).</div>}',
+              '{queryProjectId.trim() ? null : <div style={{ color: "#666", marginTop: 6 }}>No project_id filter (showing all).</div>}')
+
+p.write_text(s, encoding="utf-8")
+print("[ok] patched SeriesIndex.tsx")
+PY
+
+# ---------- B) Patch SeriesWorkspace.tsx: replace placeholder with EOV lists ----------
+SERIES_WS="apps/web/src/ui/series/SeriesWorkspace.tsx"
+need_file "$SERIES_WS"
+backup "$SERIES_WS"
+
+# create a new UI component for listing EOV by series (no dependency on existing EOV UI files)
+EOV_BY_SERIES="apps/web/src/ui/episodes_or_videos/EpisodeOrVideoListBySeries.tsx"
+if [ ! -f "$EOV_BY_SERIES" ]; then
+  mkdir -p "$(dirname "$EOV_BY_SERIES")"
+  cat > "$EOV_BY_SERIES" <<'TSX'
+"use client";
+
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { apiFetch } from "../../lib/api/client";
+
+type EpisodeOrVideoKind = "episode" | "video";
+
+type EpisodeOrVideo = {
+  id: string;
+  project_id: string;
+  series_id: string;
+  title: string;
+  kind: EpisodeOrVideoKind;
+  created_at: string;
+  updated_at?: string | null;
+  archived_at?: string | null;
+};
+
+type EpisodeOrVideoListResponse = {
+  items: EpisodeOrVideo[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
+export function EpisodeOrVideoListBySeries(props: {
+  projectId: string;
+  seriesId: string;
+  kind: EpisodeOrVideoKind;
+  title?: string;
+}) {
+  const { projectId, seriesId, kind } = props;
+  const title = props.title ?? (kind === "episode" ? "Episodes" : "Videos");
+
+  const [items, setItems] = useState<EpisodeOrVideo[]>([]);
+  const [total, setTotal] = useState<number>(0);
+  const [loading, setLoading] = useState<boolean>(false);
+  const [err, setErr] = useState<string>("");
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    setErr("");
+    try {
+      const params = new URLSearchParams();
+      params.set("project_id", projectId);
+      params.set("series_id", seriesId);
+      params.set("kind", kind);
+      params.set("limit", "50");
+      params.set("offset", "0");
+      params.set("archived", "false");
+      params.set("sort", "-created_at");
+
+      const res = await apiFetch<EpisodeOrVideoListResponse>(`/api/episodes_or_videos?${params.toString()}`);
+      setItems(res.items || []);
+      setTotal(res.total || 0);
+    } catch (e: any) {
+      setItems([]);
+      setTotal(0);
+      setErr(e?.message || "Request failed");
+    } finally {
+      setLoading(false);
+    }
+  }, [projectId, seriesId, kind]);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  const header = useMemo(() => `${title} • total: ${total}`, [title, total]);
+
+  return (
+    <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 12, display: "grid", gap: 10 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div style={{ fontWeight: 700 }}>{header}</div>
+        <button onClick={refresh} disabled={loading} style={{ padding: "6px 10px" }}>
+          {loading ? "Loading..." : "Refresh"}
+        </button>
+      </div>
+
+      {err ? <div style={{ color: "crimson" }}>{err}</div> : null}
+
+      {items.length === 0 ? (
+        <div style={{ color: "#666" }}>No items.</div>
+      ) : (
+        <div style={{ display: "grid", gap: 8 }}>
+          {items.map((x) => (
+            <div
+              key={x.id}
+              style={{
+                border: "1px solid #eee",
+                borderRadius: 12,
+                padding: 12,
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+              }}
+            >
+              <div>
+                <div style={{ fontWeight: 700 }}>{x.title}</div>
+                <div style={{ fontSize: 12, color: "#444" }}>id: {x.id}</div>
+                <div style={{ fontSize: 12, color: "#444" }}>archived_at: {String(x.archived_at ?? "null")}</div>
+              </div>
+              <a
+                href={`/episodes_or_videos/${x.id}`}
+                style={{ border: "1px solid #ddd", borderRadius: 10, padding: "6px 12px", textDecoration: "none" }}
+              >
+                Open
+              </a>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+TSX
+  say "[ok] wrote: $EOV_BY_SERIES"
+else
+  say "[info] exists: $EOV_BY_SERIES (skip write)"
+fi
+
+"$PY" - <<'PY'
+from pathlib import Path
+import re, sys
+
+p = Path("apps/web/src/ui/series/SeriesWorkspace.tsx")
+s = p.read_text(encoding="utf-8")
+
+if "Associations (placeholder)" not in s:
+    print("[skip] SeriesWorkspace.tsx: placeholder not found; refusing to patch to avoid guessing.")
+    sys.exit(3)
+
+# Insert import for new component (near existing imports)
+if "EpisodeOrVideoListBySeries" not in s:
+    s = s.replace('import { useEffect, useState } from "react";',
+                  'import { useEffect, useMemo, useState } from "react";\nimport { EpisodeOrVideoListBySeries } from "../episodes_or_videos/EpisodeOrVideoListBySeries";')
+
+# Add back link preserving project_id when available
+# Replace the literal <a href="/series"...> with computed href
+s = s.replace(
+    '<a href="/series" style={{ color: "#555", textDecoration: "none" }}>← Back to Series</a>',
+    '{/* preserve project_id filter if available */}\n        <a href={backHref} style={{ color: "#555", textDecoration: "none" }}>← Back to Series</a>'
+)
+
+# Ensure backHref computed exists (after seriesId const)
+if "const backHref =" not in s:
+    s = s.replace(
+        "  const { seriesId } = props;",
+        "  const { seriesId } = props;\n\n  const backHref = useMemo(() => {\n    const pid = (item as any)?.project_id ? String((item as any).project_id) : \"\";\n    return pid ? `/series?project_id=${encodeURIComponent(pid)}` : \"/series\";\n  }, [item]);"
+    )
+
+# Replace placeholder block with Episodes/Videos section
+block_pat = re.compile(r'<div style=\{\{ padding: 12, border: "1px solid #ddd", borderRadius: 12 \}\}>\s*<h2 style=\{\{ margin: 0 \}\}>Associations \(placeholder\)</h2>.*?</div>\s*</div>', re.S)
+m = block_pat.search(s)
+if not m:
+    print("[err] SeriesWorkspace.tsx: cannot locate placeholder block; abort.")
+    sys.exit(4)
+
+replacement = r'''<div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 12 }}>
+        <h2 style={{ margin: 0 }}>Episodes / Videos</h2>
+
+        <div style={{ color: "#666", marginTop: 8, fontSize: 12 }}>
+          series_id={seriesId} • project_id={String((item as any)?.project_id ?? "null")}
+        </div>
+
+        <div style={{ display: "flex", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
+          <a
+            href={`/series/${seriesId}/episodes/new`}
+            style={{ border: "1px solid #ddd", borderRadius: 10, padding: "6px 12px", textDecoration: "none" }}
+          >
+            + New Episode
+          </a>
+          <a
+            href={`/series/${seriesId}/videos/new`}
+            style={{ border: "1px solid #ddd", borderRadius: 10, padding: "6px 12px", textDecoration: "none" }}
+          >
+            + New Video
+          </a>
+        </div>
+
+        {(item as any)?.project_id ? (
+          <div style={{ display: "grid", gap: 12, marginTop: 12 }}>
+            <EpisodeOrVideoListBySeries projectId={String((item as any).project_id)} seriesId={seriesId} kind="episode" title="Episodes" />
+            <EpisodeOrVideoListBySeries projectId={String((item as any).project_id)} seriesId={seriesId} kind="video" title="Videos" />
+          </div>
+        ) : (
+          <div style={{ color: "crimson", marginTop: 12 }}>series.project_id missing</div>
+        )}
+      </div>'''
+s = s[:m.start()] + replacement + s[m.end():]
+
+p.write_text(s, encoding="utf-8")
+print("[ok] patched SeriesWorkspace.tsx")
+PY
+
+# ---------- C) Add a global index page /episodes_or_videos (optional but useful) ----------
+EOV_INDEX_PAGE="apps/web/app/(app)/episodes_or_videos/page.tsx"
+if [ ! -f "$EOV_INDEX_PAGE" ]; then
+  mkdir -p "$(dirname "$EOV_INDEX_PAGE")"
+  backup "$EOV_INDEX_PAGE" || true
+  cat > "$EOV_INDEX_PAGE" <<'TSX'
+"use client";
+
+import { useCallback, useMemo, useState } from "react";
+import { apiFetch } from "../../../src/lib/api/client";
+
+type EpisodeOrVideoKind = "episode" | "video";
+
+type EpisodeOrVideo = {
+  id: string;
+  project_id: string;
+  series_id: string;
+  title: string;
+  kind: EpisodeOrVideoKind;
+  created_at: string;
+  updated_at?: string | null;
+  archived_at?: string | null;
+};
+
+type EpisodeOrVideoListResponse = {
+  items: EpisodeOrVideo[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
+export default function Page() {
+  const [projectId, setProjectId] = useState("");
+  const [seriesId, setSeriesId] = useState("");
+  const [kind, setKind] = useState<string>("");
+  const [includeArchived, setIncludeArchived] = useState(false);
+
+  const [items, setItems] = useState<EpisodeOrVideo[]>([]);
+  const [total, setTotal] = useState(0);
+  const [err, setErr] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const header = useMemo(() => `total: ${total}`, [total]);
+
+  const refresh = useCallback(async () => {
+    setErr("");
+    const pid = projectId.trim();
+    if (!pid) {
+      setItems([]);
+      setTotal(0);
+      setErr("project_id is required for listing (backend contract).");
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const params = new URLSearchParams();
+      params.set("project_id", pid);
+      params.set("limit", "50");
+      params.set("offset", "0");
+      params.set("archived", includeArchived ? "true" : "false");
+      params.set("sort", "-created_at");
+
+      const sid = seriesId.trim();
+      if (sid) params.set("series_id", sid);
+      const kd = kind.trim();
+      if (kd) params.set("kind", kd);
+
+      const res = await apiFetch<EpisodeOrVideoListResponse>(`/api/episodes_or_videos?${params.toString()}`);
+      setItems(res.items || []);
+      setTotal(res.total || 0);
+    } catch (e: any) {
+      setItems([]);
+      setTotal(0);
+      setErr(e?.message || "Request failed");
+    } finally {
+      setLoading(false);
+    }
+  }, [projectId, seriesId, kind, includeArchived]);
+
+  return (
+    <div style={{ padding: 24, display: "grid", gap: 16 }}>
+      <h1 style={{ fontSize: 36, fontWeight: 700, margin: 0 }}>Episodes / Videos</h1>
+
+      <div style={{ border: "1px solid #ddd", borderRadius: 12, padding: 16, display: "grid", gap: 12 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "200px 1fr", gap: 10, alignItems: "center" }}>
+          <div>project_id (required)</div>
+          <input value={projectId} onChange={(e) => setProjectId(e.target.value)} placeholder="project_id" />
+
+          <div>series_id (optional)</div>
+          <input value={seriesId} onChange={(e) => setSeriesId(e.target.value)} placeholder="series_id" />
+
+          <div>kind (optional)</div>
+          <select value={kind} onChange={(e) => setKind(e.target.value)}>
+            <option value="">(all)</option>
+            <option value="episode">episode</option>
+            <option value="video">video</option>
+          </select>
+
+          <div>archived</div>
+          <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <input type="checkbox" checked={includeArchived} onChange={(e) => setIncludeArchived(e.target.checked)} />
+            include archived
+          </label>
+        </div>
+
+        <div style={{ display: "flex", gap: 10 }}>
+          <button onClick={refresh} disabled={loading} style={{ padding: "8px 12px" }}>
+            {loading ? "Loading..." : "Refresh"}
+          </button>
+          <div style={{ color: "#666", alignSelf: "center" }}>{header}</div>
+        </div>
+
+        {err ? <div style={{ color: "crimson" }}>{err}</div> : null}
+      </div>
+
+      <div style={{ display: "grid", gap: 10 }}>
+        {items.length === 0 ? (
+          <div style={{ color: "#666" }}>No items.</div>
+        ) : (
+          items.map((x) => (
+            <div
+              key={x.id}
+              style={{
+                border: "1px solid #eee",
+                borderRadius: 12,
+                padding: 12,
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+              }}
+            >
+              <div>
+                <div style={{ fontWeight: 700 }}>{x.title}</div>
+                <div style={{ fontSize: 12, color: "#444" }}>id: {x.id}</div>
+                <div style={{ fontSize: 12, color: "#444" }}>project_id: {x.project_id} • series_id: {x.series_id} • kind: {x.kind}</div>
+                <div style={{ fontSize: 12, color: "#444" }}>archived_at: {String(x.archived_at ?? "null")}</div>
+              </div>
+              <a
+                href={`/episodes_or_videos/${x.id}`}
+                style={{ border: "1px solid #ddd", borderRadius: 10, padding: "6px 12px", textDecoration: "none" }}
+              >
+                Open
+              </a>
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+TSX
+  say "[ok] wrote: $EOV_INDEX_PAGE"
+else
+  say "[info] exists: $EOV_INDEX_PAGE (skip write)"
+fi
+
+# ---------- D) Build web ----------
+say "==[build] apps/web =="
+cd "$ROOT/apps/web"
+npm run build
+say "[ok] next build"
+
+say "==[done] Step2 FE enhance applied =="

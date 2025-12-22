@@ -1,0 +1,7 @@
+# 终端 A：后端
+cd apps/api
+PYTHONPATH=./src uvicorn app.main:app --host 127.0.0.1 --port 7000
+
+# 终端 B：前端
+cd apps/web
+npm run dev -- -p 2000

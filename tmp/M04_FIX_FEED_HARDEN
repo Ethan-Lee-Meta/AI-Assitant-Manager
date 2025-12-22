@@ -1,0 +1,414 @@
+#!/usr/bin/env bash
+set +e
+
+ts="$(date +%Y%m%d_%H%M%S)"
+REPO_ROOT="$(cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" && pwd)"
+
+echo "==[E0] env =="
+echo "[info] repo_root=$REPO_ROOT"
+
+PY="$REPO_ROOT/.venv/Scripts/python.exe"
+if [ ! -x "$PY" ]; then
+  PY="python"
+fi
+echo "[info] python=$("$PY" -c "import sys; print(sys.executable)" 2>/dev/null)"
+echo "[rc] py_exec=$?"
+
+backup () {
+  local f="$1"
+  if [ -f "$f" ]; then
+    cp -f "$f" "$f.bak.${ts}"
+    echo "[ok] backup -> $f.bak.${ts}"
+  fi
+}
+
+write_file () {
+  local f="$1"
+  shift
+  mkdir -p "$(dirname "$f")"
+  backup "$f"
+  cat > "$f" <<'EOF'
+'"$@"'
+EOF
+  echo "[ok] wrote: $f"
+}
+
+echo
+echo "==[B1] patch backend: feed store/service/router =="
+
+# 1) store_sqlite.py (关键加固：kind 过滤/输出规范化)
+backup "$REPO_ROOT/apps/api/src/app/modules/feed/store_sqlite.py"
+cat > "$REPO_ROOT/apps/api/src/app/modules/feed/store_sqlite.py" <<'PY'
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Tuple
+
+from app.modules.episodes_or_videos import store_sqlite as eov_store
+from app.modules.episodes_or_videos.dto import EpisodeOrVideoKind
+
+# Keep a small whitelist to avoid SQL injection via ORDER BY
+ALLOWED_SORT_FIELDS = {"created_at", "updated_at", "order_index", "title"}
+
+
+def _parse_sort(sort: Optional[str]) -> Tuple[str, str]:
+    """
+    Accept:
+      - "-created_at"
+      - "created_at"
+      - "created_at:asc|desc"
+      - "created_at:ASC|DESC"
+    Fallback: created_at DESC
+    """
+    s = (sort or "").strip()
+    if not s:
+        return ("created_at", "DESC")
+
+    field = "created_at"
+    direction = "DESC"
+
+    if ":" in s:
+        a, b = s.split(":", 1)
+        a = (a or "").strip()
+        b = (b or "").strip().lower()
+        if a:
+            field = a
+        if b in ("asc", "desc"):
+            direction = b.upper()
+    elif s.startswith("-"):
+        field = s[1:].strip() or "created_at"
+        direction = "DESC"
+    else:
+        field = s
+        direction = "ASC"
+
+    if field not in ALLOWED_SORT_FIELDS:
+        return ("created_at", "DESC")
+
+    return (field, direction)
+
+
+def _norm_kind_param(kind: Any) -> Optional[str]:
+    """
+    Normalize input kind into 'episode'|'video' (lowercase).
+    Accept Enum, raw strings, and defensive cases.
+    """
+    if kind is None:
+        return None
+    if hasattr(kind, "value"):
+        kind = getattr(kind, "value")
+    s = str(kind).strip()
+    if not s:
+        return None
+    # tolerate "EpisodeOrVideoKind.video" style
+    if "." in s:
+        s = s.split(".")[-1]
+    return s.strip().lower()
+
+
+def _norm_kind_db(v: Any) -> str:
+    """
+    Normalize db kind value into 'episode'|'video' where possible.
+    """
+    s = str(v or "").strip()
+    if "." in s:
+        s = s.split(".")[-1]
+    return s.strip().lower()
+
+
+def list_feed_items(
+    *,
+    project_id: Optional[str],
+    series_id: Optional[str],
+    kind: Optional[EpisodeOrVideoKind],
+    q: Optional[str],
+    archived: bool,
+    limit: int,
+    offset: int,
+    sort: Optional[str],
+) -> Tuple[List[Dict[str, Any]], int]:
+    """
+    Read-only aggregation over episodes_or_videos table.
+    Filters:
+      - project_id (optional)
+      - series_id  (optional)
+      - kind       (optional)
+      - q          (optional, matches title or synopsis_text)
+      - archived   (False => archived_at IS NULL, True => archived_at IS NOT NULL)
+    """
+    conn = eov_store._connect()
+    eov_store._ensure(conn)
+
+    where: List[str] = []
+    params: List[Any] = []
+
+    pid = (project_id or "").strip()
+    sid = (series_id or "").strip()
+    k = _norm_kind_param(kind)
+    text = (q or "").strip()
+
+    if pid:
+        where.append("project_id = ?")
+        params.append(pid)
+
+    if sid:
+        where.append("series_id = ?")
+        params.append(sid)
+
+    # HARDEN: tolerate different enum string shapes / casing.
+    # We compare both the raw lower(kind) and the suffix-after-dot lower(substr(...)).
+    if k:
+        where.append("(lower(kind) = ? OR lower(substr(kind, instr(kind, '.') + 1)) = ?)")
+        params.extend([k, k])
+
+    if text:
+        like = f"%{text}%"
+        where.append("(title LIKE ? OR synopsis_text LIKE ?)")
+        params.extend([like, like])
+
+    if archived:
+        where.append("archived_at IS NOT NULL")
+    else:
+        where.append("archived_at IS NULL")
+
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+
+    sort_field, sort_dir = _parse_sort(sort)
+    # stable-ish secondary order
+    order_sql = f" ORDER BY {sort_field} {sort_dir}, created_at DESC"
+
+    total = conn.execute(f"SELECT COUNT(1) FROM episodes_or_videos{where_sql}", params).fetchone()[0]
+
+    rows = conn.execute(
+        f"""
+        SELECT
+          id,
+          project_id,
+          series_id,
+          kind,
+          title,
+          order_index,
+          created_at,
+          updated_at,
+          archived_at
+        FROM episodes_or_videos
+        {where_sql}
+        {order_sql}
+        LIMIT ? OFFSET ?
+        """,
+        [*params, int(limit), int(offset)],
+    ).fetchall()
+
+    items: List[Dict[str, Any]] = []
+    for r in rows:
+        items.append(
+            {
+                "item_type": "episode_or_video",
+                "id": r[0],
+                "project_id": r[1],
+                "series_id": r[2],
+                "kind": _norm_kind_db(r[3]),
+                "title": r[4],
+                "order_index": r[5],
+                "created_at": r[6],
+                "updated_at": r[7],
+                "archived_at": r[8],
+            }
+        )
+
+    return items, int(total)
+PY
+echo "[ok] patched: apps/api/src/app/modules/feed/store_sqlite.py"
+
+# 2) service.py（保持接口，减少无谓的 kind/value 转换，统一交给 store 做兼容）
+backup "$REPO_ROOT/apps/api/src/app/modules/feed/service.py"
+cat > "$REPO_ROOT/apps/api/src/app/modules/feed/service.py" <<'PY'
+from __future__ import annotations
+
+from typing import List, Optional, Tuple
+
+from app.core.pagination import ListQuery
+from app.modules.episodes_or_videos.dto import EpisodeOrVideoKind
+
+from .dto import FeedItem
+from .store_sqlite import list_feed_items
+
+
+def list_feed(
+    *,
+    project_id: Optional[str],
+    series_id: Optional[str],
+    kind: Optional[EpisodeOrVideoKind],
+    pagination: ListQuery,
+) -> Tuple[List[FeedItem], int]:
+    items, total = list_feed_items(
+        project_id=project_id,
+        series_id=series_id,
+        kind=kind,
+        q=pagination.q,
+        archived=bool(pagination.archived),
+        limit=int(pagination.limit),
+        offset=int(pagination.offset),
+        sort=pagination.sort,
+    )
+    return items, total
+PY
+echo "[ok] patched: apps/api/src/app/modules/feed/service.py"
+
+# 3) router.py（不改对外参数含义；避免重复 q 参数的歧义：q 统一走 ListQuery）
+backup "$REPO_ROOT/apps/api/src/app/modules/feed/router.py"
+cat > "$REPO_ROOT/apps/api/src/app/modules/feed/router.py" <<'PY'
+from __future__ import annotations
+
+from typing import Optional
+
+from fastapi import APIRouter, Depends, Query
+
+from app.core.pagination import ListQuery, list_query
+from app.modules.episodes_or_videos.dto import EpisodeOrVideoKind
+
+from .dto import FeedListResponse
+from .service import list_feed
+
+router = APIRouter(prefix="/api/feed", tags=["feed"])
+
+
+@router.get("", response_model=FeedListResponse)
+def list_all(
+    project_id: Optional[str] = Query(default=None),
+    series_id: Optional[str] = Query(default=None),
+    kind: Optional[EpisodeOrVideoKind] = Query(default=None),
+    pagination: ListQuery = Depends(list_query),
+):
+    items, total = list_feed(
+        project_id=project_id,
+        series_id=series_id,
+        kind=kind,
+        pagination=pagination,
+    )
+    return {"items": items, "total": total, "limit": pagination.limit, "offset": pagination.offset}
+PY
+echo "[ok] patched: apps/api/src/app/modules/feed/router.py"
+
+echo
+echo "==[B2] add hardened backend tests =="
+# 新增测试：归档语义 + sort 白名单 fallback（不依赖你当前 feed_readonly 测试文件）
+cat > "$REPO_ROOT/apps/api/tests/test_feed_list_semantics.py" <<'PY'
+import os
+
+from fastapi.testclient import TestClient
+
+
+def test_feed_archived_semantics_and_sort_whitelist(tmp_path):
+    db_path = tmp_path / "feed_semantics.sqlite"
+    os.environ["AAM_SQLITE_PATH"] = str(db_path)
+
+    from app.main import app  # import after env
+
+    client = TestClient(app)
+
+    # create one episode + one video
+    ep = client.post(
+        "/api/episodes_or_videos",
+        json={
+            "project_id": "p1",
+            "series_id": "s1",
+            "title": "ep1",
+            "kind": "episode",
+            "synopsis_text": "hello",
+            "order_index": 1,
+            "script_text": "script v1",
+            "assembly_preset_id": "preset-1",
+        },
+        headers={"X-Request-Id": "test-feed-sem-1"},
+    )
+    assert ep.status_code in (200, 201), ep.text
+    ep_id = ep.json()["id"]
+
+    vid = client.post(
+        "/api/episodes_or_videos",
+        json={
+            "project_id": "p1",
+            "series_id": "s1",
+            "title": "vid1",
+            "kind": "video",
+            "synopsis_text": "world",
+            "order_index": 2,
+            "script_text": "script v2",
+            "assembly_preset_id": "preset-1",
+        },
+        headers={"X-Request-Id": "test-feed-sem-2"},
+    )
+    assert vid.status_code in (200, 201), vid.text
+    vid_id = vid.json()["id"]
+
+    # archive the episode
+    p = client.patch(
+        f"/api/episodes_or_videos/{ep_id}",
+        json={"archived_at": "2020-01-01T00:00:00Z"},
+        headers={"X-Request-Id": "test-feed-sem-3"},
+    )
+    assert p.status_code == 200, p.text
+
+    # archived=false => only non-archived items (should include vid, exclude ep)
+    f0 = client.get(
+        "/api/feed?project_id=p1&limit=50&offset=0&archived=false&sort=-created_at",
+        headers={"X-Request-Id": "test-feed-sem-4"},
+    )
+    assert f0.status_code == 200, f0.text
+    ids0 = [it["id"] for it in f0.json()["items"]]
+    assert vid_id in ids0
+    assert ep_id not in ids0
+
+    # archived=true => only archived items (should include ep, exclude vid)
+    f1 = client.get(
+        "/api/feed?project_id=p1&limit=50&offset=0&archived=true&sort=-created_at",
+        headers={"X-Request-Id": "test-feed-sem-5"},
+    )
+    assert f1.status_code == 200, f1.text
+    ids1 = [it["id"] for it in f1.json()["items"]]
+    assert ep_id in ids1
+    assert vid_id not in ids1
+
+    # invalid sort should not 500; must fallback to default
+    f2 = client.get(
+        "/api/feed?project_id=p1&limit=50&offset=0&archived=false&sort=__bad__:asc",
+        headers={"X-Request-Id": "test-feed-sem-6"},
+    )
+    assert f2.status_code == 200, f2.text
+PY
+echo "[ok] wrote: apps/api/tests/test_feed_list_semantics.py"
+
+echo
+echo "==[B3] backend compile + tests =="
+"$PY" -m py_compile \
+  "$REPO_ROOT/apps/api/src/app/modules/feed/store_sqlite.py" \
+  "$REPO_ROOT/apps/api/src/app/modules/feed/service.py" \
+  "$REPO_ROOT/apps/api/src/app/modules/feed/router.py"
+echo "[rc] py_compile_backend=$?"
+
+cd "$REPO_ROOT/apps/api" || exit 0
+PYTHONPATH=./src "$PY" -m pytest -q
+echo "[rc] pytest_backend=$?"
+cd "$REPO_ROOT" || exit 0
+
+echo
+echo "==[B4] export+verify contracts (if API running) =="
+curl -fsS http://127.0.0.1:7000/health >/dev/null 2>&1
+if [ $? -eq 0 ]; then
+  ./scripts/export_openapi.sh
+  echo "[rc] export_openapi=$?"
+  ./scripts/verify_contracts.sh
+  echo "[rc] verify_contracts=$?"
+else
+  echo "[warn] API not running on :7000; skip export_openapi/verify_contracts"
+fi
+
+echo
+echo "==[W1] next build web =="
+cd "$REPO_ROOT/apps/web" || exit 0
+npm run build
+echo "[rc] next_build=$?"
+cd "$REPO_ROOT" || exit 0
+
+echo
+echo "==[DONE] M04 feed harden finished. Check [rc] above. =="

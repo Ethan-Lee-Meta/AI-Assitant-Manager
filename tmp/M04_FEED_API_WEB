@@ -1,0 +1,698 @@
+#!/usr/bin/env bash
+set +e
+
+ts="$(date +%Y%m%d_%H%M%S)"
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+
+cd "$repo_root" || exit 1
+
+# Prefer venv python explicitly to avoid "global python" surprises in Git Bash on Windows
+PY="$repo_root/.venv/Scripts/python.exe"
+if [[ ! -x "$PY" ]]; then
+  PY="python"
+fi
+
+backup_one () {
+  local f="$1"
+  if [[ -f "$f" ]]; then
+    cp "$f" "$f.bak.${ts}"
+    echo "[ok] backup -> $f.bak.${ts}"
+  fi
+}
+
+write_file () {
+  local f="$1"
+  local dir
+  dir="$(dirname "$f")"
+  mkdir -p "$dir"
+  backup_one "$f"
+  cat > "$f"
+  echo "[ok] wrote: $f"
+}
+
+echo "==[E0] env =="
+echo "[info] repo_root=$repo_root"
+"$PY" -c "import sys; print('[info] python=', sys.executable)" 2>/dev/null
+echo "[rc] py_exec=$?"
+
+###############################################################################
+# Backend: /api/feed (readonly aggregate of episodes_or_videos)
+###############################################################################
+echo
+echo "==[B1] write backend feed module files =="
+
+write_file "apps/api/src/app/modules/feed/dto.py" <<'PY'
+from __future__ import annotations
+
+from typing import List, Literal, Optional
+
+from pydantic import BaseModel
+
+
+class FeedItem(BaseModel):
+    item_type: Literal["episode_or_video"] = "episode_or_video"
+
+    id: str
+    project_id: str
+    series_id: str
+    kind: Literal["episode", "video"]
+
+    title: str
+    synopsis_text: Optional[str] = None
+    order_index: Optional[int] = None
+
+    created_at: str
+    updated_at: Optional[str] = None
+    archived_at: Optional[str] = None
+
+
+class FeedListResponse(BaseModel):
+    items: List[FeedItem]
+    total: int
+    limit: int
+    offset: int
+PY
+
+write_file "apps/api/src/app/modules/feed/store_sqlite.py" <<'PY'
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Tuple
+
+from app.modules.episodes_or_videos.dto import EpisodeOrVideoKind
+
+# IMPORTANT:
+# We reuse episodes_or_videos store's connection+schema init to guarantee same DB path and table existence.
+from app.modules.episodes_or_videos import store_sqlite as eov_store
+
+
+ALLOWED_SORT_FIELDS = {"created_at", "updated_at", "order_index", "title"}
+
+
+def _parse_sort(sort: Optional[str]) -> tuple[str, str]:
+    """
+    Supports:
+      - "-created_at" (desc)
+      - "created_at"  (asc)
+      - "created_at:desc" / "order_index:asc"
+    Falls back to created_at desc on invalid input.
+    """
+    s = (sort or "").strip()
+    if not s:
+        return ("created_at", "DESC")
+
+    field: str
+    direction: str
+
+    if ":" in s:
+        field, d = s.split(":", 1)
+        field = field.strip()
+        d = d.strip().lower()
+        direction = "ASC" if d == "asc" else "DESC"
+    elif s.startswith("-"):
+        field = s[1:].strip()
+        direction = "DESC"
+    else:
+        field = s.strip()
+        direction = "ASC"
+
+    if field not in ALLOWED_SORT_FIELDS:
+        return ("created_at", "DESC")
+
+    return (field, direction)
+
+
+def list_feed_items(
+    *,
+    project_id: Optional[str],
+    series_id: Optional[str],
+    kind: Optional[EpisodeOrVideoKind],
+    q: Optional[str],
+    archived: bool,
+    limit: int,
+    offset: int,
+    sort: Optional[str],
+) -> Tuple[List[Dict[str, Any]], int]:
+    # Connection + schema init (same DB and table as episodes_or_videos)
+    if not hasattr(eov_store, "_connect") or not hasattr(eov_store, "_ensure"):
+        raise RuntimeError("episodes_or_videos.store_sqlite missing _connect/_ensure; cannot build feed safely")
+
+    conn = eov_store._connect()
+    eov_store._ensure(conn)
+
+    where: List[str] = []
+    params: List[Any] = []
+
+    # archived semantics alignment: archived=false => only active; archived=true => only archived
+    if archived:
+        where.append("archived_at IS NOT NULL")
+    else:
+        where.append("archived_at IS NULL")
+
+    pid = (project_id or "").strip()
+    if pid:
+        where.append("project_id = ?")
+        params.append(pid)
+
+    sid = (series_id or "").strip()
+    if sid:
+        where.append("series_id = ?")
+        params.append(sid)
+
+    if kind is not None:
+        where.append("kind = ?")
+        params.append(str(kind))
+
+    qq = (q or "").strip()
+    if qq:
+        where.append("(title LIKE ? OR synopsis_text LIKE ? OR script_text LIKE ?)")
+        like = f"%{qq}%"
+        params.extend([like, like, like])
+
+    where_sql = " AND ".join(where) if where else "1=1"
+    field, direction = _parse_sort(sort)
+
+    # total
+    cur = conn.execute(f"SELECT COUNT(1) FROM episodes_or_videos WHERE {where_sql}", params)
+    total = int(cur.fetchone()[0] or 0)
+
+    # page
+    sql = f"""
+    SELECT
+      id, project_id, series_id, kind, title, synopsis_text, order_index,
+      created_at, updated_at, archived_at
+    FROM episodes_or_videos
+    WHERE {where_sql}
+    ORDER BY {field} {direction}
+    LIMIT ? OFFSET ?
+    """.strip()
+
+    cur = conn.execute(sql, [*params, int(limit), int(offset)])
+    rows = cur.fetchall()
+
+    items: List[Dict[str, Any]] = []
+    for r in rows:
+        items.append(
+            {
+                "item_type": "episode_or_video",
+                "id": r[0],
+                "project_id": r[1],
+                "series_id": r[2],
+                "kind": r[3],
+                "title": r[4],
+                "synopsis_text": r[5],
+                "order_index": r[6],
+                "created_at": r[7],
+                "updated_at": r[8],
+                "archived_at": r[9],
+            }
+        )
+
+    return items, total
+PY
+
+write_file "apps/api/src/app/modules/feed/service.py" <<'PY'
+from __future__ import annotations
+
+from typing import Optional, Tuple, List, Dict, Any
+
+from app.core.pagination import ListQuery
+from app.modules.episodes_or_videos.dto import EpisodeOrVideoKind
+
+from .store_sqlite import list_feed_items
+
+
+def list_feed(
+    *,
+    project_id: Optional[str],
+    series_id: Optional[str],
+    kind: Optional[EpisodeOrVideoKind],
+    q: Optional[str],
+    pagination: ListQuery,
+) -> Tuple[List[Dict[str, Any]], int]:
+    items, total = list_feed_items(
+        project_id=project_id,
+        series_id=series_id,
+        kind=kind,
+        q=q if q is not None else pagination.q,
+        archived=bool(pagination.archived),
+        limit=int(pagination.limit),
+        offset=int(pagination.offset),
+        sort=pagination.sort,
+    )
+    return items, total
+PY
+
+write_file "apps/api/src/app/modules/feed/router.py" <<'PY'
+from __future__ import annotations
+
+from typing import Optional
+
+from fastapi import APIRouter, Depends, Query
+
+from app.core.pagination import ListQuery, list_query
+from app.modules.episodes_or_videos.dto import EpisodeOrVideoKind
+
+from .dto import FeedListResponse
+from .service import list_feed
+
+router = APIRouter(prefix="/api/feed", tags=["feed"])
+
+
+@router.get("", response_model=FeedListResponse)
+def list_all(
+    project_id: Optional[str] = Query(default=None),
+    series_id: Optional[str] = Query(default=None),
+    kind: Optional[EpisodeOrVideoKind] = Query(default=None),
+    q: Optional[str] = Query(default=None),
+    pagination: ListQuery = Depends(list_query),
+):
+    items, total = list_feed(
+        project_id=project_id,
+        series_id=series_id,
+        kind=kind,
+        q=q,
+        pagination=pagination,
+    )
+    return {"items": items, "total": total, "limit": pagination.limit, "offset": pagination.offset}
+PY
+
+echo
+echo "==[B2] patch backend registry to include feed router =="
+
+backup_one "apps/api/src/app/modules/_registry.py"
+
+"$PY" - <<'PY'
+from __future__ import annotations
+from pathlib import Path
+import re
+import sys
+
+p = Path("apps/api/src/app/modules/_registry.py")
+if not p.exists():
+    print("[err] registry not found:", p)
+    sys.exit(3)
+
+s = p.read_text(encoding="utf-8", errors="ignore")
+if "modules.feed.router" in s or "feed_router" in s:
+    print("[ok] registry already mentions feed; skip")
+    sys.exit(0)
+
+m = re.search(r"(?m)^\s*return\s+routers\s*$", s)
+if not m:
+    print("[err] cannot locate 'return routers' in registry; abort to avoid guessing")
+    sys.exit(3)
+
+insert = (
+    "    # M04 Feed (readonly aggregate)\n"
+    "    from app.modules.feed.router import router as feed_router\n"
+    "    routers.append(feed_router)\n\n"
+)
+
+s2 = s[: m.start()] + insert + s[m.start() :]
+p.write_text(s2, encoding="utf-8", newline="\n")
+print("[ok] patched registry:", str(p))
+PY
+echo "[rc] patch_registry=$?"
+
+echo
+echo "==[B3] write backend tests for feed =="
+
+write_file "apps/api/tests/test_feed_readonly.py" <<'PY'
+from __future__ import annotations
+
+import os
+
+from fastapi.testclient import TestClient
+
+
+def test_feed_lists_eov_items(tmp_path):
+    db_path = tmp_path / "feed.sqlite"
+    os.environ["AAM_SQLITE_PATH"] = str(db_path)
+
+    from app.main import app  # import after env
+
+    client = TestClient(app)
+
+    # Create two items (episode + video) under different projects/series
+    r1 = client.post(
+        "/api/episodes_or_videos",
+        json={
+            "project_id": "p1",
+            "series_id": "s1",
+            "title": "ep1",
+            "kind": "episode",
+            "synopsis_text": "hello",
+            "order_index": 1,
+            "script_text": "script v1",
+            "assembly_preset_id": "preset-1",
+        },
+        headers={"X-Request-Id": "test-feed-1"},
+    )
+    assert r1.status_code in (200, 201), r1.text
+    ep_id = r1.json()["id"]
+
+    r2 = client.post(
+        "/api/episodes_or_videos",
+        json={
+            "project_id": "p2",
+            "series_id": "s2",
+            "title": "vid1",
+            "kind": "video",
+            "synopsis_text": "world",
+            "order_index": 2,
+            "script_text": "script v2",
+            "assembly_preset_id": "preset-1",
+        },
+        headers={"X-Request-Id": "test-feed-2"},
+    )
+    assert r2.status_code in (200, 201), r2.text
+    vid_id = r2.json()["id"]
+
+    # Feed (all projects)
+    f = client.get("/api/feed?limit=50&offset=0&archived=false&sort=-created_at", headers={"X-Request-Id": "test-feed-3"})
+    assert f.status_code == 200, f.text
+    j = f.json()
+    assert "items" in j and "total" in j
+    ids = [it["id"] for it in j["items"]]
+    assert ep_id in ids
+    assert vid_id in ids
+
+    # Filter by project_id
+    f1 = client.get("/api/feed?project_id=p1&limit=50&offset=0&archived=false&sort=-created_at", headers={"X-Request-Id": "test-feed-4"})
+    assert f1.status_code == 200, f1.text
+    ids1 = [it["id"] for it in f1.json()["items"]]
+    assert ep_id in ids1
+    assert vid_id not in ids1
+
+    # Filter by kind
+    f2 = client.get("/api/feed?kind=video&limit=50&offset=0&archived=false&sort=-created_at", headers={"X-Request-Id": "test-feed-5"})
+    assert f2.status_code == 200, f2.text
+    ids2 = [it["id"] for it in f2.json()["items"]]
+    assert vid_id in ids2
+    assert ep_id not in ids2
+
+    # Archive one item, ensure archived semantics
+    p = client.patch(f"/api/episodes_or_videos/{ep_id}", json={"archived_at": "2025-01-01T00:00:00Z"}, headers={"X-Request-Id": "test-feed-6"})
+    assert p.status_code == 200, p.text
+
+    fa = client.get("/api/feed?archived=true&limit=50&offset=0&sort=-created_at", headers={"X-Request-Id": "test-feed-7"})
+    assert fa.status_code == 200, fa.text
+    ida = [it["id"] for it in fa.json()["items"]]
+    assert ep_id in ida
+PY
+
+echo
+echo "==[B4] backend compile + tests =="
+
+"$PY" -m py_compile \
+  apps/api/src/app/modules/feed/dto.py \
+  apps/api/src/app/modules/feed/store_sqlite.py \
+  apps/api/src/app/modules/feed/service.py \
+  apps/api/src/app/modules/feed/router.py \
+  apps/api/src/app/modules/_registry.py
+echo "[rc] py_compile_backend=$?"
+
+cd "$repo_root/apps/api" || exit 1
+PYTHONPATH=./src "$PY" -m pytest -q
+echo "[rc] pytest_backend=$?"
+cd "$repo_root" || exit 1
+
+echo
+echo "==[B5] export+verify contracts (requires running API) =="
+
+code="$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:7000/health 2>/dev/null)"
+if [[ "$code" == "200" ]]; then
+  ./scripts/export_openapi.sh
+  echo "[rc] export_openapi=$?"
+  ./scripts/verify_contracts.sh
+  echo "[rc] verify_contracts=$?"
+else
+  echo "[warn] API not running on :7000, skip export/verify (health http_code=$code)"
+  echo "[rc] export_openapi=99"
+  echo "[rc] verify_contracts=99"
+fi
+
+###############################################################################
+# Frontend: /feed page using /api/feed
+###############################################################################
+echo
+echo "==[W1] write web api/ui/route files =="
+
+write_file "apps/web/src/lib/api/feed.ts" <<'TS'
+import { apiGet } from "./client";
+import { buildListQuery, ListQuery } from "./list";
+
+export type FeedItem = {
+  item_type: "episode_or_video";
+  id: string;
+  project_id: string;
+  series_id: string;
+  kind: "episode" | "video";
+  title: string;
+  synopsis_text?: string | null;
+  order_index?: number | null;
+  created_at: string;
+  updated_at?: string | null;
+  archived_at?: string | null;
+};
+
+export type FeedListResp = {
+  total: number;
+  items: FeedItem[];
+  limit: number;
+  offset: number;
+};
+
+export async function listFeed(
+  args: ({ project_id?: string; series_id?: string; kind?: "episode" | "video" } & ListQuery) = {}
+): Promise<FeedListResp> {
+  const { project_id, series_id, kind, ...q } = args;
+
+  const base = buildListQuery(q);
+  const params = new URLSearchParams(base.startsWith("?") ? base.slice(1) : "");
+
+  const pid = (project_id ?? "").trim();
+  const sid = (series_id ?? "").trim();
+  if (pid) params.set("project_id", pid);
+  if (sid) params.set("series_id", sid);
+  if (kind) params.set("kind", kind);
+
+  const qs = params.toString();
+  const path = qs ? `/api/feed?${qs}` : "/api/feed";
+  return apiGet<FeedListResp>(path);
+}
+TS
+
+write_file "apps/web/src/ui/feed/FeedList.tsx" <<'TSX'
+"use client";
+
+import React, { useEffect, useMemo, useState } from "react";
+import { FeedItem, listFeed } from "../../lib/api/feed";
+
+type KindFilter = "all" | "episode" | "video";
+
+function isoToLocal(s: string): string {
+  try {
+    const d = new Date(s);
+    if (Number.isNaN(d.getTime())) return s;
+    return d.toLocaleString();
+  } catch {
+    return s;
+  }
+}
+
+export function FeedList() {
+  const [projectId, setProjectId] = useState<string>("");
+  const [seriesId, setSeriesId] = useState<string>("");
+  const [kind, setKind] = useState<KindFilter>("all");
+  const [q, setQ] = useState<string>("");
+  const [archived, setArchived] = useState<boolean>(false);
+
+  const [sort, setSort] = useState<string>("-created_at");
+  const [limit, setLimit] = useState<number>(50);
+  const [offset, setOffset] = useState<number>(0);
+
+  const [items, setItems] = useState<FeedItem[]>([]);
+  const [total, setTotal] = useState<number>(0);
+  const [loading, setLoading] = useState<boolean>(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const canPrev = useMemo(() => offset > 0, [offset]);
+  const canNext = useMemo(() => offset + limit < total, [offset, limit, total]);
+
+  async function refresh() {
+    setLoading(true);
+    setErr(null);
+    try {
+      const resp = await listFeed({
+        project_id: projectId.trim() || undefined,
+        series_id: seriesId.trim() || undefined,
+        kind: kind === "all" ? undefined : (kind as any),
+        q: q.trim() || undefined,
+        archived,
+        sort,
+        limit,
+        offset,
+      });
+      setItems(resp.items || []);
+      setTotal(resp.total || 0);
+    } catch (e: any) {
+      setErr(e?.message || "failed to load feed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, seriesId, kind, q, archived, sort, limit, offset]);
+
+  function resetPaging() {
+    setOffset(0);
+  }
+
+  return (
+    <div style={{ display: "grid", gap: 12 }}>
+      <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 12 }}>
+        <h1 style={{ margin: "0 0 8px 0" }}>Feed</h1>
+        <div style={{ color: "#666", fontSize: 12 }}>
+          Read-only aggregate of Episodes/Videos. Click through to Series or item workspace.
+        </div>
+
+        {err ? <div style={{ marginTop: 10, color: "crimson" }}>Error: {err}</div> : null}
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginTop: 12 }}>
+          <label style={{ display: "grid", gap: 6, fontSize: 12 }}>
+            project_id (optional)
+            <input value={projectId} onChange={(e) => { setProjectId(e.target.value); resetPaging(); }} style={{ padding: 8 }} />
+          </label>
+
+          <label style={{ display: "grid", gap: 6, fontSize: 12 }}>
+            series_id (optional)
+            <input value={seriesId} onChange={(e) => { setSeriesId(e.target.value); resetPaging(); }} style={{ padding: 8 }} />
+          </label>
+
+          <label style={{ display: "grid", gap: 6, fontSize: 12 }}>
+            search (q)
+            <input value={q} onChange={(e) => { setQ(e.target.value); resetPaging(); }} style={{ padding: 8 }} />
+          </label>
+        </div>
+
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 12, alignItems: "center" }}>
+          <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 12 }}>
+            kind
+            <select value={kind} onChange={(e) => { setKind(e.target.value as any); resetPaging(); }} style={{ padding: 8 }}>
+              <option value="all">all</option>
+              <option value="episode">episode</option>
+              <option value="video">video</option>
+            </select>
+          </label>
+
+          <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 12 }}>
+            archived
+            <input type="checkbox" checked={archived} onChange={(e) => { setArchived(e.target.checked); resetPaging(); }} />
+          </label>
+
+          <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 12 }}>
+            sort
+            <select value={sort} onChange={(e) => { setSort(e.target.value); resetPaging(); }} style={{ padding: 8 }}>
+              <option value="-created_at">-created_at (newest first)</option>
+              <option value="created_at">created_at (oldest first)</option>
+              <option value="-order_index">-order_index</option>
+              <option value="order_index">order_index</option>
+              <option value="title">title</option>
+            </select>
+          </label>
+
+          <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 12 }}>
+            limit
+            <select value={String(limit)} onChange={(e) => { setLimit(parseInt(e.target.value, 10)); resetPaging(); }} style={{ padding: 8 }}>
+              <option value="20">20</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+            </select>
+          </label>
+
+          <button onClick={refresh} disabled={loading} style={{ padding: "8px 12px" }}>
+            {loading ? "Loading..." : "Refresh"}
+          </button>
+        </div>
+      </div>
+
+      <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 12 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+          <div style={{ fontWeight: 700 }}>Items</div>
+          <div style={{ fontSize: 12, color: "#666" }}>
+            total={total} • offset={offset} • limit={limit}
+          </div>
+        </div>
+
+        <div style={{ display: "flex", gap: 10, marginTop: 10 }}>
+          <button disabled={!canPrev || loading} onClick={() => setOffset(Math.max(0, offset - limit))} style={{ padding: "6px 10px" }}>
+            Prev
+          </button>
+          <button disabled={!canNext || loading} onClick={() => setOffset(offset + limit)} style={{ padding: "6px 10px" }}>
+            Next
+          </button>
+          <a href="/projects" style={{ marginLeft: "auto", textDecoration: "none", color: "#444" }}>Projects</a>
+          <a href="/series" style={{ textDecoration: "none", color: "#444" }}>Series</a>
+          <a href="/episodes_or_videos" style={{ textDecoration: "none", color: "#444" }}>Episodes/Videos</a>
+        </div>
+
+        <div style={{ marginTop: 12, display: "grid", gap: 8 }}>
+          {items.length === 0 ? <div style={{ color: "#666" }}>No items.</div> : null}
+
+          {items.map((it) => (
+            <div key={it.id} style={{ border: "1px solid #eee", borderRadius: 12, padding: 10, display: "grid", gap: 6 }}>
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "baseline" }}>
+                <div style={{ fontWeight: 700 }}>{it.title}</div>
+                <div style={{ fontSize: 12, color: "#666" }}>
+                  {it.kind} • {isoToLocal(it.created_at)} • project_id={it.project_id} • series_id={it.series_id}
+                </div>
+              </div>
+
+              {it.synopsis_text ? <div style={{ color: "#444", fontSize: 13 }}>{it.synopsis_text}</div> : null}
+
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                <a href={`/episodes_or_videos/${it.id}`} style={{ textDecoration: "none", border: "1px solid #ddd", borderRadius: 10, padding: "6px 10px" }}>
+                  Open Item
+                </a>
+                <a href={`/series/${it.series_id}`} style={{ textDecoration: "none", border: "1px solid #ddd", borderRadius: 10, padding: "6px 10px" }}>
+                  Open Series
+                </a>
+                <a
+                  href={`/series?project_id=${encodeURIComponent(it.project_id)}`}
+                  style={{ textDecoration: "none", border: "1px solid #ddd", borderRadius: 10, padding: "6px 10px" }}
+                >
+                  Series in Project
+                </a>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+TSX
+
+write_file "apps/web/app/(app)/feed/page.tsx" <<'TSX'
+import { FeedList } from "../../../src/ui/feed/FeedList";
+
+export default function Page() {
+  return <FeedList />;
+}
+TSX
+
+echo
+echo "==[W2] build web =="
+cd "$repo_root/apps/web" || exit 1
+npm run build
+echo "[rc] next_build=$?"
+cd "$repo_root" || exit 1
+
+echo
+echo "==[DONE] Feed delivered =="
+echo "[info] web:  http://localhost:2000/feed"
+echo "[info] api:  http://localhost:7000/api/feed?limit=50&offset=0&archived=false&sort=-created_at"

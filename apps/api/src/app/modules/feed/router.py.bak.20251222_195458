@@ -1,0 +1,34 @@
+from __future__ import annotations
+
+from typing import Optional
+
+from fastapi import APIRouter, Query
+
+from app.modules.episodes_or_videos.dto import EpisodeOrVideoKind
+from app.modules.feed.dto import FeedListResponse
+from app.modules.feed import service
+
+router = APIRouter(prefix="/api/feed", tags=["feed"])
+
+
+@router.get("", response_model=FeedListResponse)
+def list_feed(
+    project_id: Optional[str] = Query(default=None),
+    series_id: Optional[str] = Query(default=None),
+    kind: Optional[EpisodeOrVideoKind] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    sort: Optional[str] = Query(default="-created_at"),
+    q: Optional[str] = Query(default=None),
+    archived: bool = Query(default=False),
+) -> FeedListResponse:
+    return service.list_feed(
+        project_id=project_id,
+        series_id=series_id,
+        kind=str(kind) if kind is not None else None,
+        q=q,
+        archived=archived,
+        limit=limit,
+        offset=offset,
+        sort=sort,
+    )

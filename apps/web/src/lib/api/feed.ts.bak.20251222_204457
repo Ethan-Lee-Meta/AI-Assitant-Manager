@@ -1,0 +1,42 @@
+import { apiGet } from "./client";
+import { buildListQuery, ListQuery } from "./list";
+
+export type FeedItem = {
+  item_type: "episode_or_video";
+  id: string;
+  project_id: string;
+  series_id: string;
+  kind: "episode" | "video";
+  title: string;
+  synopsis_text?: string | null;
+  order_index?: number | null;
+  created_at: string;
+  updated_at?: string | null;
+  archived_at?: string | null;
+};
+
+export type FeedListResp = {
+  total: number;
+  items: FeedItem[];
+  limit: number;
+  offset: number;
+};
+
+export async function listFeed(
+  args: ({ project_id?: string; series_id?: string; kind?: "episode" | "video" } & ListQuery) = {}
+): Promise<FeedListResp> {
+  const { project_id, series_id, kind, ...q } = args;
+
+  const base = buildListQuery(q);
+  const params = new URLSearchParams(base.startsWith("?") ? base.slice(1) : "");
+
+  const pid = (project_id ?? "").trim();
+  const sid = (series_id ?? "").trim();
+  if (pid) params.set("project_id", pid);
+  if (sid) params.set("series_id", sid);
+  if (kind) params.set("kind", kind);
+
+  const qs = params.toString();
+  const path = qs ? `/api/feed?${qs}` : "/api/feed";
+  return apiGet<FeedListResp>(path);
+}

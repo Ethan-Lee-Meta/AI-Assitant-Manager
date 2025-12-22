@@ -284,6 +284,12 @@ export default function ProjectsPage() {
               </div>
 
               <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <a
+                  href={`/series?project_id=${encodeURIComponent(p.id)}`}
+                  style={{ border: "1px solid #e5e7eb", borderRadius: 8, padding: "6px 10px", textDecoration: "none" }}
+                >
+                  View Series
+                </a>
                 {p.archived_at ? (
                   <span style={{ fontSize: 12, opacity: 0.8 }}>archived</span>
                 ) : (

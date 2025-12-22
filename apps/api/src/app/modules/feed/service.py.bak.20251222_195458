@@ -1,0 +1,31 @@
+from __future__ import annotations
+
+from typing import Optional
+
+from app.modules.feed.dto import FeedListResponse, FeedItem
+from app.modules.feed import store_sqlite
+
+
+def list_feed(
+    *,
+    project_id: Optional[str],
+    series_id: Optional[str],
+    kind: Optional[str],
+    q: Optional[str],
+    archived: bool,
+    limit: int,
+    offset: int,
+    sort: Optional[str],
+) -> FeedListResponse:
+    rows, total = store_sqlite.list_feed(
+        project_id=project_id,
+        series_id=series_id,
+        kind=kind,
+        q=q,
+        archived=archived,
+        limit=limit,
+        offset=offset,
+        sort=sort,
+    )
+    items = [FeedItem(**r) for r in rows]
+    return FeedListResponse(items=items, total=total, limit=limit, offset=offset)
